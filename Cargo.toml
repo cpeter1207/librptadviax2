@@ -1,0 +1,11 @@
+[package]
+name = "rptadviax2"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-2.0-only"
+description = "Standalone IAX2 protocol and transport adapters for rpt_advanced"
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
