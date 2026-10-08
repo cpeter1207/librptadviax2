@@ -1,3 +1,9 @@
+librptadviax2 (0.1.0~alpha4) unstable; urgency=medium
+
+  * Make source archive generation work from a container-owned checkout.
+
+ -- Chris Peterson <cpeter1207@users.noreply.github.com>  Thu, 08 Oct 2026 16:20:00 -0500
+
 librptadviax2 (0.1.0~alpha3) unstable; urgency=medium
 
   * Normalize the Debian alpha version when naming the versioned shared object.

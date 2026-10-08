@@ -148,7 +148,7 @@ release-packages: package-check dist
 
 dist:
 	mkdir -p build
-	git archive --format=tar --prefix=$(PACKAGE)-$(VERSION)/ HEAD | gzip -n > build/$(PACKAGE)-$(VERSION).tar.gz
+	git -c safe.directory=$(CURDIR) archive --format=tar --prefix=$(PACKAGE)-$(VERSION)/ HEAD | gzip -n > build/$(PACKAGE)-$(VERSION).tar.gz
 
 clean:
 	rm -rf build $(CARGO_TARGET_DIR)
