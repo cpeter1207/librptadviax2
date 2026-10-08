@@ -1,3 +1,9 @@
+librptadviax2 (0.1.0~alpha3) unstable; urgency=medium
+
+  * Normalize the Debian alpha version when naming the versioned shared object.
+
+ -- Chris Peterson <cpeter1207@users.noreply.github.com>  Thu, 08 Oct 2026 15:40:00 -0500
+
 librptadviax2 (0.1.0~alpha2) unstable; urgency=medium
 
   * Publish radio-key and radio-unkey events through the client poll ABI.
