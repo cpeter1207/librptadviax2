@@ -1,0 +1,12 @@
+librptadviax2 (0.1.0~alpha2) unstable; urgency=medium
+
+  * Publish radio-key and radio-unkey events through the client poll ABI.
+
+ -- Chris Peterson <cpeter1207@users.noreply.github.com>  Thu, 08 Oct 2026 00:00:00 -0500
+
+librptadviax2 (0.1.0~alpha1) unstable; urgency=medium
+
+  * Publish the first versioned C client ABI with SONAME 1.
+  * Split runtime shared object and development header packages.
+
+ -- Chris Peterson <cpeter1207@users.noreply.github.com>  Tue, 06 Oct 2026 12:00:00 -0500

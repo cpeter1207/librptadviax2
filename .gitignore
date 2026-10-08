@@ -1,2 +1,15 @@
 /target
 /.work
+/.work-target
+/build
+/.ruff_cache
+/__pycache__
+**/__pycache__/
+/debian/.debhelper
+/debian/debhelper-build-stamp
+/debian/files
+/debian/tmp
+/debian/*.substvars
+/debian/*.debhelper.log
+/debian/librptadv-iax2-client1
+/debian/librptadv-iax2-client-dev

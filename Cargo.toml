@@ -4,8 +4,14 @@ version = "0.1.0"
 edition = "2024"
 license = "GPL-2.0-only"
 description = "Standalone IAX2 protocol and transport adapters for rpt_advanced"
+build = "build.rs"
 
 [lib]
 crate-type = ["rlib", "cdylib"]
 
 [dependencies]
+audio-codec-algorithms = "0.7.0"
+getrandom = "0.2"
+md-5 = "0.10.6"
+rtrb = "0.4.0"
+sha1 = "0.10.6"
