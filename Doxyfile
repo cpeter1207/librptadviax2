@@ -1,0 +1,13 @@
+PROJECT_NAME = librptadviax2
+OUTPUT_DIRECTORY = build/doxygen
+INPUT = include/rptadv_iax2_client.h
+FILE_PATTERNS = *.h
+RECURSIVE = NO
+EXTRACT_ALL = YES
+WARNINGS = YES
+WARN_IF_UNDOCUMENTED = YES
+WARN_AS_ERROR = YES
+WARN_LOGFILE = build/doxygen-warnings.log
+GENERATE_HTML = YES
+GENERATE_LATEX = NO
+QUIET = YES

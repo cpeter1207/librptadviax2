@@ -1,0 +1,12 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: librptadviax2
+Source: https://github.com/cpeter1207/librptadviax2
+
+Files: *
+Copyright: 2026 Chris Peterson
+License: GPL-2.0-only
+ This program is free software; you can redistribute it and/or modify it
+ under the terms of the GNU General Public License version 2 only.
+ .
+ On Debian systems, the complete text of version 2 of the GNU General Public
+ License can be found in /usr/share/common-licenses/GPL-2.

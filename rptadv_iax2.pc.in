@@ -1,0 +1,10 @@
+prefix=@PREFIX@
+libdir=@LIBDIR@
+includedir=${prefix}/include/rptadv_iax2
+
+Name: rptadv-iax2-client
+Description: Versioned standalone IAX2 client ABI
+Version: @VERSION@
+Libs: -L${libdir} -lrptadviax2
+Cflags: -I${includedir}
+abi_version=@ABI_VERSION@
