@@ -13,4 +13,4 @@ jobs:
     uses: cpeter1207/rptadv-shared-library-workflows/.github/workflows/quality.yml@main
     with:
       code_ref: ${{ github.sha }}
-      full: ${{ github.event_name != 'push' }}
+      full: ${{ github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' }}
