@@ -18,6 +18,304 @@ const LOCAL_CALL: u16 = 1234;
 const REMOTE_CALL: u16 = 5678;
 const ULAW: u32 = 0x4;
 
+fn interop_peer(ack_first: bool) -> (crate::client::IaxPeer, UdpSocket) {
+    let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+    server
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    let remote = server.local_addr().unwrap();
+    let handshake = server.try_clone().unwrap();
+    let responder = thread::spawn(move || {
+        let mut bytes = [0; 1500];
+        let (_, client) = handshake.recv_from(&mut bytes).unwrap();
+        if ack_first {
+            handshake
+                .send_to(
+                    &frame(REMOTE_CALL, LOCAL_CALL, 0, 1, IaxCommand::Ack, &[]),
+                    client,
+                )
+                .unwrap();
+            thread::sleep(Duration::from_millis(150));
+        }
+        send_ie(
+            &handshake,
+            client,
+            (REMOTE_CALL, LOCAL_CALL, 0, 1, IaxCommand::Accept),
+            &[InformationElement {
+                kind: 9,
+                data: &ULAW.to_be_bytes(),
+            }],
+        );
+        handshake.recv_from(&mut bytes).unwrap();
+        send_answer(&handshake, client, 1, 1);
+    });
+    let result = dial_ulaw(DialOptions {
+        remote,
+        local_call: LOCAL_CALL,
+        local_node: "524950",
+        remote_node: "506315",
+        secret: "",
+        timeout: Duration::from_secs(1),
+    });
+    responder.join().unwrap();
+    let peer = result.unwrap();
+    (peer, server)
+}
+
+#[test]
+fn interop_setup_ack_waits_for_accept_without_retrying_new() {
+    let _ = interop_peer(true);
+}
+
+#[test]
+fn interop_lag_probe_echoes_timestamp_and_preserves_following_voice() {
+    let (mut peer, server) = interop_peer(false);
+    let destination =
+        std::net::SocketAddr::from(([127, 0, 0, 1], peer.local_addr().unwrap().port()));
+    let mut request = frame(REMOTE_CALL, LOCAL_CALL, 2, 1, IaxCommand::LagRq, &[]);
+    // The original request was lost; its first observed retry still needs a reliable reply.
+    request[2] |= 0x80;
+    request[4..8].copy_from_slice(&10880u32.to_be_bytes());
+    server.send_to(&request, destination).unwrap();
+    thread::sleep(Duration::from_millis(10));
+    assert_eq!(peer.poll_ulaw(&mut [0.0; 160]).unwrap(), None);
+    let mut bytes = [0; 1500];
+    let (length, _) = server.recv_from(&mut bytes).unwrap();
+    let response = parse_full_frame_packet(&bytes[..length]).unwrap();
+    assert_eq!(
+        decode_iax_command(&response.header).unwrap(),
+        Some(IaxCommand::LagRp)
+    );
+    assert_eq!(
+        (
+            response.header.timestamp,
+            response.header.outgoing_sequence,
+            response.header.incoming_sequence
+        ),
+        (10880, 1, 3)
+    );
+    thread::sleep(Duration::from_millis(2050));
+    assert_eq!(peer.poll_ulaw(&mut [0.0; 160]).unwrap(), None);
+    let (length, _) = server.recv_from(&mut bytes).unwrap();
+    assert!(
+        parse_full_frame_packet(&bytes[..length])
+            .unwrap()
+            .header
+            .retransmission
+    );
+    server
+        .send_to(
+            &frame(REMOTE_CALL, LOCAL_CALL, 3, 2, IaxCommand::Ack, &[]),
+            destination,
+        )
+        .unwrap();
+    thread::sleep(Duration::from_millis(10));
+    assert_eq!(peer.poll_ulaw(&mut [0.0; 160]).unwrap(), None);
+    let mut reply = frame(REMOTE_CALL, LOCAL_CALL, 3, 2, IaxCommand::LagRp, &[]);
+    reply[4..8].copy_from_slice(&10880u32.to_be_bytes());
+    server.send_to(&reply, destination).unwrap();
+    thread::sleep(Duration::from_millis(10));
+    assert_eq!(peer.poll_ulaw(&mut [0.0; 160]).unwrap(), None);
+    let (length, _) = server.recv_from(&mut bytes).unwrap();
+    let ack = parse_full_frame_packet(&bytes[..length]).unwrap();
+    assert_eq!(
+        decode_iax_command(&ack.header).unwrap(),
+        Some(IaxCommand::Ack)
+    );
+    assert_eq!(ack.header.incoming_sequence, 4);
+    assert_eq!(ack.header.timestamp, 10880);
+    let mut voice = make_full_voice(REMOTE_CALL, LOCAL_CALL, 4, &[0xff; 160]);
+    voice[8] = 4;
+    voice[9] = 2;
+    server.send_to(&voice, destination).unwrap();
+    thread::sleep(Duration::from_millis(10));
+    assert_eq!(peer.poll_ulaw(&mut [0.0; 160]).unwrap(), Some(160));
+}
+
+#[test]
+fn interop_first_voice_bootstraps_codec_before_mini_frames() {
+    let (mut peer, server) = interop_peer(false);
+    peer.send_ulaw(&[0.0; 160], 20).unwrap();
+    let mut bytes = [0; 1500];
+    let (length, _) = server.recv_from(&mut bytes).unwrap();
+    let voice = parse_full_frame_packet(&bytes[..length])
+        .expect("first voice must establish the codec with a full frame");
+    assert_eq!(
+        (
+            voice.header.frame_type,
+            voice.header.subclass,
+            voice.header.outgoing_sequence,
+            voice.header.incoming_sequence,
+            voice.header.timestamp
+        ),
+        (2, 4, 1, 2, 20)
+    );
+    assert_eq!(voice.payload, &[0xff; 160]);
+    peer.send_ulaw(&[0.0; 160], 40).unwrap();
+    let (length, _) = server.recv_from(&mut bytes).unwrap();
+    assert!(matches!(
+        parse_voice_frame(&bytes[..length], ULAW).unwrap(),
+        VoiceFrame::Mini { .. }
+    ));
+    peer.send_text(b"K? * 524950 0 0").unwrap();
+    let (length, _) = server.recv_from(&mut bytes).unwrap();
+    assert_eq!(
+        parse_full_frame_packet(&bytes[..length])
+            .unwrap()
+            .header
+            .outgoing_sequence,
+        2
+    );
+}
+
+#[test]
+fn interop_full_voice_is_acknowledged_and_advances_ping_sequence() {
+    let (mut peer, server) = interop_peer(false);
+    let mut voice = make_full_voice(REMOTE_CALL, LOCAL_CALL, 4, &[0xff; 160]);
+    voice[8] = 2;
+    voice[9] = 1;
+    let destination =
+        std::net::SocketAddr::from(([127, 0, 0, 1], peer.local_addr().unwrap().port()));
+    server.send_to(&voice, destination).unwrap();
+    let mut pcm = [1.0; 160];
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    while peer.poll_ulaw(&mut pcm).unwrap().is_none() {
+        assert!(std::time::Instant::now() < deadline);
+        thread::yield_now();
+    }
+    assert_eq!(pcm, [0.0; 160]);
+    let mut bytes = [0; 1500];
+    let (length, _) = server
+        .recv_from(&mut bytes)
+        .expect("full voice must be ACKed");
+    let ack = parse_full_frame_packet(&bytes[..length]).unwrap();
+    assert_eq!(
+        decode_iax_command(&ack.header).unwrap(),
+        Some(IaxCommand::Ack)
+    );
+    assert_eq!(ack.header.incoming_sequence, 3);
+    voice[2] |= 0x80;
+    server.send_to(&voice, destination).unwrap();
+    thread::sleep(Duration::from_millis(10));
+    assert_eq!(peer.poll_ulaw(&mut pcm).unwrap(), None);
+    server.recv_from(&mut bytes).unwrap();
+    server
+        .send_to(
+            &frame(REMOTE_CALL, LOCAL_CALL, 3, 1, IaxCommand::Ping, &[]),
+            destination,
+        )
+        .unwrap();
+    thread::sleep(Duration::from_millis(10));
+    assert_eq!(peer.poll_ulaw(&mut pcm).unwrap(), None);
+    let (length, _) = server.recv_from(&mut bytes).unwrap();
+    let pong = parse_full_frame_packet(&bytes[..length]).unwrap();
+    assert_eq!(
+        decode_iax_command(&pong.header).unwrap(),
+        Some(IaxCommand::Pong)
+    );
+    assert_eq!(pong.header.incoming_sequence, 4);
+    server.send_to(&voice, destination).unwrap();
+    thread::sleep(Duration::from_millis(10));
+    assert_eq!(peer.poll_ulaw(&mut pcm).unwrap(), None);
+    let (length, _) = server.recv_from(&mut bytes).unwrap();
+    assert_eq!(
+        parse_full_frame_packet(&bytes[..length])
+            .unwrap()
+            .header
+            .incoming_sequence,
+        4
+    );
+}
+
+#[test]
+fn interop_crossed_voice_allows_outstanding_cumulative_ack() {
+    let (mut peer, server) = interop_peer(false);
+    peer.send_ulaw(&[0.0; 160], 20).unwrap();
+    let mut bytes = [0; 1500];
+    let (_, destination) = server.recv_from(&mut bytes).unwrap();
+    let mut voice = make_full_voice(REMOTE_CALL, LOCAL_CALL, 4, &[0xff; 160]);
+    voice[8] = 2;
+    voice[9] = 1;
+    server.send_to(&voice, destination).unwrap();
+    thread::sleep(Duration::from_millis(10));
+    assert_eq!(peer.poll_ulaw(&mut [0.0; 160]).unwrap(), Some(160));
+    server.recv_from(&mut bytes).unwrap();
+    server
+        .send_to(
+            &frame(REMOTE_CALL, LOCAL_CALL, 3, 1, IaxCommand::Ping, &[]),
+            destination,
+        )
+        .unwrap();
+    thread::sleep(Duration::from_millis(10));
+    assert_eq!(peer.poll_ulaw(&mut [0.0; 160]).unwrap(), None);
+    let (length, _) = server.recv_from(&mut bytes).unwrap();
+    assert_eq!(
+        decode_iax_command(&parse_full_frame_packet(&bytes[..length]).unwrap().header).unwrap(),
+        Some(IaxCommand::Pong)
+    );
+    voice[8] = 4;
+    voice[9] = 4;
+    server.send_to(&voice, destination).unwrap();
+    thread::sleep(Duration::from_millis(10));
+    assert!(matches!(
+        peer.poll_ulaw(&mut [0.0; 160]),
+        Err(DialError::Protocol(
+            crate::session::CallSetupError::SequenceMismatch { .. }
+        ))
+    ));
+}
+
+#[test]
+fn interop_ack_overtaking_earlier_voice_keeps_audio_and_control_deliverable() {
+    let (mut peer, server) = interop_peer(false);
+    peer.send_ulaw(&[0.0; 160], 20).unwrap();
+    let mut bytes = [0; 1500];
+    let (_, destination) = server.recv_from(&mut bytes).unwrap();
+    server
+        .send_to(
+            &frame(REMOTE_CALL, LOCAL_CALL, 2, 2, IaxCommand::Ack, &[]),
+            destination,
+        )
+        .unwrap();
+    thread::sleep(Duration::from_millis(10));
+    assert_eq!(peer.poll_ulaw(&mut [0.0; 160]).unwrap(), None);
+    let mut voice = make_full_voice(REMOTE_CALL, LOCAL_CALL, 4, &[0xff; 160]);
+    voice[8] = 2;
+    voice[9] = 1;
+    server.send_to(&voice, destination).unwrap();
+    thread::sleep(Duration::from_millis(10));
+    assert_eq!(peer.poll_ulaw(&mut [0.0; 160]).unwrap(), Some(160));
+    server.recv_from(&mut bytes).unwrap();
+    server
+        .send_to(
+            &frame(REMOTE_CALL, LOCAL_CALL, 3, 1, IaxCommand::Ping, &[]),
+            destination,
+        )
+        .unwrap();
+    thread::sleep(Duration::from_millis(10));
+    assert_eq!(peer.poll_ulaw(&mut [0.0; 160]).unwrap(), None);
+    let (length, _) = server.recv_from(&mut bytes).unwrap();
+    assert_eq!(
+        decode_iax_command(&parse_full_frame_packet(&bytes[..length]).unwrap().header).unwrap(),
+        Some(IaxCommand::Pong)
+    );
+}
+
+fn send_answer(socket: &UdpSocket, client: std::net::SocketAddr, oseq: u8, iseq: u8) {
+    let mut answer = frame(REMOTE_CALL, LOCAL_CALL, oseq, iseq, IaxCommand::Ack, &[]);
+    answer[10] = 4;
+    answer[11] = 4;
+    socket.send_to(&answer, client).unwrap();
+    let mut bytes = [0; 1500];
+    let (length, _) = socket.recv_from(&mut bytes).unwrap();
+    let ack = parse_full_frame_packet(&bytes[..length]).unwrap();
+    assert_eq!(
+        decode_iax_command(&ack.header).unwrap(),
+        Some(IaxCommand::Ack)
+    );
+    assert_eq!(ack.header.incoming_sequence, oseq.wrapping_add(1));
+}
+
 fn frame(
     source: u16,
     destination: u16,
@@ -166,6 +464,7 @@ fn retries_linked_text_as_retransmission_when_ack_is_lost() {
             decode_iax_command(&parse_full_frame_packet(&bytes[..length]).unwrap().header).unwrap(),
             Some(IaxCommand::Ack)
         );
+        send_answer(&handshake, client, 1, 1);
     });
 
     let mut peer = dial_ulaw(DialOptions {
@@ -221,7 +520,7 @@ fn retries_linked_text_as_retransmission_when_ack_is_lost() {
     let acknowledgement = frame(
         REMOTE_CALL,
         LOCAL_CALL,
-        1,
+        2,
         original_header.outgoing_sequence.wrapping_add(1),
         IaxCommand::Ack,
         &[],
@@ -358,14 +657,15 @@ fn dials_an_8khz_ulaw_call_through_calltoken_and_md5_authentication() {
         );
         assert_eq!(ack.header.source_call_number, LOCAL_CALL);
         assert_eq!(ack.header.destination_call_number, REMOTE_CALL);
+        send_answer(&server, client, 2, 2);
 
         let (length, _) = server.recv_from(&mut bytes).unwrap();
         let outbound = parse_voice_frame(&bytes[..length], ULAW).unwrap();
-        let VoiceFrame::Mini {
+        let VoiceFrame::Full {
             header, payload, ..
         } = outbound
         else {
-            panic!("outbound audio must use an IAX mini voice frame");
+            panic!("first outbound audio must establish the ULAW format");
         };
         assert_eq!(header.source_call_number, LOCAL_CALL);
         let mut decoded = [0.0; 160];
@@ -389,8 +689,8 @@ fn dials_an_8khz_ulaw_call_through_calltoken_and_md5_authentication() {
         let mut text_header = parse_full_frame_packet(&frame(
             REMOTE_CALL,
             LOCAL_CALL,
-            2,
-            2,
+            3,
+            3,
             IaxCommand::Accept,
             &[],
         ))
@@ -409,7 +709,7 @@ fn dials_an_8khz_ulaw_call_through_calltoken_and_md5_authentication() {
         );
         assert_eq!(
             (ack.header.outgoing_sequence, ack.header.incoming_sequence),
-            (2, 3)
+            (3, 4)
         );
 
         let (length, _) = server.recv_from(&mut bytes).unwrap();
@@ -557,12 +857,13 @@ fn direct_peer_api_reports_metadata_and_sends_ulaw() {
             decode_iax_command(&acknowledgement.header).unwrap(),
             Some(IaxCommand::Ack)
         );
+        send_answer(&server, client_addr, 1, 1);
 
         let (length, audio_source) = server.recv_from(&mut bytes).unwrap();
         assert_eq!(audio_source, client_addr);
         let outbound = parse_voice_frame(&bytes[..length], IAX_FORMAT_ULAW).unwrap();
-        let VoiceFrame::Mini { payload, .. } = outbound else {
-            panic!("direct ULAW client should transmit a mini voice frame");
+        let VoiceFrame::Full { payload, .. } = outbound else {
+            panic!("direct ULAW client should establish the codec with a full frame");
         };
         let mut decoded = [0.0; 160];
         G711Ulaw.decode(payload, &mut decoded).unwrap();
@@ -571,13 +872,13 @@ fn direct_peer_api_reports_metadata_and_sends_ulaw() {
         send_ie(
             &server,
             client_addr,
-            (REMOTE_CALL, LOCAL_CALL, 1, 1, IaxCommand::Ack),
+            (REMOTE_CALL, LOCAL_CALL, 2, 2, IaxCommand::Ack),
             &[],
         );
         send_ie(
             &server,
             client_addr,
-            (REMOTE_CALL, LOCAL_CALL, 1, 1, IaxCommand::Ping),
+            (REMOTE_CALL, LOCAL_CALL, 2, 2, IaxCommand::Ping),
             &[],
         );
         let (length, _) = server.recv_from(&mut bytes).unwrap();
@@ -586,7 +887,7 @@ fn direct_peer_api_reports_metadata_and_sends_ulaw() {
             Some(IaxCommand::Pong)
         );
 
-        let pong = frame(REMOTE_CALL, LOCAL_CALL, 2, 2, IaxCommand::Pong, &[]);
+        let pong = frame(REMOTE_CALL, LOCAL_CALL, 3, 3, IaxCommand::Pong, &[]);
         let mut duplicate_pong_header = parse_full_frame_packet(&pong).unwrap().header;
         duplicate_pong_header.retransmission = true;
         let duplicate_pong = serialize_full_frame(&duplicate_pong_header, &[]).unwrap();
@@ -606,8 +907,8 @@ fn direct_peer_api_reports_metadata_and_sends_ulaw() {
         let mut text_header = parse_full_frame_packet(&frame(
             REMOTE_CALL,
             LOCAL_CALL,
+            4,
             3,
-            2,
             IaxCommand::Accept,
             &[],
         ))
@@ -632,7 +933,7 @@ fn direct_peer_api_reports_metadata_and_sends_ulaw() {
             decode_iax_command(&parse_full_frame_packet(&bytes[..length]).unwrap().header).unwrap(),
             Some(IaxCommand::Ack)
         );
-        text_header.outgoing_sequence = 4;
+        text_header.outgoing_sequence = 5;
         let oversized_text = serialize_full_frame(&text_header, b"too large").unwrap();
         server.send_to(&oversized_text, client_addr).unwrap();
         let (length, _) = server.recv_from(&mut bytes).unwrap();
@@ -652,8 +953,8 @@ fn direct_peer_api_reports_metadata_and_sends_ulaw() {
                 retransmission: false,
                 destination_call_number: LOCAL_CALL,
                 timestamp: 40,
-                outgoing_sequence: 1,
-                incoming_sequence: 2,
+                outgoing_sequence: 6,
+                incoming_sequence: 3,
                 frame_type: 2,
                 subclass: ULAW as u8,
                 subclass_is_log: false,
@@ -662,6 +963,14 @@ fn direct_peer_api_reports_metadata_and_sends_ulaw() {
         )
         .unwrap();
         server.send_to(&full_voice, client_addr).unwrap();
+        let (length, _) = server.recv_from(&mut bytes).unwrap();
+        assert_eq!(
+            parse_full_frame_packet(&bytes[..length])
+                .unwrap()
+                .header
+                .incoming_sequence,
+            7
+        );
 
         let wrong_full_source = make_full_voice(REMOTE_CALL + 1, LOCAL_CALL, ULAW as u8, &encoded);
         server.send_to(&wrong_full_source, client_addr).unwrap();
@@ -685,7 +994,7 @@ fn direct_peer_api_reports_metadata_and_sends_ulaw() {
         send_ie(
             &server,
             client_addr,
-            (REMOTE_CALL, LOCAL_CALL, 5, 2, IaxCommand::Hangup),
+            (REMOTE_CALL, LOCAL_CALL, 7, 3, IaxCommand::Hangup),
             &[],
         );
         let (length, _) = server.recv_from(&mut bytes).unwrap();
@@ -759,8 +1068,14 @@ fn direct_peer_api_reports_metadata_and_sends_ulaw() {
     assert!(incoming.iter().all(|sample| (*sample - 0.125).abs() < 0.02));
 
     for _ in 0..4 {
+        let result = loop {
+            match peer.poll_ulaw(&mut incoming) {
+                Ok(None) => thread::sleep(Duration::from_millis(1)),
+                result => break result,
+            }
+        };
         assert!(matches!(
-            peer.poll_ulaw(&mut incoming),
+            result,
             Err(DialError::Voice(
                 crate::media::VoiceFrameError::NotVoiceFrame
             ))
@@ -813,6 +1128,7 @@ fn direct_peer_reports_radio_key_control_frames() {
             decode_iax_command(&parse_full_frame_packet(&bytes[..length]).unwrap().header).unwrap(),
             Some(IaxCommand::Ack)
         );
+        send_answer(&responder, client, 1, 1);
         client
     });
     let mut peer = dial_ulaw(DialOptions {
@@ -843,7 +1159,7 @@ fn direct_peer_reports_radio_key_control_frames() {
         .unwrap()
     };
     let mut samples = [0.0; 160];
-    for (subclass, expected, sequence) in [(12, "RadioKey", 1), (13, "RadioUnkey", 2)] {
+    for (subclass, expected, sequence) in [(12, "RadioKey", 2), (13, "RadioUnkey", 3)] {
         server
             .send_to(&control(subclass, sequence), client)
             .unwrap();

@@ -74,6 +74,14 @@ fn send_dtmf_rejects_invalid_digits_and_unlinked_calls() {
     );
 }
 
+#[test]
+fn send_ulaw_frame_rejects_unlinked_calls() {
+    assert_eq!(
+        setup().send_ulaw_frame(&[0xff], 25),
+        Err(CallSetupError::NotLinked)
+    );
+}
+
 fn accept_packet() -> Vec<u8> {
     serialize_full_frame(
         &FullFrameHeader {
@@ -123,6 +131,43 @@ fn public_receive_maps_setup_accept_and_linked_ack_responses() {
         setup.receive(&acknowledgement, 2, ""),
         Ok(CallSetupResponse::NoAction)
     );
+}
+
+#[test]
+fn public_receive_maps_setup_ack_without_linking() {
+    let mut call = setup();
+    assert_eq!(
+        call.receive(&control_frame(IaxCommand::Ack, 0, 1, 1), 1, ""),
+        Ok(CallSetupResponse::NoAction)
+    );
+    assert!(!call.is_linked());
+}
+
+#[test]
+fn public_receive_acknowledges_linked_answer() {
+    let mut call = setup();
+    call.receive(&accept_packet(), 1, "").unwrap();
+    let answer = serialize_full_frame(
+        &FullFrameHeader {
+            source_call_number: 77,
+            retransmission: false,
+            destination_call_number: 1,
+            timestamp: 2,
+            outgoing_sequence: 1,
+            incoming_sequence: 1,
+            frame_type: 4,
+            subclass: 4,
+            subclass_is_log: false,
+        },
+        &[],
+    )
+    .unwrap();
+    let CallSetupResponse::Send(acknowledgement) = call.receive(&answer, 2, "").unwrap() else {
+        panic!("linked ANSWER must be acknowledged");
+    };
+    let ack = parse_full_frame_packet(&acknowledgement).unwrap();
+    assert_eq!(decode_iax_command(&ack.header), Ok(Some(IaxCommand::Ack)));
+    assert_eq!(ack.header.incoming_sequence, 2);
 }
 
 #[test]

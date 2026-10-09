@@ -26,7 +26,42 @@ fn linked_peer(remote: SocketAddr) -> IaxPeer {
         connected_at: Instant::now(),
         setup: OutboundCallSetup::for_inbound_call(1234, 5678).unwrap(),
         pending_reliable: VecDeque::new(),
+        pending_events: VecDeque::new(),
+        answered: true,
+        voice_epoch: None,
         release_on_drop: None,
+    }
+}
+
+#[test]
+fn interop_ffi_preserves_delayed_first_voice_and_silent_gap_timestamp_epochs() {
+    let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
+    remote
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    let mut peer = linked_peer(remote.local_addr().unwrap());
+    let descriptor = unsafe { &*crate::ffi::rptadv_iax2_client_descriptor_v1() };
+    let samples = [0.0; 160];
+    let mut packet = [0; 1500];
+    for elapsed in [70020, 140040] {
+        peer.connected_at = Instant::now() - Duration::from_millis(elapsed);
+        assert_eq!(
+            unsafe {
+                descriptor.send_audio.unwrap()(
+                    (&mut peer as *mut IaxPeer).cast(),
+                    samples.as_ptr(),
+                    samples.len(),
+                )
+            },
+            0
+        );
+        let (length, _) = remote.recv_from(&mut packet).unwrap();
+        let voice = crate::protocol::parse_full_frame_packet(&packet[..length])
+            .expect("new epoch requires full voice");
+        assert!(
+            (elapsed..elapsed + 1000).contains(&u64::from(voice.header.timestamp)),
+            "full voice must retain elapsed epoch"
+        );
     }
 }
 

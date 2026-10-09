@@ -362,6 +362,8 @@ pub enum CallSetupResponse {
 
 /// Response possible before an outbound call has reached the linked state.
 pub(crate) enum OutboundSetupResponse {
+    /// The current setup transmission was acknowledged; await the next response.
+    NoAction,
     /// Send the next setup packet.
     Send(Vec<u8>),
     /// The peer accepted the call.
@@ -377,6 +379,12 @@ pub(crate) enum OutboundSetupResponse {
 
 /// Response possible after an outbound call has reached the linked state.
 pub(crate) enum LinkedCallResponse {
+    /// The peer answered the accepted call.
+    Answered {
+        acknowledgement: Vec<u8>,
+    },
+    /// Send and retain a newly sequenced reliable reply.
+    SendReliable(Vec<u8>),
     /// Send the next protocol packet.
     Send(Vec<u8>),
     /// A PONG was acknowledged.
@@ -411,6 +419,7 @@ pub(crate) enum LinkedCallResponse {
 impl From<OutboundSetupResponse> for CallSetupResponse {
     fn from(response: OutboundSetupResponse) -> Self {
         match response {
+            OutboundSetupResponse::NoAction => Self::NoAction,
             OutboundSetupResponse::Send(packet) => Self::Send(packet),
             OutboundSetupResponse::Accepted {
                 format,
@@ -430,7 +439,10 @@ impl From<OutboundSetupResponse> for CallSetupResponse {
 impl From<LinkedCallResponse> for CallSetupResponse {
     fn from(response: LinkedCallResponse) -> Self {
         match response {
-            LinkedCallResponse::Send(packet) => Self::Send(packet),
+            LinkedCallResponse::Send(packet) | LinkedCallResponse::SendReliable(packet) => {
+                Self::Send(packet)
+            }
+            LinkedCallResponse::Answered { acknowledgement } => Self::Send(acknowledgement),
             LinkedCallResponse::PongAcknowledged {
                 acknowledgement,
                 matched_probe,
@@ -588,6 +600,41 @@ impl OutboundCallSetup {
         Ok(packet)
     }
 
+    /// Establish the outgoing ULAW codec with a sequenced full voice frame.
+    pub(crate) fn send_ulaw_frame(
+        &mut self,
+        payload: &[u8],
+        timestamp_ms: u32,
+    ) -> Result<Vec<u8>, CallSetupError> {
+        if self.state != State::Linked {
+            return Err(CallSetupError::NotLinked);
+        }
+        let remote_call = self.remote_call.ok_or(CallSetupError::CallFinished)?;
+        let mut header = self.outgoing_header(remote_call, timestamp_ms, self.next_incoming, 4);
+        header.frame_type = 2;
+        let packet = serialize_full_frame(&header, payload).map_err(CallSetupError::Frame)?;
+        self.next_outgoing = self.next_outgoing.wrapping_add(1);
+        Ok(packet)
+    }
+
+    /// Sequence a validated full voice frame and suppress duplicate media delivery.
+    pub(crate) fn receive_voice(
+        &mut self,
+        header: &FullFrameHeader,
+    ) -> Result<(bool, Vec<u8>), CallSetupError> {
+        self.validate_call_ids(header)?;
+        // The bounded reliable window makes older sequence positions unambiguous,
+        // even after an intervening control frame replaced the reply cache.
+        if (1..=64).contains(&self.next_incoming.wrapping_sub(header.outgoing_sequence)) {
+            return Ok((false, self.acknowledgement(header, self.next_incoming)?));
+        }
+        self.validate_peer_header(header)?;
+        let next_incoming = self.next_incoming.wrapping_add(1);
+        let acknowledgement = self.acknowledgement(header, next_incoming)?;
+        self.next_incoming = next_incoming;
+        Ok((true, acknowledgement))
+    }
+
     /// Build one sequenced IAX DTMF full frame for a linked call.
     pub fn send_dtmf(&mut self, digit: u8, timestamp_ms: u32) -> Result<Vec<u8>, CallSetupError> {
         if self.state != State::Linked {
@@ -682,6 +729,10 @@ impl OutboundCallSetup {
 
         self.validate_peer_header(&frame.header)?;
         match command {
+            IaxCommand::Ack => {
+                self.remote_call = Some(frame.header.source_call_number);
+                Ok(OutboundSetupResponse::NoAction)
+            }
             IaxCommand::AuthReq if self.state == State::AwaitingResponse => {
                 let auth =
                     parse_auth_request(frame.payload).map_err(CallSetupError::Authentication)?;
@@ -721,9 +772,14 @@ impl OutboundCallSetup {
 
     fn validate_peer_header(&self, header: &FullFrameHeader) -> Result<(), CallSetupError> {
         self.validate_call_ids(header)?;
-        if header.outgoing_sequence != self.next_incoming
-            || header.incoming_sequence != self.next_outgoing
-        {
+        let valid_ack = if self.state == State::Linked {
+            // ACK datagrams may overtake earlier voice/control. Accept bounded
+            // stale cumulative ACKs; the network send window alone retires frames.
+            self.next_outgoing.wrapping_sub(header.incoming_sequence) <= 64
+        } else {
+            header.incoming_sequence == self.next_outgoing
+        };
+        if header.outgoing_sequence != self.next_incoming || !valid_ack {
             return Err(CallSetupError::SequenceMismatch {
                 expected_outgoing: self.next_incoming,
                 actual_outgoing: header.outgoing_sequence,
@@ -804,6 +860,7 @@ impl OutboundCallSetup {
         self.next_incoming = next_incoming;
         self.remember_response(None, header, payload, acknowledgement.clone());
         Ok(match subclass {
+            4 => LinkedCallResponse::Answered { acknowledgement },
             12 => LinkedCallResponse::RadioKey { acknowledgement },
             13 => LinkedCallResponse::RadioUnkey { acknowledgement },
             _ => LinkedCallResponse::Send(acknowledgement),
@@ -822,14 +879,19 @@ impl OutboundCallSetup {
         }
         self.validate_peer_header(header)?;
         match command {
-            IaxCommand::Ping => {
+            IaxCommand::Ping | IaxCommand::LagRq => {
                 let next_incoming = self.next_incoming.wrapping_add(1);
+                let reply = if command == IaxCommand::Ping {
+                    IaxCommand::Pong
+                } else {
+                    IaxCommand::LagRp
+                };
                 let pong = serialize_full_frame(
                     &self.outgoing_header(
                         header.source_call_number,
                         header.timestamp,
                         next_incoming,
-                        IaxCommand::Pong.subclass_value() as u8,
+                        reply.subclass_value() as u8,
                     ),
                     &[],
                 )
@@ -837,7 +899,7 @@ impl OutboundCallSetup {
                 self.next_outgoing = self.next_outgoing.wrapping_add(1);
                 self.next_incoming = next_incoming;
                 self.remember_response(Some(command), header, payload, pong.clone());
-                Ok(LinkedCallResponse::Send(pong))
+                Ok(LinkedCallResponse::SendReliable(pong))
             }
             IaxCommand::Pong => {
                 let next_incoming = self.next_incoming.wrapping_add(1);
@@ -853,12 +915,15 @@ impl OutboundCallSetup {
                     matched_probe,
                 })
             }
-            IaxCommand::Hangup => {
+            IaxCommand::Hangup | IaxCommand::LagRp => {
                 let next_incoming = self.next_incoming.wrapping_add(1);
                 let acknowledgement = self.acknowledgement(header, next_incoming)?;
                 self.next_incoming = next_incoming;
-                self.state = State::Ended;
                 self.remember_response(Some(command), header, payload, acknowledgement.clone());
+                if command == IaxCommand::LagRp {
+                    return Ok(LinkedCallResponse::Send(acknowledgement));
+                }
+                self.state = State::Ended;
                 Ok(LinkedCallResponse::Ended { acknowledgement })
             }
             _ => Err(CallSetupError::UnexpectedCommand { command }),

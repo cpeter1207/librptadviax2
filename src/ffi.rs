@@ -394,12 +394,12 @@ unsafe extern "C" fn dial(
 
 unsafe extern "C" fn send_audio(peer: *mut c_void, samples: *const f32, count: usize) -> i32 {
     boundary(-1, || {
-        let (Some(peer), Some(samples)) = (unsafe { peer.cast::<IaxPeer>().as_ref() }, unsafe {
+        let (Some(peer), Some(samples)) = (unsafe { peer.cast::<IaxPeer>().as_mut() }, unsafe {
             input_slice(samples, count)
         }) else {
             return -1;
         };
-        peer.send_ulaw(samples, peer.elapsed_ms() as u16)
+        peer.send_ulaw(samples, peer.elapsed_ms())
             .map_or_else(|_| -1, |_| 0)
     })
 }
@@ -520,6 +520,7 @@ fn dial_error_code(error: DialError) -> i32 {
         DialError::Rejected => -4,
         DialError::UnsupportedFormat(_) => -5,
         DialError::Hangup
+        | DialError::EarlyEventsFull
         | DialError::ReliableWindowFull
         | DialError::Protocol(_)
         | DialError::Voice(_)
