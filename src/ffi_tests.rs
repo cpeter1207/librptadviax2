@@ -109,6 +109,12 @@ fn establish() -> (*mut c_void, UdpSocket, SocketAddr) {
         .unwrap();
         server.send_to(&accept, client).unwrap();
         let _ = server.recv_from(&mut packet).unwrap(); // ACK.
+        let mut answer = accept[..12].to_vec();
+        answer[8] = 1;
+        answer[10] = 4;
+        answer[11] = 4;
+        server.send_to(&answer, client).unwrap();
+        let _ = server.recv_from(&mut packet).unwrap(); // ANSWER ACK.
         (server, client)
     });
 
@@ -513,6 +519,7 @@ fn dial_error_codes_and_slice_boundaries_are_explicit() {
     assert_eq!(dial_error_code(DialError::UnsupportedFormat(8)), -5);
     assert_eq!(dial_error_code(DialError::Hangup), -6);
     assert_eq!(dial_error_code(DialError::ReliableWindowFull), -6);
+    assert_eq!(dial_error_code(DialError::EarlyEventsFull), -6);
     assert_eq!(
         dial_error_code(DialError::Protocol(CallSetupError::NotLinked)),
         -6
@@ -674,7 +681,7 @@ fn c_peer_api_reports_events_and_rejects_invalid_buffers() {
             retransmission: false,
             destination_call_number: LOCAL_CALL,
             timestamp: 25,
-            outgoing_sequence: 1,
+            outgoing_sequence: 2,
             incoming_sequence: 1,
             frame_type: 7,
             subclass: 0,
@@ -709,7 +716,7 @@ fn c_peer_api_reports_events_and_rejects_invalid_buffers() {
             retransmission: false,
             destination_call_number: LOCAL_CALL,
             timestamp: 26,
-            outgoing_sequence: 2,
+            outgoing_sequence: 3,
             incoming_sequence: 1,
             frame_type: 1,
             subclass: b'5',
@@ -737,8 +744,8 @@ fn c_peer_api_reports_events_and_rejects_invalid_buffers() {
     assert!(server.recv_from(&mut ack).is_ok());
 
     for (subclass, expected, sequence) in [
-        (12, RPTADV_IAX2_EVENT_RADIO_KEY, 3),
-        (13, RPTADV_IAX2_EVENT_RADIO_UNKEY, 4),
+        (12, RPTADV_IAX2_EVENT_RADIO_KEY, 4),
+        (13, RPTADV_IAX2_EVENT_RADIO_UNKEY, 5),
     ] {
         let control = serialize_full_frame(
             &FullFrameHeader {
@@ -780,7 +787,7 @@ fn c_peer_api_reports_events_and_rejects_invalid_buffers() {
             retransmission: false,
             destination_call_number: LOCAL_CALL,
             timestamp: 30,
-            outgoing_sequence: 5,
+            outgoing_sequence: 6,
             incoming_sequence: 1,
             frame_type: 6,
             subclass: encode_subclass(crate::protocol::IaxCommand::Hangup.subclass_value())
@@ -820,7 +827,7 @@ fn c_peer_api_rejects_dtmf_without_text_storage() {
             retransmission: false,
             destination_call_number: LOCAL_CALL,
             timestamp: 1,
-            outgoing_sequence: 0,
+            outgoing_sequence: 2,
             incoming_sequence: 1,
             frame_type: 1,
             subclass: b'5',

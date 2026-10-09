@@ -20,6 +20,8 @@ pub mod text;
 #[cfg(test)]
 mod call_token_server_tests;
 #[cfg(test)]
+mod client_answer_tests;
+#[cfg(test)]
 mod client_tests;
 #[cfg(test)]
 mod inbound_tests;
