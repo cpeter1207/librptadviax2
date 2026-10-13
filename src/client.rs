@@ -9,6 +9,7 @@ use crate::{
         parse_voice_frame,
     },
     network::UdpEndpoint,
+    playout::Playout,
     protocol::{MiniFrameHeader, parse_full_frame_packet},
     session::{CallSetupError, LinkedCallResponse, OutboundCallSetup, OutboundSetupResponse},
 };
@@ -94,6 +95,8 @@ pub enum DialError {
     Encode(VoiceFrameEncodeError),
     /// Decoded μ-law PCM does not fit in caller-owned storage.
     Decode(CodecError),
+    /// The composed jitter capability rejected an operation or returned invalid media.
+    Jitter,
 }
 
 /// Established call metadata retained with its private UDP endpoint.
@@ -110,6 +113,8 @@ pub struct IaxPeer {
     answered: bool,
     voice_epoch: Option<u32>,
     release_on_drop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    async_attached: bool,
+    playout: Option<Playout>,
 }
 
 enum PeerEndpoint {
@@ -136,11 +141,19 @@ impl PeerEndpoint {
         }
     }
 
-    fn receive(&mut self, buffer: &mut [u8]) -> io::Result<Option<(usize, SocketAddr)>> {
+    fn receive(&mut self, buffer: &mut [u8]) -> io::Result<Option<(usize, SocketAddr, Instant)>> {
         match self {
-            Self::Dedicated(endpoint) => endpoint.try_receive(buffer),
+            Self::Dedicated(endpoint) => endpoint
+                .try_receive(buffer)
+                .map(|packet| packet.map(|(length, address)| (length, address, Instant::now()))),
             Self::Shared { ingress, .. } => {
                 let Some(datagram) = ingress.try_pop() else {
+                    if ingress.failed() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::ConnectionAborted,
+                            "IAX receive task failed",
+                        ));
+                    }
                     return Ok(None);
                 };
                 let payload = datagram.payload();
@@ -151,7 +164,11 @@ impl PeerEndpoint {
                     ));
                 }
                 buffer[..payload.len()].copy_from_slice(payload);
-                Ok(Some((payload.len(), datagram.remote())))
+                Ok(Some((
+                    payload.len(),
+                    datagram.remote(),
+                    datagram.arrived_at(),
+                )))
             }
         }
     }
@@ -164,6 +181,8 @@ pub enum IaxPeerEvent {
     None,
     /// Decoded audio samples were written to the supplied PCM buffer.
     Audio(usize),
+    /// Ordered missing/inserted 8kHz source samples; the receiver's PCM ring owns PLC.
+    Gap(usize),
     /// A reliable ASL text message was copied to the supplied byte buffer.
     Text(usize),
     /// One decoded DTMF digit was acknowledged.
@@ -176,7 +195,137 @@ pub enum IaxPeerEvent {
     Hangup,
 }
 
+/// ABI1 owner-thread diagnostics. Durations use 8kHz source samples, not ring units.
+/// Gauges are current; counters are cumulative for the connection lifetime.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct IaxPeerObservation {
+    /// Complete record size, currently 112 bytes.
+    pub struct_size: u32,
+    /// Record revision, currently one.
+    pub abi_version: u32,
+    /// Opaque packets retained by jitter.
+    pub jitter_queued_packets: u32,
+    /// Current packet delay in source samples.
+    pub jitter_delay_samples: u32,
+    /// Sum of retained packet spans, including overlap.
+    pub jitter_buffered_span_samples: u64,
+    /// Duplicate packet drops.
+    pub jitter_duplicate_drops: u64,
+    /// Late packet drops.
+    pub jitter_late_drops: u64,
+    /// Jitter-capacity packet drops.
+    pub jitter_full_drops: u64,
+    /// Ordered missing source samples released.
+    pub jitter_missing_samples: u64,
+    /// Source samples inserted to increase delay.
+    pub jitter_insertion_samples: u64,
+    /// Source samples skipped to reduce delay.
+    pub jitter_skipped_samples: u64,
+    /// Resets caused by the maximum delay bound.
+    pub jitter_limit_resets: u64,
+    /// Queued packets discarded by maximum-delay resets.
+    pub jitter_overload_drops: u64,
+    /// Sum of packet spans discarded by maximum-delay resets.
+    pub jitter_overload_span_samples: u64,
+    /// Datagrams rejected by a full ingress mailbox.
+    pub ingress_overflow_drops: u64,
+    /// Current mailbox depth.
+    pub ingress_queued_packets: u32,
+    /// Fixed mailbox capacity.
+    pub ingress_capacity_packets: u32,
+}
+
 impl IaxPeer {
+    /// Read only on the exclusive callback owner or after it is quiesced.
+    /// Requires composed jitter and queue-backed ingress; never call from audio.
+    pub fn observe(&self) -> Result<IaxPeerObservation, DialError> {
+        let PeerEndpoint::Shared { ingress, .. } = &self.endpoint else {
+            return Err(DialError::InvalidOptions);
+        };
+        let jitter = self
+            .playout
+            .as_ref()
+            .ok_or(DialError::InvalidOptions)?
+            .observe()?;
+        let ingress = ingress.stats();
+        Ok(IaxPeerObservation {
+            struct_size: std::mem::size_of::<IaxPeerObservation>() as u32,
+            abi_version: 1,
+            jitter_queued_packets: jitter.queued_packets,
+            jitter_delay_samples: jitter.delay,
+            jitter_buffered_span_samples: jitter.buffered_span,
+            jitter_duplicate_drops: jitter.duplicate_drops,
+            jitter_late_drops: jitter.late_drops,
+            jitter_full_drops: jitter.full_drops,
+            jitter_missing_samples: jitter.missing_span,
+            jitter_insertion_samples: jitter.insertion_span,
+            jitter_skipped_samples: jitter.skipped_span,
+            jitter_limit_resets: jitter.limit_resets,
+            jitter_overload_drops: jitter.overload_drops,
+            jitter_overload_span_samples: jitter.overload_span,
+            ingress_overflow_drops: ingress.dropped_packets,
+            ingress_queued_packets: ingress.queued_packets as u32,
+            ingress_capacity_packets: ingress.capacity_packets as u32,
+        })
+    }
+
+    /// Compose optional packet jitter before attaching the exclusive async owner.
+    ///
+    /// # Safety
+    /// The descriptor must be readable for its declared size and its DSO must
+    /// remain loaded until this peer is destroyed, after async-owner quiescence.
+    pub unsafe fn configure_jitter(
+        &mut self,
+        descriptor: *const std::ffi::c_void,
+    ) -> Result<(), DialError> {
+        if self.async_attached || self.playout.is_some() {
+            return Err(DialError::InvalidOptions);
+        }
+        let jitter = unsafe { crate::jitter::Jitter::new(descriptor) }
+            .map_err(|_| DialError::InvalidOptions)?;
+        self.playout = Some(Playout::new(jitter, self.connected_at));
+        Ok(())
+    }
+
+    /// Prepare one queue-backed receive owner before its retained callback starts.
+    /// Dedicated sockets transfer receive ownership to the returned async pump.
+    pub(crate) fn prepare_async_ingress(
+        &mut self,
+        runtime: &tokio::runtime::Handle,
+    ) -> io::Result<(
+        crate::ingress::IngressWake,
+        Option<(tokio::net::UdpSocket, crate::ingress::IngressProducer)>,
+    )> {
+        if self.async_attached {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "peer async attachment is one-shot",
+            ));
+        }
+        let shared = match &self.endpoint {
+            PeerEndpoint::Shared { ingress, .. } => {
+                self.async_attached = true;
+                return Ok((ingress.wake(), None));
+            }
+            PeerEndpoint::Dedicated(endpoint) => endpoint.shared_socket(),
+        };
+        let _entered = runtime.enter();
+        let socket = tokio::net::UdpSocket::from_std(shared.try_clone()?)?;
+        let local = shared.local_addr()?;
+        // Each retired endpoint keeps its own queue; reusing call numbers cannot reuse it.
+        let (producer, ingress) = crate::ingress::producer_ingress(64, u64::from(self.local_call))
+            .map_err(|_| io::Error::other("invalid IAX ingress capacity"))?;
+        let wake = ingress.wake();
+        self.endpoint = PeerEndpoint::Shared {
+            socket: shared,
+            ingress,
+            local,
+        };
+        self.async_attached = true;
+        Ok((wake, Some((socket, producer))))
+    }
+
     pub(crate) fn from_inbound(
         socket: std::sync::Arc<UdpSocket>,
         ingress: IngressConsumer,
@@ -206,8 +355,20 @@ impl IaxPeer {
             answered: true,
             voice_epoch: None,
             release_on_drop: Some(std::sync::Arc::clone(&released)),
+            async_attached: false,
+            playout: None,
         };
         Ok((peer, released))
+    }
+
+    /// Send an authorized inbound ACCEPT and ANSWER through the normal reliable window.
+    pub(crate) fn accept_inbound(&mut self, accept: Vec<u8>) -> Result<(), DialError> {
+        let answer = self
+            .setup
+            .send_answer(self.elapsed_ms())
+            .map_err(DialError::Protocol)?;
+        self.send_reliable(accept)?;
+        self.send_reliable(answer)
     }
 
     /// Negotiated IAX codec-format bit.
@@ -378,18 +539,42 @@ impl IaxPeer {
         text: &mut [u8],
     ) -> Result<IaxPeerEvent, DialError> {
         self.retry_reliable_frames()?;
-        let mut packet = [0_u8; 1500];
-        let Some((length, address)) = self
-            .endpoint
-            .receive(&mut packet)
-            .map_err(DialError::Network)?
-        else {
-            return Ok(IaxPeerEvent::None);
-        };
-        if address != self.remote {
-            return Ok(IaxPeerEvent::None);
+        // Admit the bounded receive batch before advancing packet time. Otherwise
+        // executor batching would masquerade as network loss in already due media.
+        for _ in 0..MAX_RELIABLE_WINDOW {
+            if self.playout.as_ref().is_some_and(Playout::blocks_transport) {
+                break;
+            }
+            let mut packet = [0_u8; MAX_PACKET_SIZE];
+            let Some((length, address, arrived_at)) = self
+                .endpoint
+                .receive(&mut packet)
+                .map_err(DialError::Network)?
+            else {
+                break;
+            };
+            let event = if address == self.remote {
+                self.receive_event(&packet[..length], arrived_at, pcm, text)?
+            } else {
+                IaxPeerEvent::None
+            };
+            if self.playout.is_none() || event != IaxPeerEvent::None {
+                return Ok(event);
+            }
         }
-        let bytes = &packet[..length];
+        match &mut self.playout {
+            Some(playout) => playout.poll(Instant::now(), pcm),
+            None => Ok(IaxPeerEvent::None),
+        }
+    }
+
+    fn receive_event(
+        &mut self,
+        bytes: &[u8],
+        arrived_at: Instant,
+        pcm: &mut [f32],
+        text: &mut [u8],
+    ) -> Result<IaxPeerEvent, DialError> {
         if bytes.first().is_some_and(|byte| byte & 0x80 != 0) {
             let frame = parse_full_frame_packet(bytes)
                 .map_err(|_| DialError::Protocol(CallSetupError::InvalidFrame))?;
@@ -452,12 +637,21 @@ impl IaxPeer {
                         self.endpoint
                             .send_to(&acknowledgement, self.remote)
                             .map_err(DialError::Network)?;
+                        if let Some(playout) = &mut self.playout {
+                            if !playout.key(frame.header.timestamp)? {
+                                return Ok(IaxPeerEvent::None);
+                            }
+                        }
                         return Ok(IaxPeerEvent::RadioKey);
                     }
                     LinkedCallResponse::RadioUnkey { acknowledgement } => {
                         self.endpoint
                             .send_to(&acknowledgement, self.remote)
                             .map_err(DialError::Network)?;
+                        if let Some(playout) = &mut self.playout {
+                            playout.unkey();
+                            return Ok(IaxPeerEvent::None);
+                        }
                         return Ok(IaxPeerEvent::RadioUnkey);
                     }
                     LinkedCallResponse::NoAction => return Ok(IaxPeerEvent::None),
@@ -470,7 +664,7 @@ impl IaxPeer {
         }
 
         let voice = parse_voice_frame(bytes, self.format).map_err(DialError::Voice)?;
-        let payload = match voice {
+        let (payload, timestamp, mini) = match voice {
             VoiceFrame::Full {
                 header,
                 format,
@@ -479,10 +673,12 @@ impl IaxPeer {
                 && header.destination_call_number == self.local_call
                 && format == self.format =>
             {
-                let (deliver, acknowledgement) = self
-                    .setup
-                    .receive_media(&header)
-                    .map_err(DialError::Protocol)?;
+                let (deliver, acknowledgement) = if self.playout.is_some() {
+                    self.setup.receive_media_reordered(&header)
+                } else {
+                    self.setup.receive_media(&header)
+                }
+                .map_err(DialError::Protocol)?;
                 self.acknowledge_reliable_frames(header.incoming_sequence);
                 self.endpoint
                     .send_to(&acknowledgement, self.remote)
@@ -490,13 +686,19 @@ impl IaxPeer {
                 if !deliver {
                     return Ok(IaxPeerEvent::None);
                 }
-                payload
+                (payload, header.timestamp, false)
             }
             VoiceFrame::Mini {
                 header, payload, ..
-            } if header.source_call_number == self.remote_call => payload,
+            } if header.source_call_number == self.remote_call => {
+                (payload, u32::from(header.timestamp), true)
+            }
             _ => return Err(DialError::Voice(VoiceFrameError::NotVoiceFrame)),
         };
+        if let Some(playout) = &mut self.playout {
+            playout.put(timestamp, mini, arrived_at, payload)?;
+            return Ok(IaxPeerEvent::None);
+        }
         G711Ulaw
             .decode(payload, pcm)
             .map(IaxPeerEvent::Audio)
@@ -556,13 +758,17 @@ impl IaxPeer {
         Ok(())
     }
 
-    /// Poll one datagram and decode only audio; text/control events are handled internally.
+    /// Legacy audio-only polling without composed jitter; use `poll_event` for ordered gaps.
     pub fn poll_ulaw(&mut self, pcm: &mut [f32]) -> Result<Option<usize>, DialError> {
+        if self.playout.is_some() {
+            return Err(DialError::InvalidOptions);
+        }
         let mut text = [0_u8; 1500];
         match self.poll_event(pcm, &mut text)? {
             IaxPeerEvent::Audio(count) => Ok(Some(count)),
             IaxPeerEvent::Hangup => Err(DialError::Hangup),
             IaxPeerEvent::None
+            | IaxPeerEvent::Gap(_)
             | IaxPeerEvent::Text(_)
             | IaxPeerEvent::Digit(_)
             | IaxPeerEvent::RadioKey
@@ -720,6 +926,8 @@ pub fn dial_ulaw(options: DialOptions<'_>) -> Result<IaxPeer, DialError> {
                     answered: false,
                     voice_epoch: None,
                     release_on_drop: None,
+                    async_attached: false,
+                    playout: None,
                 };
                 peer.wait_answer(deadline)?;
                 return Ok(peer);

@@ -1,8 +1,13 @@
-//! Fixed-storage SPSC handoff for one ingress-producer-to-peer-owner pair.
+//! Bounded per-connection packet mailboxes, separate from real-time PCM exchange.
 
-use rtrb::{Consumer, Producer, PushError, RingBuffer};
 use std::net::SocketAddr;
-use std::{collections::HashMap, num::NonZeroUsize};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+};
+use std::{collections::HashMap, num::NonZeroUsize, time::Instant};
+use tokio::sync::Notify;
+use tokio::sync::mpsc::{self, Receiver, Sender, error::TrySendError};
 
 /// Maximum UDP payload retained by one queued IAX datagram.
 pub const MAX_DATAGRAM_SIZE: usize = 1500;
@@ -17,6 +22,8 @@ pub enum IngressError {
 /// Why a datagram could not be queued by one ingress producer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IngressPushError {
+    /// The sole connection owner has gone away; no more work can be admitted.
+    Closed,
     /// The datagram is larger than the fixed packet storage.
     DatagramTooLarge {
         /// Number of bytes in the rejected datagram.
@@ -53,24 +60,32 @@ pub enum PeerIngressRouterError {
 }
 
 /// Observable occupancy and drop count for one routed peer.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct IngressStats {
     /// Number of packets waiting for the peer owner.
     pub queued_packets: usize,
     /// Number of packets rejected because its queue was full.
     pub dropped_packets: u64,
+    /// Maximum number of packets retained by this queue.
+    pub capacity_packets: usize,
 }
 
 /// One copied datagram handed to a peer's serialized media owner.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct InboundDatagram {
     generation: u64,
+    arrived_at: Instant,
     remote: SocketAddr,
     length: usize,
     payload: [u8; MAX_DATAGRAM_SIZE],
 }
 
 impl InboundDatagram {
+    /// Monotonic socket-receipt time, retained independently of executor delay.
+    pub const fn arrived_at(&self) -> Instant {
+        self.arrived_at
+    }
+
     /// Peer/session generation assigned when this producer-owner pair was created.
     pub const fn generation(&self) -> u64 {
         self.generation
@@ -87,15 +102,37 @@ impl InboundDatagram {
     }
 }
 
-/// The sole producer handle for one bounded packet queue.
+/// Cloneable packet admission handle; all clones feed the same exclusive owner.
+#[derive(Clone)]
 pub struct IngressProducer {
-    queue: Producer<InboundDatagram>,
+    queue: Sender<InboundDatagram>,
     generation: u64,
+    wake: IngressWake,
 }
 
 impl IngressProducer {
-    /// Copy one datagram into the queue without blocking or allocating.
+    /// Publish a terminal socket failure without waiting for packet-queue capacity.
+    pub fn fail(&self) {
+        self.wake.0.failed.store(true, Ordering::Release);
+        self.wake.0.ready.notify_one();
+    }
+
+    /// Admit a datagram immediately, recording receipt at this call.
     pub fn try_push(&mut self, remote: SocketAddr, payload: &[u8]) -> Result<(), IngressPushError> {
+        self.try_push_at(remote, payload, Instant::now())
+    }
+
+    /// Copy a socket-received datagram without waiting for queue space.
+    ///
+    /// This non-audio mailbox may allocate Tokio queue blocks. Admission order
+    /// is preserved; receive timestamps prevent executor batching from becoming
+    /// apparent network jitter. PCM consumers never enter this mailbox.
+    pub fn try_push_at(
+        &mut self,
+        remote: SocketAddr,
+        payload: &[u8],
+        arrived_at: Instant,
+    ) -> Result<(), IngressPushError> {
         if payload.len() > MAX_DATAGRAM_SIZE {
             return Err(IngressPushError::DatagramTooLarge {
                 length: payload.len(),
@@ -103,31 +140,79 @@ impl IngressProducer {
         }
         let mut packet = InboundDatagram {
             generation: self.generation,
+            arrived_at,
             remote,
             length: payload.len(),
             payload: [0; MAX_DATAGRAM_SIZE],
         };
         packet.payload[..payload.len()].copy_from_slice(payload);
-        self.queue
-            .push(packet)
-            .map_err(|PushError::Full(_)| IngressPushError::Full)
+        // Increment before publication: the consumer may remove the packet immediately.
+        self.wake.0.pending.fetch_add(1, Ordering::AcqRel);
+        self.queue.try_send(packet).map_err(|error| {
+            self.wake.0.pending.fetch_sub(1, Ordering::AcqRel);
+            match error {
+                TrySendError::Full(_) => {
+                    let _ = self.wake.0.dropped.fetch_update(
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                        |count| Some(count.saturating_add(1)),
+                    );
+                    IngressPushError::Full
+                }
+                TrySendError::Closed(_) => IngressPushError::Closed,
+            }
+        })?;
+        self.wake.0.ready.notify_one();
+        Ok(())
     }
 
     /// Number of slots currently available to this producer.
     pub fn available_slots(&self) -> usize {
-        self.queue.slots()
+        self.queue.capacity()
+    }
+
+    fn stats(&self) -> IngressStats {
+        IngressStats {
+            queued_packets: self.queue.max_capacity() - self.queue.capacity(),
+            dropped_packets: self.wake.0.dropped.load(Ordering::Relaxed),
+            capacity_packets: self.queue.max_capacity(),
+        }
     }
 }
 
 /// The sole peer-owner consumer handle for one bounded packet queue.
 pub struct IngressConsumer {
-    queue: Consumer<InboundDatagram>,
+    queue: Receiver<InboundDatagram>,
+    wake: IngressWake,
+}
+
+/// Readiness only; cloning this handle never grants packet-consumer ownership.
+#[derive(Clone, Default)]
+pub struct IngressWake(Arc<IngressReadiness>);
+
+#[derive(Default)]
+struct IngressReadiness {
+    ready: Notify,
+    pending: AtomicUsize,
+    failed: AtomicBool,
+    dropped: AtomicU64,
+}
+
+impl IngressWake {
+    /// Wait for a successful enqueue, retaining a notification received before this wait.
+    pub async fn notified(&self) {
+        self.0.ready.notified().await;
+    }
+
+    /// Remaining work after a bounded drain; coalesced notifications do not lose backlog.
+    pub fn pending(&self) -> usize {
+        self.0.pending.load(Ordering::Acquire)
+    }
 }
 
 struct PeerRoute {
     generation: u64,
     producer: IngressProducer,
-    dropped_packets: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -143,7 +228,7 @@ enum PeerRouteKey {
 /// Nonblocking datagram dispatcher owned by the network receive context.
 ///
 /// Registration allocates one bounded queue per peer. Packet routing only
-/// looks up the source and pushes into that peer's SPSC queue.
+/// looks up the source and attempts admission without waiting for queue space.
 pub struct PeerIngressRouter {
     routes: HashMap<PeerRouteKey, PeerRoute>,
     peer_limit: usize,
@@ -230,19 +315,23 @@ impl PeerIngressRouter {
             PeerRoute {
                 generation,
                 producer,
-                dropped_packets: 0,
             },
         );
         Ok(consumer)
     }
 
-    /// Route one received datagram without waiting or allocating.
+    /// Route one received datagram without waiting for queue space.
     pub fn route(
         &mut self,
         remote: SocketAddr,
         payload: &[u8],
     ) -> Result<(), PeerIngressRouterError> {
-        self.route_key(PeerRouteKey::Address(remote), remote, payload)
+        self.route_key(
+            PeerRouteKey::Address(remote),
+            remote,
+            payload,
+            Instant::now(),
+        )
     }
 
     /// Route a datagram to the exact local/remote call pair for one endpoint.
@@ -253,18 +342,30 @@ impl PeerIngressRouter {
         remote_call: u16,
         payload: &[u8],
     ) -> Result<(), PeerIngressRouterError> {
+        self.route_call_at(remote, local_call, remote_call, payload, Instant::now())
+    }
+
+    /// Route a full frame while preserving its original socket-receipt time.
+    pub fn route_call_at(
+        &mut self,
+        remote: SocketAddr,
+        local_call: u16,
+        remote_call: u16,
+        payload: &[u8],
+        arrived_at: Instant,
+    ) -> Result<(), PeerIngressRouterError> {
         let key = PeerRouteKey::Call {
             remote,
             local_call,
             remote_call,
         };
         if self.routes.contains_key(&key) {
-            return self.route_key(key, remote, payload);
+            return self.route_key(key, remote, payload, arrived_at);
         }
         if self.has_call_routes(remote) {
             Err(PeerIngressRouterError::UnknownPeer)
         } else {
-            self.route(remote, payload)
+            self.route_key(PeerRouteKey::Address(remote), remote, payload, arrived_at)
         }
     }
 
@@ -274,6 +375,17 @@ impl PeerIngressRouter {
         remote: SocketAddr,
         remote_call: u16,
         payload: &[u8],
+    ) -> Result<(), PeerIngressRouterError> {
+        self.route_remote_call_at(remote, remote_call, payload, Instant::now())
+    }
+
+    /// Route a mini frame while preserving its original socket-receipt time.
+    pub fn route_remote_call_at(
+        &mut self,
+        remote: SocketAddr,
+        remote_call: u16,
+        payload: &[u8],
+        arrived_at: Instant,
     ) -> Result<(), PeerIngressRouterError> {
         let mut matching_key = None;
         for key in self.routes.keys() {
@@ -286,12 +398,12 @@ impl PeerIngressRouter {
             }
         }
         if let Some(key) = matching_key {
-            return self.route_key(key, remote, payload);
+            return self.route_key(key, remote, payload, arrived_at);
         }
         if self.has_call_routes(remote) {
             Err(PeerIngressRouterError::UnknownPeer)
         } else {
-            self.route(remote, payload)
+            self.route_key(PeerRouteKey::Address(remote), remote, payload, arrived_at)
         }
     }
 
@@ -306,21 +418,30 @@ impl PeerIngressRouter {
         key: PeerRouteKey,
         remote: SocketAddr,
         payload: &[u8],
+        arrived_at: Instant,
     ) -> Result<(), PeerIngressRouterError> {
         let route = self
             .routes
             .get_mut(&key)
             .ok_or(PeerIngressRouterError::UnknownPeer)?;
-        match route.producer.try_push(remote, payload) {
+        match route.producer.try_push_at(remote, payload, arrived_at) {
             Ok(()) => Ok(()),
-            Err(IngressPushError::Full) => {
-                route.dropped_packets = route.dropped_packets.saturating_add(1);
-                Err(PeerIngressRouterError::Full)
-            }
+            Err(IngressPushError::Closed) => Err(PeerIngressRouterError::UnknownPeer),
+            Err(IngressPushError::Full) => Err(PeerIngressRouterError::Full),
             Err(IngressPushError::DatagramTooLarge { length }) => {
                 Err(PeerIngressRouterError::DatagramTooLarge { length })
             }
         }
+    }
+
+    pub(crate) fn fail_all(&self) {
+        for route in self.routes.values() {
+            route.producer.fail();
+        }
+    }
+
+    pub(crate) fn route_count(&self) -> usize {
+        self.routes.len()
     }
 
     /// Remove a peer route only when the caller still owns its generation.
@@ -380,26 +501,51 @@ impl PeerIngressRouter {
 
     fn stats_route(&self, key: PeerRouteKey) -> Option<IngressStats> {
         let route = self.routes.get(&key)?;
-        Some(IngressStats {
-            queued_packets: self.queue_capacity.get() - route.producer.available_slots(),
-            dropped_packets: route.dropped_packets,
-        })
+        Some(route.producer.stats())
     }
 }
 
 impl IngressConsumer {
+    /// Snapshot actual queue occupancy/capacity and all producers' full-queue drops.
+    /// Fields are sampled independently while producers may still be active.
+    pub fn stats(&self) -> IngressStats {
+        IngressStats {
+            queued_packets: self.queue.len(),
+            dropped_packets: self.wake.0.dropped.load(Ordering::Relaxed),
+            capacity_packets: self.queue.max_capacity(),
+        }
+    }
+
+    /// Whether the receive owner reported a terminal transport failure.
+    pub fn failed(&self) -> bool {
+        self.wake.0.failed.load(Ordering::Acquire)
+    }
+
+    /// Borrow readiness independently from the unique peer-owned packet consumer.
+    pub fn wake(&self) -> IngressWake {
+        self.wake.clone()
+    }
+
+    /// Suspend only this connection owner until its next packet or final sender closes.
+    pub async fn receive(&mut self) -> Option<InboundDatagram> {
+        let packet = self.queue.recv().await?;
+        self.wake.0.pending.fetch_sub(1, Ordering::AcqRel);
+        Some(packet)
+    }
+
     /// Remove the oldest packet, or return `None` when the queue is empty.
     pub fn try_pop(&mut self) -> Option<InboundDatagram> {
-        self.queue.pop().ok()
+        let packet = self.queue.try_recv().ok()?;
+        self.wake.0.pending.fetch_sub(1, Ordering::AcqRel);
+        Some(packet)
     }
 }
 
-/// Allocate a fixed-capacity wait-free SPSC queue for one producer-owner pair.
+/// Allocate a bounded packet mailbox for one exclusively owned connection.
 ///
-/// Create a separate queue for each producer assigned to the peer owner. The
-/// producer and consumer handles are unique execution-context capabilities;
-/// never share either handle between threads. The peer generation is copied
-/// into every packet so owners can reject stale work after slot reuse.
+/// Producers may be cloned; the consumer remains unique. Old producers cannot
+/// reach a replacement mailbox after a session generation is retired. This is
+/// non-audio work; the shared PCM ring keeps its independent lock-free boundary.
 pub fn producer_ingress(
     capacity: usize,
     peer_generation: u64,
@@ -409,12 +555,17 @@ pub fn producer_ingress(
 }
 
 fn new_ingress(capacity: NonZeroUsize, peer_generation: u64) -> (IngressProducer, IngressConsumer) {
-    let (producer, consumer) = RingBuffer::new(capacity.get());
+    let (producer, consumer) = mpsc::channel(capacity.get());
+    let wake = IngressWake::default();
     (
         IngressProducer {
             queue: producer,
             generation: peer_generation,
+            wake: wake.clone(),
         },
-        IngressConsumer { queue: consumer },
+        IngressConsumer {
+            queue: consumer,
+            wake,
+        },
     )
 }

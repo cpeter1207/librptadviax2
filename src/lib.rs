@@ -1,6 +1,10 @@
 //! IAX2 protocol and transport components for the standalone controller.
 #![deny(missing_docs)]
 
+pub mod async_driver;
+#[cfg(test)]
+mod async_driver_tests;
+pub mod async_ffi;
 pub mod authentication;
 pub mod call_token;
 pub mod client;
@@ -10,8 +14,10 @@ pub mod information_elements;
 pub mod ingress;
 #[cfg(test)]
 mod ingress_tests;
+pub(crate) mod jitter;
 pub mod media;
 pub mod network;
+mod playout;
 pub mod protocol;
 pub mod server;
 pub mod session;

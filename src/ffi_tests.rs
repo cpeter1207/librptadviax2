@@ -17,6 +17,17 @@ use std::{
 const LOCAL_CALL: u16 = 1234;
 const REMOTE_CALL: u16 = 5678;
 
+#[test]
+fn async_enable_status_preserves_success_and_network_failure() {
+    assert_eq!(async_enable_status(Ok(())), 0);
+    assert_eq!(
+        async_enable_status(Err(crate::server::ListenerError::Network(
+            io::Error::other("socket registration failed")
+        ))),
+        -1
+    );
+}
+
 fn options<'a>(
     remote: &'a [u8],
     local: &'a [u8],
