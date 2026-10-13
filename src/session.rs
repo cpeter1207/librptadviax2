@@ -719,7 +719,8 @@ impl OutboundCallSetup {
             return Ok(OutboundSetupResponse::Send(retry));
         }
 
-        if let Some(response) = self.duplicate_response(&frame.header, Some(command), frame.payload)
+        if let Some(response) =
+            self.duplicate_response(&frame.header, Some(command), frame.payload)?
         {
             return Ok(OutboundSetupResponse::Send(response));
         }
@@ -843,7 +844,8 @@ impl OutboundCallSetup {
         if command == IaxCommand::CallToken {
             return Err(CallSetupError::UnexpectedCommand { command });
         }
-        if let Some(response) = self.duplicate_response(&frame.header, Some(command), frame.payload)
+        if let Some(response) =
+            self.duplicate_response(&frame.header, Some(command), frame.payload)?
         {
             return Ok(LinkedCallResponse::Send(response));
         }
@@ -860,7 +862,7 @@ impl OutboundCallSetup {
         }
         let subclass = (u8::from(header.subclass_is_log) << 7) | header.subclass;
         let subclass = decode_subclass(subclass).map_err(|_| CallSetupError::InvalidFrame)?;
-        if let Some(response) = self.duplicate_response(header, None, payload) {
+        if let Some(response) = self.duplicate_response(header, None, payload)? {
             return Ok(LinkedCallResponse::Send(response));
         }
         self.validate_peer_header(header)?;
@@ -942,7 +944,7 @@ impl OutboundCallSetup {
     fn receive_text(&mut self, packet: &[u8]) -> Result<LinkedCallResponse, CallSetupError> {
         let text = parse_text_frame(packet).map_err(|_| CallSetupError::InvalidFrame)?;
         if let Some(acknowledgement) =
-            self.duplicate_response(&text.header, None, text.text.as_bytes())
+            self.duplicate_response(&text.header, None, text.text.as_bytes())?
         {
             return Ok(LinkedCallResponse::Send(acknowledgement));
         }
@@ -973,7 +975,7 @@ impl OutboundCallSetup {
         if !payload.is_empty() {
             return Err(CallSetupError::InvalidFrame);
         }
-        if let Some(response) = self.duplicate_response(header, None, payload) {
+        if let Some(response) = self.duplicate_response(header, None, payload)? {
             return Ok(LinkedCallResponse::Send(response));
         }
         self.validate_peer_header(header)?;
@@ -987,22 +989,39 @@ impl OutboundCallSetup {
         })
     }
 
+    /// Replay the cached reply, or cumulatively ACK an older linked retry.
+    ///
+    /// Intervening frames replace the one-entry reply cache, but do not make
+    /// an already consumed sequence new again. Never redeliver its event.
     fn duplicate_response(
         &self,
         header: &FullFrameHeader,
         command: Option<IaxCommand>,
         payload: &[u8],
-    ) -> Option<Vec<u8>> {
-        let last = self.last_reliable_response.as_ref()?;
-        (header.retransmission
-            && header.destination_call_number == self.local_call
-            && header.source_call_number == last.source_call
-            && header.outgoing_sequence == last.outgoing_sequence
-            && command == last.command
-            && header.frame_type == last.frame_type
-            && header.subclass == last.subclass
-            && payload == last.payload)
-            .then(|| last.response.clone())
+    ) -> Result<Option<Vec<u8>>, CallSetupError> {
+        if !header.retransmission {
+            return Ok(None);
+        }
+        if let Some(last) = self.last_reliable_response.as_ref().filter(|last| {
+            header.destination_call_number == self.local_call
+                && header.source_call_number == last.source_call
+                && header.outgoing_sequence == last.outgoing_sequence
+                && command == last.command
+                && header.frame_type == last.frame_type
+                && header.subclass == last.subclass
+                && payload == last.payload
+        }) {
+            // Setup replies and PONG/LAGRP must retain their original sequence.
+            return Ok(Some(last.response.clone()));
+        }
+        if self.state == State::Linked
+            && command != Some(IaxCommand::Ack)
+            && (1..=64).contains(&self.next_incoming.wrapping_sub(header.outgoing_sequence))
+        {
+            self.validate_call_ids(header)?;
+            return self.acknowledgement(header, self.next_incoming).map(Some);
+        }
+        Ok(None)
     }
 
     fn remember_response(

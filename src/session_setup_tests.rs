@@ -421,7 +421,7 @@ fn linked_session_acknowledges_and_delivers_remote_dtmf() {
 }
 
 #[test]
-fn duplicate_cache_does_not_match_different_frame_type_or_digit() {
+fn consumed_sequences_are_acknowledged_without_delivering_changed_type_or_digit() {
     let accept = incoming(
         IaxCommand::Accept,
         0,
@@ -439,10 +439,17 @@ fn duplicate_cache_does_not_match_different_frame_type_or_digit() {
         .unwrap();
     let mut different_frame = incoming_dtmf(1, 1, b'7');
     different_frame[2] |= 0x80;
-    assert!(matches!(
-        text_then_digit.receive(&different_frame, 3, ""),
-        Err(CallSetupError::SequenceMismatch { .. })
-    ));
+    let CallSetupResponse::Send(ack) = text_then_digit.receive(&different_frame, 3, "").unwrap()
+    else {
+        panic!("a consumed sequence must not deliver a new digit");
+    };
+    assert_eq!(
+        parse_full_frame_packet(&ack)
+            .unwrap()
+            .header
+            .incoming_sequence,
+        2
+    );
 
     let mut digit_then_other_digit =
         OutboundCallSetup::new(LOCAL_CALL, 0, &initial_elements()).unwrap();
@@ -452,10 +459,19 @@ fn duplicate_cache_does_not_match_different_frame_type_or_digit() {
         .unwrap();
     let mut different_subclass = incoming_dtmf(1, 1, b'8');
     different_subclass[2] |= 0x80;
-    assert!(matches!(
-        digit_then_other_digit.receive(&different_subclass, 3, ""),
-        Err(CallSetupError::SequenceMismatch { .. })
-    ));
+    let CallSetupResponse::Send(ack) = digit_then_other_digit
+        .receive(&different_subclass, 3, "")
+        .unwrap()
+    else {
+        panic!("a consumed sequence must not deliver a changed digit");
+    };
+    assert_eq!(
+        parse_full_frame_packet(&ack)
+            .unwrap()
+            .header
+            .incoming_sequence,
+        2
+    );
 }
 
 #[test]

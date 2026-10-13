@@ -321,3 +321,130 @@ fn control_frame(command: IaxCommand, outgoing: u8, incoming: u8, timestamp: u32
     )
     .unwrap()
 }
+
+#[test]
+fn delayed_retries_preserve_events_and_sequences_across_wraparound() {
+    for first_sequence in [128_u8, 254] {
+        for (frame_type, subclass, payload) in [
+            (7, 0, &b"!KEY!"[..]),
+            (1, b'7', &b""[..]),
+            (4, 12, &b""[..]),
+            (6, IaxCommand::Ping.subclass_value() as u8, &b""[..]),
+            (6, IaxCommand::Pong.subclass_value() as u8, &b""[..]),
+            (6, IaxCommand::LagRq.subclass_value() as u8, &b""[..]),
+            (6, IaxCommand::LagRp.subclass_value() as u8, &b""[..]),
+        ] {
+            let mut session = OutboundCallSetup::for_inbound_call(1, 77).unwrap();
+            session.next_incoming = first_sequence;
+            let mut header = FullFrameHeader {
+                source_call_number: 77,
+                destination_call_number: 1,
+                retransmission: false,
+                timestamp: 28403,
+                outgoing_sequence: first_sequence,
+                incoming_sequence: 1,
+                frame_type,
+                subclass,
+                subclass_is_log: false,
+            };
+            let initial = session
+                .receive_linked(&serialize_full_frame(&header, payload).unwrap())
+                .unwrap();
+            header.retransmission = true;
+            let retry = serialize_full_frame(&header, payload).unwrap();
+            if let LinkedCallResponse::SendReliable(reply) = initial {
+                let LinkedCallResponse::Send(repeated) = session.receive_linked(&retry).unwrap()
+                else {
+                    panic!("an immediate probe retry must replay its response");
+                };
+                assert_eq!(repeated, reply);
+            }
+            // Three accepted frames evict the response cache, including across
+            // the 255 -> 0 boundary. None makes the original event new again.
+            header.retransmission = false;
+            header.frame_type = 7;
+            header.subclass = 0;
+            header.incoming_sequence = session.next_outgoing;
+            for offset in 1..=3 {
+                header.outgoing_sequence = first_sequence.wrapping_add(offset);
+                assert!(matches!(
+                    session.receive_linked(&serialize_full_frame(&header, b"L ").unwrap()),
+                    Ok(LinkedCallResponse::Text { .. })
+                ));
+            }
+            let LinkedCallResponse::Send(ack) = session.receive_linked(&retry).unwrap() else {
+                panic!("an old retry must only acknowledge, never replay its event");
+            };
+            let ack = parse_full_frame_packet(&ack).unwrap().header;
+            assert_eq!(decode_iax_command(&ack).unwrap(), Some(IaxCommand::Ack));
+            assert_eq!(ack.incoming_sequence, first_sequence.wrapping_add(4));
+            assert_eq!(ack.timestamp, 28403);
+            header.outgoing_sequence = first_sequence.wrapping_add(4);
+            assert!(matches!(
+                session.receive_linked(&serialize_full_frame(&header, b"fresh").unwrap()),
+                Ok(LinkedCallResponse::Text { .. })
+            ));
+        }
+    }
+}
+
+#[test]
+fn delayed_retry_window_preserves_validation_and_never_acknowledges_ack() {
+    let mut session = OutboundCallSetup::for_inbound_call(1, 77).unwrap();
+    session.next_incoming = 65;
+    let header = FullFrameHeader {
+        source_call_number: 77,
+        destination_call_number: 1,
+        retransmission: true,
+        timestamp: 100,
+        outgoing_sequence: 1,
+        incoming_sequence: 1,
+        frame_type: 7,
+        subclass: 0,
+        subclass_is_log: false,
+    };
+    // No cached response is needed for the oldest accepted retry in the window.
+    let LinkedCallResponse::Send(ack) = session
+        .receive_linked(&serialize_full_frame(&header, b"old").unwrap())
+        .unwrap()
+    else {
+        panic!("the oldest retry in the window must be acknowledged");
+    };
+    assert_eq!(
+        parse_full_frame_packet(&ack)
+            .unwrap()
+            .header
+            .incoming_sequence,
+        65
+    );
+    for (source, destination, sequence, retry) in [
+        (78, 1, 1, true),
+        (77, 2, 1, true),
+        (77, 1, 0, true),
+        (77, 1, 66, true),
+        (77, 1, 1, false),
+    ] {
+        let invalid = FullFrameHeader {
+            source_call_number: source,
+            destination_call_number: destination,
+            outgoing_sequence: sequence,
+            retransmission: retry,
+            ..header
+        };
+        assert!(
+            session
+                .receive_linked(&serialize_full_frame(&invalid, b"old").unwrap())
+                .is_err()
+        );
+    }
+    let ack = FullFrameHeader {
+        frame_type: IAX_FRAME_TYPE,
+        subclass: ACK_SUBCLASS,
+        ..header
+    };
+    assert!(matches!(
+        session.receive_linked(&serialize_full_frame(&ack, &[]).unwrap()),
+        Ok(LinkedCallResponse::NoAction)
+    ));
+    assert_eq!(session.next_incoming, 65);
+}

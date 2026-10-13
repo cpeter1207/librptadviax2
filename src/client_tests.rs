@@ -1171,6 +1171,49 @@ fn direct_peer_reports_radio_key_control_frames() {
 }
 
 #[test]
+fn delayed_text_retry_is_acknowledged_without_redelivery_or_disconnect() {
+    let (mut peer, server) = interop_peer(false);
+    let client = std::net::SocketAddr::from(([127, 0, 0, 1], peer.local_addr().unwrap().port()));
+    let mut bytes = [0; 1500];
+    let mut samples = [0.0; 160];
+    let mut text = [0; 16];
+    let mut header = FullFrameHeader {
+        source_call_number: REMOTE_CALL,
+        retransmission: false,
+        destination_call_number: LOCAL_CALL,
+        timestamp: 28403,
+        outgoing_sequence: 2,
+        incoming_sequence: 1,
+        frame_type: 7,
+        subclass: 0,
+        subclass_is_log: false,
+    };
+    // Replay the captured ordering: three newer text frames precede a retry
+    // of the first. The cumulative ACK must not redeliver its keying text.
+    for (sequence, retry, payload, expected, acknowledged) in [
+        (2, false, &b"!KEY!"[..], IaxPeerEvent::Text(5), 3),
+        (3, false, &b"L "[..], IaxPeerEvent::Text(2), 4),
+        (4, false, &b"L "[..], IaxPeerEvent::Text(2), 5),
+        (5, false, &b"L "[..], IaxPeerEvent::Text(2), 6),
+        (2, true, &b"!KEY!"[..], IaxPeerEvent::None, 6),
+        (6, false, &b"fresh"[..], IaxPeerEvent::Text(5), 7),
+    ] {
+        header.outgoing_sequence = sequence;
+        header.retransmission = retry;
+        server
+            .send_to(&serialize_full_frame(&header, payload).unwrap(), client)
+            .unwrap();
+        assert_eq!(peer.poll_event(&mut samples, &mut text).unwrap(), expected);
+        let (length, _) = server.recv_from(&mut bytes).unwrap();
+        let ack = parse_full_frame_packet(&bytes[..length]).unwrap().header;
+        assert_eq!(decode_iax_command(&ack).unwrap(), Some(IaxCommand::Ack));
+        assert_eq!(ack.incoming_sequence, acknowledged);
+        assert_eq!(ack.timestamp, header.timestamp);
+    }
+    assert_eq!(&text[..5], b"fresh");
+}
+
+#[test]
 fn comfort_noise_after_unkey_is_acknowledged_without_ending_the_call() {
     let (mut peer, server) = interop_peer(false);
     let mut bytes = [0; 1500];
