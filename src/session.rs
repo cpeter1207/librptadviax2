@@ -617,8 +617,8 @@ impl OutboundCallSetup {
         Ok(packet)
     }
 
-    /// Sequence a validated full voice frame and suppress duplicate media delivery.
-    pub(crate) fn receive_voice(
+    /// Sequence a validated full media frame and suppress duplicate delivery.
+    pub(crate) fn receive_media(
         &mut self,
         header: &FullFrameHeader,
     ) -> Result<(bool, Vec<u8>), CallSetupError> {
@@ -822,6 +822,15 @@ impl OutboundCallSetup {
         }
         if frame.header.frame_type == 4 {
             return self.receive_radio_control(&frame.header, frame.payload);
+        }
+        if frame.header.frame_type == 10 {
+            // RFC 5456 CNG has no payload. ACK its sequence without creating
+            // audio or changing radio key state when a peer finishes speaking.
+            if !frame.payload.is_empty() {
+                return Err(CallSetupError::InvalidFrame);
+            }
+            let (_, acknowledgement) = self.receive_media(&frame.header)?;
+            return Ok(LinkedCallResponse::Send(acknowledgement));
         }
         if frame.header.frame_type != IAX_FRAME_TYPE {
             return Err(CallSetupError::NotIaxFrame {

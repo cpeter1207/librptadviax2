@@ -396,7 +396,7 @@ impl IaxPeer {
             if frame.header.frame_type == 1 && text.is_empty() {
                 return Err(DialError::InvalidOptions);
             }
-            if matches!(frame.header.frame_type, 1 | 4 | 6 | 7) {
+            if matches!(frame.header.frame_type, 1 | 4 | 6 | 7 | 10) {
                 let response = self
                     .setup
                     .receive_linked(bytes)
@@ -481,7 +481,7 @@ impl IaxPeer {
             {
                 let (deliver, acknowledgement) = self
                     .setup
-                    .receive_voice(&header)
+                    .receive_media(&header)
                     .map_err(DialError::Protocol)?;
                 self.acknowledge_reliable_frames(header.incoming_sequence);
                 self.endpoint
