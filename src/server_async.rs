@@ -184,6 +184,31 @@ mod tests {
     use std::{thread, time::Duration};
 
     #[test]
+    fn stopped_before_first_poll_fails_admission_and_established_peers() {
+        let runtime = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let socket = runtime.block_on(UdpSocket::bind("127.0.0.1:0")).unwrap();
+        let mut router = PeerIngressRouter::new(1, 1).unwrap();
+        let peer = router
+            .register_call("127.0.0.1:4569".parse().unwrap(), 22, 42, 7)
+            .unwrap();
+        let mut pump = ListenerIngress::start(runtime.clone(), socket, router);
+        pump.stop.send_replace(true);
+
+        assert!(runtime.block_on(pump.admission.receive()).is_none());
+        assert!(peer.failed());
+        assert_eq!(pump.stats().active_routes, 0);
+        assert_eq!(
+            pump.try_receive().unwrap_err().kind(),
+            io::ErrorKind::ConnectionAborted
+        );
+    }
+
+    #[test]
     fn full_admission_queue_does_not_block_established_routing_and_shutdown_wakes_all() {
         let runtime = Arc::new(
             tokio::runtime::Builder::new_multi_thread()
