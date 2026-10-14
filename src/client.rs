@@ -126,8 +126,17 @@ pub struct IaxPeer {
     async_attached: bool,
     // None preserves polling for callers that never supply scheduling deadlines.
     product_deadline: Option<Option<Instant>>,
-    send_blocked: std::cell::Cell<bool>,
+    send_stats: SendStatistics,
     playout: Option<Playout>,
+}
+
+/// Exclusive peer-owner counters; send helpers borrow only the cell-backed fields.
+#[derive(Default)]
+struct SendStatistics {
+    blocked: std::cell::Cell<bool>,
+    datagrams: std::cell::Cell<u64>,
+    would_block: std::cell::Cell<u64>,
+    retries: u64,
 }
 
 enum PeerEndpoint {
@@ -221,7 +230,7 @@ pub enum IaxPeerEvent {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct IaxPeerObservation {
-    /// Complete record size, currently 112 bytes.
+    /// Complete record size, currently 144 bytes; the original prefix is 112 bytes.
     pub struct_size: u32,
     /// Record revision, currently one.
     pub abi_version: u32,
@@ -255,17 +264,27 @@ pub struct IaxPeerObservation {
     pub ingress_queued_packets: u32,
     /// Fixed mailbox capacity.
     pub ingress_capacity_packets: u32,
+    /// Datagrams accepted by the local socket, not proof of remote delivery.
+    pub egress_datagrams: u64,
+    /// Actual socket WouldBlock results across media, replies, and reliable frames.
+    pub egress_would_block: u64,
+    /// Previously transmitted reliable frames sent again successfully.
+    pub egress_reliable_retries: u64,
+    /// Current committed reliable window occupancy.
+    pub egress_reliable_pending: u32,
+    /// Current bounded best-effort reply queue occupancy.
+    pub egress_reply_pending: u32,
 }
 
 impl IaxPeer {
     pub(crate) fn begin_turn(&self) {
         // An expired uncommitted item must not leave stale writable interest.
-        self.send_blocked.set(false);
+        self.send_stats.blocked.set(false);
     }
 
     pub(crate) fn wait_state(&self) -> crate::async_driver::PeerWait {
         let now = tokio::time::Instant::now().into_std();
-        let blocked = self.send_blocked.get();
+        let blocked = self.send_stats.blocked.get();
         let protocol = self
             .pending_reliable
             .iter()
@@ -351,6 +370,11 @@ impl IaxPeer {
             ingress_overflow_drops: ingress.dropped_packets,
             ingress_queued_packets: ingress.queued_packets as u32,
             ingress_capacity_packets: ingress.capacity_packets as u32,
+            egress_datagrams: self.send_stats.datagrams.get(),
+            egress_would_block: self.send_stats.would_block.get(),
+            egress_reliable_retries: self.send_stats.retries,
+            egress_reliable_pending: self.pending_reliable.len() as u32,
+            egress_reply_pending: self.pending_replies.len() as u32,
         })
     }
 
@@ -442,7 +466,7 @@ impl IaxPeer {
             release_on_drop: Some(std::sync::Arc::clone(&released)),
             async_attached: false,
             product_deadline: None,
-            send_blocked: std::cell::Cell::new(false),
+            send_stats: SendStatistics::default(),
             playout: None,
         };
         Ok((peer, released))
@@ -567,7 +591,7 @@ impl IaxPeer {
             &self.endpoint,
             &packet[..4 + payload.len()],
             self.remote,
-            &self.send_blocked,
+            &self.send_stats,
         )
     }
 
@@ -853,7 +877,7 @@ impl IaxPeer {
 
     fn flush_replies(&mut self) -> Result<(), DialError> {
         while let Some(packet) = self.pending_replies.front() {
-            if send_media(&self.endpoint, packet, self.remote, &self.send_blocked)?
+            if send_media(&self.endpoint, packet, self.remote, &self.send_stats)?
                 == MediaSend::WouldBlock
             {
                 break;
@@ -908,12 +932,13 @@ impl IaxPeer {
             } else {
                 &frame.packet
             };
-            if send_media(&self.endpoint, packet, self.remote, &self.send_blocked)?
+            if send_media(&self.endpoint, packet, self.remote, &self.send_stats)?
                 == MediaSend::WouldBlock
             {
                 break; // Still process inbound ACKs and control while the socket is full.
             }
             if frame.sent {
+                self.send_stats.retries = self.send_stats.retries.saturating_add(1);
                 frame.retries += 1;
                 frame.retry_interval = (frame.retry_interval * 10).min(MAX_RETRY);
             } else {
@@ -959,12 +984,18 @@ fn send_media(
     endpoint: &PeerEndpoint,
     packet: &[u8],
     remote: SocketAddr,
-    blocked: &std::cell::Cell<bool>,
+    stats: &SendStatistics,
 ) -> Result<MediaSend, DialError> {
     match endpoint.send_to(packet, remote) {
-        Ok(_) => Ok(MediaSend::Accepted),
+        Ok(_) => {
+            stats.datagrams.set(stats.datagrams.get().saturating_add(1));
+            Ok(MediaSend::Accepted)
+        }
         Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-            blocked.set(true);
+            stats.blocked.set(true);
+            stats
+                .would_block
+                .set(stats.would_block.get().saturating_add(1));
             Ok(MediaSend::WouldBlock)
         }
         Err(error) => Err(DialError::Network(error)),
@@ -1114,7 +1145,7 @@ pub fn dial_ulaw(options: DialOptions<'_>) -> Result<IaxPeer, DialError> {
                     release_on_drop: None,
                     async_attached: false,
                     product_deadline: None,
-                    send_blocked: std::cell::Cell::new(false),
+                    send_stats: SendStatistics::default(),
                     playout: None,
                 };
                 peer.wait_answer(deadline)?;

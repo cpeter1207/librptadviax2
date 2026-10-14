@@ -37,6 +37,11 @@ struct rptadv_iax2_peer_observation_v1 {
     uint64_t ingress_overflow_drops; /**< Shared/dedicated mailbox full-queue drops. */
     uint32_t ingress_queued_packets; /**< Current mailbox occupancy. */
     uint32_t ingress_capacity_packets; /**< Maximum retained mailbox packets. */
+    uint64_t egress_datagrams; /**< Datagrams accepted by the local socket, not remote delivery. */
+    uint64_t egress_would_block; /**< Actual socket WouldBlock results. */
+    uint64_t egress_reliable_retries; /**< Successfully resent reliable frames. */
+    uint32_t egress_reliable_pending; /**< Current committed reliable window occupancy. */
+    uint32_t egress_reply_pending; /**< Current bounded best-effort reply queue occupancy. */
 };
 
 /** Optional readiness executor, independent of the unchanged client/server ABI.

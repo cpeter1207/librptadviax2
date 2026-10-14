@@ -44,6 +44,65 @@ impl Drop for SendFault {
 }
 
 #[test]
+fn egress_transport_observation_counts_actual_sends_and_backpressure() {
+    let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let address = remote.local_addr().unwrap();
+    let (mut peer, _producer) = shared_peer(address);
+    let fixture = crate::jitter::fixture::Fixture::new();
+    unsafe { peer.configure_jitter(fixture.descriptor()) }.unwrap();
+    let fault = SendFault::set(address, std::io::ErrorKind::WouldBlock);
+    assert_eq!(
+        peer.send_prepared_ulaw(&[0xff; 160], 100).unwrap(),
+        super::MediaSend::Accepted
+    );
+    peer.retry_reliable_frames().unwrap();
+    let stats = peer.observe().unwrap();
+    assert_eq!(
+        (
+            stats.egress_datagrams,
+            stats.egress_would_block,
+            stats.egress_reliable_retries,
+            stats.egress_reliable_pending
+        ),
+        (0, 2, 0, 1)
+    );
+    drop(fault);
+    peer.retry_reliable_frames().unwrap();
+    peer.pending_reliable[0].next_retry = Instant::now();
+    peer.retry_reliable_frames().unwrap();
+    peer.acknowledge_reliable_frames(2);
+    let stats = peer.observe().unwrap();
+    assert_eq!(
+        (
+            stats.egress_datagrams,
+            stats.egress_would_block,
+            stats.egress_reliable_retries,
+            stats.egress_reliable_pending
+        ),
+        (2, 2, 1, 0)
+    );
+    // The original observation prefix remains writable without touching a caller guard.
+    let mut prefix = [0xa5u64; 15];
+    let words = prefix.as_mut_ptr().cast::<u32>();
+    unsafe {
+        words.write(112);
+        words.add(1).write(1);
+    }
+    let api = unsafe { &*crate::async_ffi::rptadv_iax2_async_descriptor_v1() };
+    assert_eq!(
+        unsafe {
+            (api.peer_observe)(
+                (&mut peer as *mut IaxPeer).cast(),
+                prefix.as_mut_ptr().cast(),
+            )
+        },
+        0
+    );
+    assert_eq!(prefix[14], 0xa5);
+    assert_eq!(unsafe { words.read() }, 112);
+}
+
+#[test]
 fn egress_congestion_preserves_sequence_and_epoch() {
     let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
     remote
@@ -262,7 +321,7 @@ fn linked_peer(remote: SocketAddr) -> IaxPeer {
         release_on_drop: None,
         async_attached: false,
         product_deadline: None,
-        send_blocked: std::cell::Cell::new(false),
+        send_stats: super::SendStatistics::default(),
         playout: None,
     }
 }

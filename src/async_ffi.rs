@@ -221,9 +221,9 @@ unsafe extern "C" fn server_enable(runtime: *mut c_void, server: *mut c_void) ->
 }
 
 unsafe extern "C" fn peer_observe(peer: *mut c_void, output: *mut IaxPeerObservation) -> i32 {
-    // Validate only the advertised prefix before constructing/writing a full record.
+    // The ABI-1 prefix stays valid; write no bytes beyond the caller's declared record.
     if output.is_null()
-        || unsafe { output.cast::<u32>().read() } < size_of::<IaxPeerObservation>() as u32
+        || unsafe { output.cast::<u32>().read() } < 112
         || unsafe { output.cast::<u32>().add(1).read() } != 1
     {
         return -1;
@@ -232,9 +232,16 @@ unsafe extern "C" fn peer_observe(peer: *mut c_void, output: *mut IaxPeerObserva
         return -1;
     };
     match peer.observe() {
-        Ok(observation) => {
+        Ok(mut observation) => {
+            let writable = (unsafe { output.cast::<u32>().read() } as usize)
+                .min(size_of::<IaxPeerObservation>());
+            observation.struct_size = writable as u32;
             unsafe {
-                output.write(observation);
+                ptr::copy_nonoverlapping(
+                    ptr::from_ref(&observation).cast::<u8>(),
+                    output.cast(),
+                    writable,
+                );
             }
             0
         }

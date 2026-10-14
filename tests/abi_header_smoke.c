@@ -8,8 +8,10 @@ _Static_assert(offsetof(struct rptadv_iax2_async_descriptor_v1, server_enable) =
     24 + 6 * sizeof(void (*)(void)), "async descriptor tail order changed");
 _Static_assert(offsetof(struct rptadv_iax2_async_descriptor_v1, peer_observe) ==
     24 + 7 * sizeof(void (*)(void)), "peer observation tail order changed");
-_Static_assert(sizeof(struct rptadv_iax2_peer_observation_v1) == 112,
+_Static_assert(sizeof(struct rptadv_iax2_peer_observation_v1) == 144,
     "peer observation must match the product POD record");
+_Static_assert(offsetof(struct rptadv_iax2_peer_observation_v1, egress_datagrams) == 112,
+    "egress observation must preserve the original prefix");
 _Static_assert(offsetof(struct rptadv_iax2_async_descriptor_v1, peer_wake) ==
     24 + 8 * sizeof(void (*)(void)), "wake tail must preserve the prefix");
 _Static_assert(offsetof(struct rptadv_iax2_async_descriptor_v1, peer_set_deadline) ==
@@ -62,6 +64,7 @@ int main(void)
 	void *runtime = NULL;
 	void *registration = (void *)1;
 	if (!async || async->abi_version != 1 || async->struct_size != sizeof(*async) ||
+		!async->peer_wake || !async->peer_set_deadline ||
 		async->runtime_create(&runtime) != 0 || !runtime ||
 		async->peer_configure_jitter(NULL, NULL) != -1 ||
 		async->server_enable(runtime, NULL) != -1 ||
@@ -76,7 +79,11 @@ int main(void)
 	};
 	void *peer = (void *)1;
 
-	return descriptor != NULL && descriptor->dial != NULL &&
+	return descriptor != NULL && descriptor->struct_size == sizeof(*descriptor) &&
+		   descriptor->abi_version == 1 &&
+		   memcmp(descriptor->capability, "rptadv.iax2.v1\0\0", 16) == 0 &&
+		   descriptor->prepare_ulaw != NULL && descriptor->send_prepared_ulaw != NULL &&
+		   descriptor->elapsed_ms != NULL && descriptor->dial != NULL &&
 		   descriptor->send_digit != NULL &&
 		   descriptor->dial(&options, &peer) == -1 && peer == NULL &&
 		   server_lifecycle() == 0

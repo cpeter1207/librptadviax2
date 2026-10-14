@@ -227,7 +227,8 @@ fn peer_observation_validates_only_output_prefix_before_touching_the_record() {
         ptr,
     };
     let api = unsafe { &*crate::async_ffi::rptadv_iax2_async_descriptor_v1() };
-    assert_eq!(size_of::<IaxPeerObservation>(), 112);
+    assert_eq!(size_of::<IaxPeerObservation>(), 144);
+    assert_eq!(offset_of!(IaxPeerObservation, egress_datagrams), 112);
     assert_eq!(
         offset_of!(AsyncDescriptor, peer_observe),
         24 + 7 * size_of::<usize>()
