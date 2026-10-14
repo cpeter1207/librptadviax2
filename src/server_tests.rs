@@ -348,13 +348,34 @@ fn poll_routes_established_frames_before_new_call_admission() {
 }
 
 #[test]
-fn listener_rejects_a_new_call_when_the_peer_limit_is_full() {
+fn egress_admission_exhausted_call_numbers_do_not_panic_or_reuse_live_calls() {
     let mut listener = InboundIaxListener::bind("127.0.0.1:0".parse().unwrap(), "524950").unwrap();
-    listener.router = PeerIngressRouter::new(1, 16).unwrap();
+    listener.router = PeerIngressRouter::new(1).unwrap();
+    let remote = "127.0.0.1:4568".parse().unwrap();
+    let mut owners = Vec::new();
+    for call in 16384..=32767 {
+        owners.push(
+            listener
+                .router
+                .register_call(remote, call, call, 1)
+                .unwrap(),
+        );
+    }
+    assert_eq!(listener.next_available_call(), None);
+    assert!(listener.router.unregister_call(remote, 20000, 20000, 1));
+    assert_eq!(listener.next_available_call(), Some(20000));
+    assert!(listener.router.contains_local_call(20001));
+}
+
+#[test]
+fn egress_admission_listener_reservation_failure_keeps_existing_peers() {
+    let mut listener = InboundIaxListener::bind("127.0.0.1:0".parse().unwrap(), "524950").unwrap();
+    listener.router = PeerIngressRouter::new(16).unwrap();
     let server = listener.local_addr().unwrap();
 
     let (first_client, first_initial) = initial_new("127.0.0.1:0".parse().unwrap(), server);
     let first = finish_inbound_handshake(&mut listener, &first_client, &first_initial, server);
+    listener.fail_next_reserve = true;
     let (second_client, second_initial) = initial_new("127.0.0.1:0".parse().unwrap(), server);
     assert!(matches!(
         finish_inbound_handshake(&mut listener, &second_client, &second_initial, server),
@@ -366,6 +387,8 @@ fn listener_rejects_a_new_call_when_the_peer_limit_is_full() {
         decode_iax_command(&parse_full_frame_packet(&response[..length]).unwrap().header),
         Ok(Some(IaxCommand::Reject))
     );
+    assert_eq!(listener.routes.len(), 1);
+    assert_eq!(listener.router.route_count(), 1);
     drop(first);
 }
 
@@ -469,7 +492,7 @@ fn full_queue_hangup_keeps_route_for_retransmission_until_peer_release() {
         );
         let mut listener =
             InboundIaxListener::bind("127.0.0.1:0".parse().unwrap(), "524950").unwrap();
-        listener.router = PeerIngressRouter::new(1, 1).unwrap();
+        listener.router = PeerIngressRouter::new(1).unwrap();
         let client = UdpEndpoint::bind("127.0.0.1:0".parse().unwrap()).unwrap();
         let remote = client.local_addr().unwrap();
         let mut consumer = listener.router.register_call(remote, 22, 42, 7).unwrap();
@@ -621,7 +644,7 @@ fn existing_mini_frame_routes_only_unique_call_identity() {
 fn full_ingress_queue_keeps_existing_full_call_routed() {
     let remote: SocketAddr = "127.0.0.1:4568".parse().unwrap();
     let mut listener = InboundIaxListener::bind("127.0.0.1:0".parse().unwrap(), "524950").unwrap();
-    listener.router = PeerIngressRouter::new(1, 1).unwrap();
+    listener.router = PeerIngressRouter::new(1).unwrap();
     let _consumer = listener.router.register_call(remote, 22, 42, 7).unwrap();
     let ack = full_packet(42, 22, IaxCommand::Ack.subclass_value() as u8);
     assert!(listener.router.route_call(remote, 22, 42, &ack).is_ok());
@@ -858,7 +881,7 @@ fn inbound_listener_rejects_a_token_valid_call_denied_by_product_policy() {
 #[test]
 fn inbound_listener_reuses_peer_capacity_after_session_drop() {
     let mut listener = InboundIaxListener::bind("127.0.0.1:0".parse().unwrap(), "524950").unwrap();
-    listener.router = PeerIngressRouter::new(1, 16).unwrap();
+    listener.router = PeerIngressRouter::new(16).unwrap();
     let server = listener.local_addr().unwrap();
     let (client, initial) = initial_new("127.0.0.1:0".parse().unwrap(), server);
     let mut response = [0_u8; 1500];
@@ -941,9 +964,9 @@ fn inbound_listener_reuses_peer_capacity_after_session_drop() {
 }
 
 #[test]
-fn listener_rejects_authorized_new_when_ingress_peer_limit_is_full() {
+fn egress_admission_router_reservation_failure_keeps_existing_peers() {
     let mut listener = InboundIaxListener::bind("127.0.0.1:0".parse().unwrap(), "524950").unwrap();
-    listener.router = PeerIngressRouter::new(1, 16).unwrap();
+    listener.router = PeerIngressRouter::new(16).unwrap();
     listener
         .router
         .register_call("127.0.0.1:4568".parse().unwrap(), 22, 42, 1)
@@ -961,6 +984,7 @@ fn listener_rejects_authorized_new_when_ingress_peer_limit_is_full() {
     ));
     let (length, _) = send_until_event(|| client.try_receive(&mut response).unwrap());
     let retry = retry_new_call_with_token(&initial, &response[..length], 8).unwrap();
+    listener.router.fail_next_reserve = true;
     client.send_to(&retry, server).unwrap();
 
     assert!(matches!(

@@ -19,7 +19,7 @@ fn queued_datagram_retains_observed_arrival_time() {
 
 #[test]
 fn call_routes_preserve_captured_arrival_and_publish_terminal_failure() {
-    let mut router = PeerIngressRouter::new(2, 4).unwrap();
+    let mut router = PeerIngressRouter::new(4).unwrap();
     let mut full = router.register_call(address(1), 22, 42, 7).unwrap();
     let mut fallback = router.register(address(2), 8).unwrap();
     let arrival = std::time::Instant::now() - std::time::Duration::from_secs(1);
@@ -53,7 +53,7 @@ fn call_routes_preserve_captured_arrival_and_publish_terminal_failure() {
 #[test]
 fn closed_peer_owner_rejects_every_router_admission_form() {
     for call_route in [false, true] {
-        let mut router = PeerIngressRouter::new(1, 1).unwrap();
+        let mut router = PeerIngressRouter::new(1).unwrap();
         let owner = if call_route {
             router.register_call(address(1), 22, 42, 1).unwrap()
         } else {
@@ -208,7 +208,7 @@ fn rejects_zero_capacity_and_oversized_datagrams() {
 
 #[test]
 fn router_routes_each_peer_to_its_own_generation_tagged_queue() {
-    let mut router = PeerIngressRouter::new(2, 2).unwrap();
+    let mut router = PeerIngressRouter::new(2).unwrap();
     let mut first_owner = router.register(address(1), 11).unwrap();
     let mut second_owner = router.register(address(2), 22).unwrap();
 
@@ -231,7 +231,7 @@ fn router_routes_each_peer_to_its_own_generation_tagged_queue() {
 
 #[test]
 fn router_separates_calls_from_the_same_udp_source() {
-    let mut router = PeerIngressRouter::new(2, 2).unwrap();
+    let mut router = PeerIngressRouter::new(2).unwrap();
     let mut first = router.register_call(address(10), 100, 200, 11).unwrap();
     let mut second = router.register_call(address(10), 101, 201, 22).unwrap();
 
@@ -250,7 +250,7 @@ fn router_separates_calls_from_the_same_udp_source() {
 
 #[test]
 fn call_router_reports_present_local_calls_and_rejects_nonmatching_remote_calls() {
-    let mut router = PeerIngressRouter::new(1, 1).unwrap();
+    let mut router = PeerIngressRouter::new(1).unwrap();
     let remote = address(10);
     let _owner = router.register_call(remote, 100, 200, 11).unwrap();
 
@@ -267,8 +267,50 @@ fn call_router_reports_present_local_calls_and_rejects_nonmatching_remote_calls(
 }
 
 #[test]
+fn egress_admission_failure_keeps_existing_peers() {
+    let mut router = PeerIngressRouter::new(1).unwrap();
+    let mut existing = router.register_call(address(10), 10, 20, 1).unwrap();
+    router.fail_next_reserve = true;
+    assert!(router.register_call(address(10), 11, 21, 2).is_err());
+    assert!(!router.contains_local_call(11));
+    router.route_call(address(10), 10, 20, &[7]).unwrap();
+    assert_eq!(existing.try_pop().unwrap().payload(), [7]);
+    let _replacement = router.register_call(address(10), 11, 21, 3).unwrap();
+}
+
+#[test]
+fn egress_admission_above_1024() {
+    let mut router = PeerIngressRouter::new(1).unwrap();
+    let mut owners = Vec::new();
+    for call in 1..=2000 {
+        let owner = router
+            .register_call(address(10), call, call, u64::from(call))
+            .unwrap();
+        owners.push(owner);
+        router
+            .route_call(address(10), call, call, &call.to_be_bytes())
+            .unwrap();
+        assert_eq!(
+            router.route_call(address(10), call, call, &[0]),
+            Err(PeerIngressRouterError::Full)
+        );
+    }
+    for (index, owner) in owners.iter_mut().enumerate() {
+        assert_eq!(
+            owner.try_pop().unwrap().payload(),
+            ((index + 1) as u16).to_be_bytes()
+        );
+    }
+    assert!(router.unregister_call(address(10), 1000, 1000, 1000));
+    let mut replacement = router.register_call(address(10), 1000, 1000, 3000).unwrap();
+    router.route_call(address(10), 1000, 1000, &[9]).unwrap();
+    assert_eq!(replacement.try_pop().unwrap().generation(), 3000);
+    assert!(owners[999].try_pop().is_none());
+}
+
+#[test]
 fn router_rejects_ambiguous_mini_frame_call_ids() {
-    let mut router = PeerIngressRouter::new(2, 1).unwrap();
+    let mut router = PeerIngressRouter::new(1).unwrap();
     let mut first = router.register_call(address(10), 100, 200, 11).unwrap();
     let mut second = router.register_call(address(10), 101, 200, 22).unwrap();
 
@@ -282,7 +324,7 @@ fn router_rejects_ambiguous_mini_frame_call_ids() {
 
 #[test]
 fn call_routes_validate_ids_track_drops_and_retire_by_generation() {
-    let mut router = PeerIngressRouter::new(1, 1).unwrap();
+    let mut router = PeerIngressRouter::new(1).unwrap();
     for (local_call, remote_call) in [(0, 200), (100, 0), (0x8000, 200), (100, 0x8000)] {
         assert_eq!(
             router
@@ -330,7 +372,7 @@ fn call_routes_validate_ids_track_drops_and_retire_by_generation() {
 
 #[test]
 fn remove_call_retires_only_the_exact_call_route() {
-    let mut router = PeerIngressRouter::new(1, 1).unwrap();
+    let mut router = PeerIngressRouter::new(1).unwrap();
     let remote = address(10);
     let _owner = router.register_call(remote, 100, 200, 7).unwrap();
 
@@ -341,7 +383,7 @@ fn remove_call_retires_only_the_exact_call_route() {
 
 #[test]
 fn router_rejects_unknown_sources_and_keeps_known_queues_live() {
-    let mut router = PeerIngressRouter::new(1, 1).unwrap();
+    let mut router = PeerIngressRouter::new(1).unwrap();
     let mut owner = router.register(address(1), 9).unwrap();
     assert_eq!(
         router.route(address(2), &[2]),
@@ -357,7 +399,7 @@ fn router_rejects_unknown_sources_and_keeps_known_queues_live() {
 
 #[test]
 fn router_counts_full_queue_drops_and_reports_occupancy() {
-    let mut router = PeerIngressRouter::new(1, 1).unwrap();
+    let mut router = PeerIngressRouter::new(1).unwrap();
     let mut owner = router.register(address(1), 1).unwrap();
     router.route(address(1), &[1]).unwrap();
     assert_eq!(
@@ -372,32 +414,25 @@ fn router_counts_full_queue_drops_and_reports_occupancy() {
 }
 
 #[test]
-fn router_rejects_duplicate_addresses_and_exceeding_peer_limit() {
+fn router_rejects_duplicate_addresses_and_zero_queue_capacity() {
     assert_eq!(
-        PeerIngressRouter::new(0, 1).err().unwrap(),
-        PeerIngressRouterError::ZeroPeerLimit
-    );
-    assert_eq!(
-        PeerIngressRouter::new(1, 0).err().unwrap(),
+        PeerIngressRouter::new(0).err().unwrap(),
         PeerIngressRouterError::Ingress(IngressError::ZeroCapacity)
     );
 
-    let mut router = PeerIngressRouter::new(1, 1).unwrap();
+    let mut router = PeerIngressRouter::new(1).unwrap();
     let _owner = router.register(address(1), 1).unwrap();
     assert!(!router.contains_local_call(1));
     assert_eq!(
         router.register(address(1), 2).err().unwrap(),
         PeerIngressRouterError::DuplicatePeer
     );
-    assert_eq!(
-        router.register(address(2), 2).err().unwrap(),
-        PeerIngressRouterError::PeerLimit
-    );
+    assert!(router.register(address(2), 2).is_ok());
 }
 
 #[test]
 fn router_removes_only_the_matching_generation_before_address_reuse() {
-    let mut router = PeerIngressRouter::new(1, 1).unwrap();
+    let mut router = PeerIngressRouter::new(1).unwrap();
     let mut old_owner = router.register(address(1), 1).unwrap();
     router.route(address(1), &[1]).unwrap();
     assert!(!router.unregister(address(1), 2));

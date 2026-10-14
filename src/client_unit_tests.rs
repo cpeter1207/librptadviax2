@@ -807,7 +807,7 @@ fn shared_endpoint_routes_sends_and_rejects_packets_larger_than_output_storage()
     let remote_address = remote.local_addr().unwrap();
     let socket = Arc::new(SharedSocket::new(UdpSocket::bind("127.0.0.1:0").unwrap()));
     let local = socket.local_addr().unwrap();
-    let mut router = PeerIngressRouter::new(1, 2).unwrap();
+    let mut router = PeerIngressRouter::new(2).unwrap();
     let ingress = router.register_call(remote_address, 1234, 5678, 1).unwrap();
     let mut endpoint = PeerEndpoint::Shared {
         socket: Arc::clone(&socket),

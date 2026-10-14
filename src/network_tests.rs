@@ -81,7 +81,7 @@ fn propagates_send_and_non_would_block_receive_errors() {
 
 #[test]
 fn routed_receive_preserves_socket_errors() {
-    let mut router = PeerIngressRouter::new(1, 1).unwrap();
+    let mut router = PeerIngressRouter::new(1).unwrap();
     let error = Error::new(ErrorKind::PermissionDenied, "injected receive error");
     assert!(matches!(
         route_received(Err(error), &mut router, &[0; 1500]),
@@ -118,7 +118,7 @@ fn sends_and_receives_one_unmodified_datagram() {
 fn endpoint_routes_received_datagrams_to_peer_owner_queue() {
     let sender = UdpEndpoint::bind(loopback()).unwrap();
     let endpoint = UdpEndpoint::bind(loopback()).unwrap();
-    let mut router = PeerIngressRouter::new(1, 2).unwrap();
+    let mut router = PeerIngressRouter::new(2).unwrap();
     let mut owner = router.register(sender.local_addr().unwrap(), 42).unwrap();
     let destination = endpoint.local_addr().unwrap();
     let mut buffer = [0; 1500];
@@ -151,7 +151,7 @@ fn endpoint_demultiplexes_full_and_mini_frames_by_call() {
     let sender = UdpEndpoint::bind(loopback()).unwrap();
     let endpoint = UdpEndpoint::bind(loopback()).unwrap();
     let remote = sender.local_addr().unwrap();
-    let mut router = PeerIngressRouter::new(2, 2).unwrap();
+    let mut router = PeerIngressRouter::new(2).unwrap();
     let mut first = router.register_call(remote, 100, 200, 11).unwrap();
     let mut second = router.register_call(remote, 101, 201, 22).unwrap();
     let destination = endpoint.local_addr().unwrap();
@@ -201,7 +201,7 @@ fn endpoint_rejects_malformed_and_unknown_call_frames() {
     let sender = UdpEndpoint::bind(loopback()).unwrap();
     let endpoint = UdpEndpoint::bind(loopback()).unwrap();
     let remote = sender.local_addr().unwrap();
-    let mut router = PeerIngressRouter::new(1, 1).unwrap();
+    let mut router = PeerIngressRouter::new(1).unwrap();
     let mut owner = router.register_call(remote, 100, 200, 1).unwrap();
     let destination = endpoint.local_addr().unwrap();
     let mut buffer = [0; 1500];
@@ -257,7 +257,7 @@ fn endpoint_rejects_malformed_and_unknown_call_frames() {
 fn endpoint_returns_unknown_full_frame_length_for_inbound_admission() {
     let sender = UdpEndpoint::bind(loopback()).unwrap();
     let endpoint = UdpEndpoint::bind(loopback()).unwrap();
-    let mut router = PeerIngressRouter::new(1, 1).unwrap();
+    let mut router = PeerIngressRouter::new(1).unwrap();
     let destination = endpoint.local_addr().unwrap();
     let packet = serialize_full_frame(
         &FullFrameHeader {
@@ -291,7 +291,7 @@ fn endpoint_keeps_address_only_routes_for_existing_callers() {
     let sender = UdpEndpoint::bind(loopback()).unwrap();
     let endpoint = UdpEndpoint::bind(loopback()).unwrap();
     let remote = sender.local_addr().unwrap();
-    let mut router = PeerIngressRouter::new(1, 1).unwrap();
+    let mut router = PeerIngressRouter::new(1).unwrap();
     let mut owner = router.register(remote, 9).unwrap();
     let destination = endpoint.local_addr().unwrap();
     let frame = serialize_full_frame(
@@ -323,7 +323,7 @@ fn endpoint_keeps_address_only_routes_for_existing_callers() {
 fn endpoint_surfaces_unknown_peer_and_full_queue_route_errors() {
     let sender = UdpEndpoint::bind(loopback()).unwrap();
     let endpoint = UdpEndpoint::bind(loopback()).unwrap();
-    let mut router = PeerIngressRouter::new(1, 1).unwrap();
+    let mut router = PeerIngressRouter::new(1).unwrap();
     let mut owner = router
         .register(SocketAddr::from(([127, 0, 0, 1], 9)), 7)
         .unwrap();

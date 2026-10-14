@@ -112,6 +112,8 @@ pub struct InboundIaxListener {
     async_ingress: Option<ListenerIngress>,
     #[cfg(test)]
     fail_next_poll: bool,
+    #[cfg(test)]
+    fail_next_reserve: bool,
 }
 
 struct InboundRoute {
@@ -140,12 +142,14 @@ impl InboundIaxListener {
             endpoint: UdpEndpoint::bind(local).map_err(ListenerError::Network)?,
             local_nodes: local_nodes.to_vec(),
             tokens,
-            router: PeerIngressRouter::new(1024, 16).map_err(|_| ListenerError::InvalidFrame)?,
-            routes: Vec::with_capacity(1024),
+            router: PeerIngressRouter::new(16).map_err(|_| ListenerError::InvalidFrame)?,
+            routes: Vec::new(),
             generation: 0,
             async_ingress: None,
             #[cfg(test)]
             fail_next_poll: false,
+            #[cfg(test)]
+            fail_next_reserve: false,
         })
     }
 
@@ -169,7 +173,7 @@ impl InboundIaxListener {
             .register(runtime.handle())
             .map_err(ListenerError::Network)?;
         // No fallible work remains before the sole router moves into its task.
-        let empty = PeerIngressRouter::new(1, 1).expect("nonzero placeholder limits");
+        let empty = PeerIngressRouter::new(1).expect("nonzero placeholder limits");
         let router = std::mem::replace(&mut self.router, empty);
         self.async_ingress = Some(ListenerIngress::start(runtime, socket, router));
         Ok(())
@@ -252,7 +256,9 @@ impl InboundIaxListener {
         let Ok(request) = parse_full_frame_packet(bytes) else {
             return Ok(ListenerEvent::Ignored);
         };
-        let local_call = self.next_available_call();
+        let Some(local_call) = self.next_available_call() else {
+            return self.reject_new(bytes, remote);
+        };
         let local_node = called_node(bytes)
             .filter(|called| self.local_nodes.iter().any(|node| node == called))
             .unwrap_or(&self.local_nodes[0])
@@ -276,6 +282,13 @@ impl InboundIaxListener {
                 Ok(ListenerEvent::Replied)
             }
             InboundNewAction::Accept(accepted) => {
+                // Reserve before a router or peer can retain the new call identity.
+                let reserved = self.routes.try_reserve(1).is_ok();
+                #[cfg(test)]
+                let reserved = reserved && !std::mem::take(&mut self.fail_next_reserve);
+                if !reserved {
+                    return self.reject_new(bytes, remote);
+                }
                 self.generation = self.generation.wrapping_add(1).max(1);
                 let ingress = if let Some(ingress) = &self.async_ingress {
                     ingress
@@ -295,12 +308,7 @@ impl InboundIaxListener {
                     )
                 };
                 let Ok(ingress) = ingress else {
-                    let reject = self
-                        .tokens
-                        .reject_initial_new(bytes)
-                        .map_err(|_| ListenerError::InvalidFrame)?;
-                    send_reply(&self.endpoint, &reject, remote)?;
-                    return Ok(ListenerEvent::Replied);
+                    return self.reject_new(bytes, remote);
                 };
                 let local = self.endpoint.local_addr().map_err(ListenerError::Network)?;
                 let (mut peer, released) = IaxPeer::from_inbound(
@@ -367,9 +375,20 @@ impl InboundIaxListener {
         Ok(())
     }
 
-    fn next_available_call(&self) -> u16 {
+    fn reject_new(&self, bytes: &[u8], remote: SocketAddr) -> Result<ListenerEvent, ListenerError> {
+        let Ok(reject) = self.tokens.reject_initial_new(bytes) else {
+            return Ok(ListenerEvent::Ignored);
+        };
+        send_reply(&self.endpoint, &reject, remote)?;
+        Ok(ListenerEvent::Replied)
+    }
+
+    fn next_available_call(&self) -> Option<u16> {
+        // One starting point, then a complete local scan. Concurrent listeners
+        // must not make each other's atomic strides skip a free call number.
+        let start = u32::from(next_call_number()) - 16_384;
         (0..16_384)
-            .map(|_| next_call_number())
+            .map(|offset| (16_384 + (start + offset) % 16_384) as u16)
             .find(|call| {
                 if self.async_ingress.is_some() {
                     !self.routes.iter().any(|route| route.local_call == *call)
@@ -377,7 +396,6 @@ impl InboundIaxListener {
                     !self.router.contains_local_call(*call)
                 }
             })
-            .expect("inbound peer limit is below the available local call-number space")
     }
 
     fn route_existing(&mut self, remote: SocketAddr, packet: &[u8]) -> bool {

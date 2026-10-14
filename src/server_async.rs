@@ -192,7 +192,7 @@ mod tests {
                 .unwrap(),
         );
         let socket = runtime.block_on(UdpSocket::bind("127.0.0.1:0")).unwrap();
-        let mut router = PeerIngressRouter::new(1, 1).unwrap();
+        let mut router = PeerIngressRouter::new(1).unwrap();
         let peer = router
             .register_call("127.0.0.1:4569".parse().unwrap(), 22, 42, 7)
             .unwrap();
@@ -226,7 +226,7 @@ mod tests {
             let _entered = runtime.enter();
             UdpSocket::from_std(receiver).unwrap()
         };
-        let mut router = PeerIngressRouter::new(1, 4).unwrap();
+        let mut router = PeerIngressRouter::new(4).unwrap();
         let mut peer = router.register_call(remote, 22, 42, 7).unwrap();
         let mut pump = ListenerIngress::start(runtime.clone(), Arc::new(socket), router);
         let packet = |destination, command: IaxCommand| {
@@ -319,7 +319,7 @@ mod tests {
             let _entered = runtime.enter();
             UdpSocket::from_std(receiver).unwrap()
         };
-        let mut router = PeerIngressRouter::new(1, 1).unwrap();
+        let mut router = PeerIngressRouter::new(1).unwrap();
         let peer = router.register_call(remote, 22, 42, 7).unwrap();
         let mut pump = ListenerIngress::start(runtime.clone(), Arc::new(socket), router);
         runtime.block_on(async {
