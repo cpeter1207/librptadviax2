@@ -485,6 +485,7 @@ pub struct OutboundCallSetup {
     offered_formats: u32,
     next_outgoing: u8,
     next_incoming: u8,
+    received_media: u64,
     initial_new: Vec<u8>,
     state: State,
     last_reliable_response: Option<LastReliableResponse>,
@@ -507,6 +508,7 @@ impl OutboundCallSetup {
             offered_formats: IAX_FORMAT_ULAW,
             next_outgoing: 1,
             next_incoming: 1,
+            received_media: 0,
             initial_new: Vec::new(),
             state: State::Linked,
             last_reliable_response: None,
@@ -530,6 +532,7 @@ impl OutboundCallSetup {
             offered_formats,
             next_outgoing: 1,
             next_incoming: 0,
+            received_media: 0,
             initial_new,
             state: State::AwaitingResponse,
             last_reliable_response: None,
@@ -617,8 +620,8 @@ impl OutboundCallSetup {
         Ok(packet)
     }
 
-    /// Sequence a validated full voice frame and suppress duplicate media delivery.
-    pub(crate) fn receive_voice(
+    /// Sequence a validated full media frame and suppress duplicate delivery.
+    pub(crate) fn receive_media(
         &mut self,
         header: &FullFrameHeader,
     ) -> Result<(bool, Vec<u8>), CallSetupError> {
@@ -631,8 +634,52 @@ impl OutboundCallSetup {
         self.validate_peer_header(header)?;
         let next_incoming = self.next_incoming.wrapping_add(1);
         let acknowledgement = self.acknowledgement(header, next_incoming)?;
-        self.next_incoming = next_incoming;
+        self.consume_incoming(next_incoming);
         Ok((true, acknowledgement))
+    }
+
+    /// Admit bounded out-of-order full voice without relaxing reliable control ordering.
+    pub(crate) fn receive_media_reordered(
+        &mut self,
+        header: &FullFrameHeader,
+    ) -> Result<(bool, Vec<u8>), CallSetupError> {
+        // Validate identity and cumulative ACK independently from media arrival order.
+        self.validate_peer_header(&FullFrameHeader {
+            outgoing_sequence: self.next_incoming,
+            ..*header
+        })?;
+        if (1..=64).contains(&self.next_incoming.wrapping_sub(header.outgoing_sequence)) {
+            return Ok((false, self.acknowledgement(header, self.next_incoming)?));
+        }
+        let distance = header.outgoing_sequence.wrapping_sub(self.next_incoming);
+        if distance >= 64 {
+            return Err(CallSetupError::SequenceMismatch {
+                expected_outgoing: self.next_incoming,
+                actual_outgoing: header.outgoing_sequence,
+                expected_incoming: self.next_outgoing,
+                actual_incoming: header.incoming_sequence,
+            });
+        }
+        let bit = 1u64 << distance;
+        let deliver = self.received_media & bit == 0;
+        self.received_media |= bit;
+        self.consume_incoming(self.next_incoming);
+        Ok((deliver, self.acknowledgement(header, self.next_incoming)?))
+    }
+
+    fn advanced_incoming(&self, next: u8) -> u8 {
+        let shift = u32::from(next.wrapping_sub(self.next_incoming));
+        let pending = self.received_media.checked_shr(shift).unwrap_or(0);
+        next.wrapping_add(pending.trailing_ones() as u8)
+    }
+
+    fn consume_incoming(&mut self, next: u8) {
+        let next = self.advanced_incoming(next);
+        self.received_media = self
+            .received_media
+            .checked_shr(u32::from(next.wrapping_sub(self.next_incoming)))
+            .unwrap_or(0);
+        self.next_incoming = next;
     }
 
     /// Build one sequenced IAX DTMF full frame for a linked call.
@@ -647,6 +694,19 @@ impl OutboundCallSetup {
         let remote_call = self.remote_call.ok_or(CallSetupError::CallFinished)?;
         let mut header = self.outgoing_header(remote_call, timestamp_ms, self.next_incoming, digit);
         header.frame_type = 1;
+        let packet = serialize_full_frame(&header, &[]).map_err(CallSetupError::Frame)?;
+        self.next_outgoing = self.next_outgoing.wrapping_add(1);
+        Ok(packet)
+    }
+
+    /// Answer an authorized inbound call using its next reliable sequence position.
+    pub(crate) fn send_answer(&mut self, timestamp_ms: u32) -> Result<Vec<u8>, CallSetupError> {
+        if self.state != State::Linked {
+            return Err(CallSetupError::NotLinked);
+        }
+        let remote_call = self.remote_call.ok_or(CallSetupError::CallFinished)?;
+        let mut header = self.outgoing_header(remote_call, timestamp_ms, self.next_incoming, 4);
+        header.frame_type = 4;
         let packet = serialize_full_frame(&header, &[]).map_err(CallSetupError::Frame)?;
         self.next_outgoing = self.next_outgoing.wrapping_add(1);
         Ok(packet)
@@ -719,7 +779,8 @@ impl OutboundCallSetup {
             return Ok(OutboundSetupResponse::Send(retry));
         }
 
-        if let Some(response) = self.duplicate_response(&frame.header, Some(command), frame.payload)
+        if let Some(response) =
+            self.duplicate_response(&frame.header, Some(command), frame.payload)?
         {
             return Ok(OutboundSetupResponse::Send(response));
         }
@@ -823,6 +884,15 @@ impl OutboundCallSetup {
         if frame.header.frame_type == 4 {
             return self.receive_radio_control(&frame.header, frame.payload);
         }
+        if frame.header.frame_type == 10 {
+            // RFC 5456 CNG has no payload. ACK its sequence without creating
+            // audio or changing radio key state when a peer finishes speaking.
+            if !frame.payload.is_empty() {
+                return Err(CallSetupError::InvalidFrame);
+            }
+            let (_, acknowledgement) = self.receive_media(&frame.header)?;
+            return Ok(LinkedCallResponse::Send(acknowledgement));
+        }
         if frame.header.frame_type != IAX_FRAME_TYPE {
             return Err(CallSetupError::NotIaxFrame {
                 frame_type: frame.header.frame_type,
@@ -834,7 +904,8 @@ impl OutboundCallSetup {
         if command == IaxCommand::CallToken {
             return Err(CallSetupError::UnexpectedCommand { command });
         }
-        if let Some(response) = self.duplicate_response(&frame.header, Some(command), frame.payload)
+        if let Some(response) =
+            self.duplicate_response(&frame.header, Some(command), frame.payload)?
         {
             return Ok(LinkedCallResponse::Send(response));
         }
@@ -851,13 +922,13 @@ impl OutboundCallSetup {
         }
         let subclass = (u8::from(header.subclass_is_log) << 7) | header.subclass;
         let subclass = decode_subclass(subclass).map_err(|_| CallSetupError::InvalidFrame)?;
-        if let Some(response) = self.duplicate_response(header, None, payload) {
+        if let Some(response) = self.duplicate_response(header, None, payload)? {
             return Ok(LinkedCallResponse::Send(response));
         }
         self.validate_peer_header(header)?;
         let next_incoming = self.next_incoming.wrapping_add(1);
         let acknowledgement = self.acknowledgement(header, next_incoming)?;
-        self.next_incoming = next_incoming;
+        self.consume_incoming(next_incoming);
         self.remember_response(None, header, payload, acknowledgement.clone());
         Ok(match subclass {
             4 => LinkedCallResponse::Answered { acknowledgement },
@@ -897,7 +968,7 @@ impl OutboundCallSetup {
                 )
                 .map_err(CallSetupError::Frame)?;
                 self.next_outgoing = self.next_outgoing.wrapping_add(1);
-                self.next_incoming = next_incoming;
+                self.consume_incoming(next_incoming);
                 self.remember_response(Some(command), header, payload, pong.clone());
                 Ok(LinkedCallResponse::SendReliable(pong))
             }
@@ -908,7 +979,7 @@ impl OutboundCallSetup {
                 if matched_probe {
                     self.pending_ping_timestamp = None;
                 }
-                self.next_incoming = next_incoming;
+                self.consume_incoming(next_incoming);
                 self.remember_response(Some(command), header, payload, acknowledgement.clone());
                 Ok(LinkedCallResponse::PongAcknowledged {
                     acknowledgement,
@@ -918,7 +989,7 @@ impl OutboundCallSetup {
             IaxCommand::Hangup | IaxCommand::LagRp => {
                 let next_incoming = self.next_incoming.wrapping_add(1);
                 let acknowledgement = self.acknowledgement(header, next_incoming)?;
-                self.next_incoming = next_incoming;
+                self.consume_incoming(next_incoming);
                 self.remember_response(Some(command), header, payload, acknowledgement.clone());
                 if command == IaxCommand::LagRp {
                     return Ok(LinkedCallResponse::Send(acknowledgement));
@@ -933,14 +1004,14 @@ impl OutboundCallSetup {
     fn receive_text(&mut self, packet: &[u8]) -> Result<LinkedCallResponse, CallSetupError> {
         let text = parse_text_frame(packet).map_err(|_| CallSetupError::InvalidFrame)?;
         if let Some(acknowledgement) =
-            self.duplicate_response(&text.header, None, text.text.as_bytes())
+            self.duplicate_response(&text.header, None, text.text.as_bytes())?
         {
             return Ok(LinkedCallResponse::Send(acknowledgement));
         }
         self.validate_peer_header(&text.header)?;
         let next_incoming = self.next_incoming.wrapping_add(1);
         let acknowledgement = self.acknowledgement(&text.header, next_incoming)?;
-        self.next_incoming = next_incoming;
+        self.consume_incoming(next_incoming);
         self.remember_response(
             None,
             &text.header,
@@ -964,13 +1035,13 @@ impl OutboundCallSetup {
         if !payload.is_empty() {
             return Err(CallSetupError::InvalidFrame);
         }
-        if let Some(response) = self.duplicate_response(header, None, payload) {
+        if let Some(response) = self.duplicate_response(header, None, payload)? {
             return Ok(LinkedCallResponse::Send(response));
         }
         self.validate_peer_header(header)?;
         let next_incoming = self.next_incoming.wrapping_add(1);
         let acknowledgement = self.acknowledgement(header, next_incoming)?;
-        self.next_incoming = next_incoming;
+        self.consume_incoming(next_incoming);
         self.remember_response(None, header, payload, acknowledgement.clone());
         Ok(LinkedCallResponse::Digit {
             digit: header.subclass,
@@ -978,22 +1049,39 @@ impl OutboundCallSetup {
         })
     }
 
+    /// Replay the cached reply, or cumulatively ACK an older linked retry.
+    ///
+    /// Intervening frames replace the one-entry reply cache, but do not make
+    /// an already consumed sequence new again. Never redeliver its event.
     fn duplicate_response(
         &self,
         header: &FullFrameHeader,
         command: Option<IaxCommand>,
         payload: &[u8],
-    ) -> Option<Vec<u8>> {
-        let last = self.last_reliable_response.as_ref()?;
-        (header.retransmission
-            && header.destination_call_number == self.local_call
-            && header.source_call_number == last.source_call
-            && header.outgoing_sequence == last.outgoing_sequence
-            && command == last.command
-            && header.frame_type == last.frame_type
-            && header.subclass == last.subclass
-            && payload == last.payload)
-            .then(|| last.response.clone())
+    ) -> Result<Option<Vec<u8>>, CallSetupError> {
+        if !header.retransmission {
+            return Ok(None);
+        }
+        if let Some(last) = self.last_reliable_response.as_ref().filter(|last| {
+            header.destination_call_number == self.local_call
+                && header.source_call_number == last.source_call
+                && header.outgoing_sequence == last.outgoing_sequence
+                && command == last.command
+                && header.frame_type == last.frame_type
+                && header.subclass == last.subclass
+                && payload == last.payload
+        }) {
+            // Setup replies and PONG/LAGRP must retain their original sequence.
+            return Ok(Some(last.response.clone()));
+        }
+        if self.state == State::Linked
+            && command != Some(IaxCommand::Ack)
+            && (1..=64).contains(&self.next_incoming.wrapping_sub(header.outgoing_sequence))
+        {
+            self.validate_call_ids(header)?;
+            return self.acknowledgement(header, self.next_incoming).map(Some);
+        }
+        Ok(None)
     }
 
     fn remember_response(
@@ -1033,7 +1121,7 @@ impl OutboundCallSetup {
             acknowledgement.clone(),
         );
         self.remote_call = Some(header.source_call_number);
-        self.next_incoming = next_incoming;
+        self.consume_incoming(next_incoming);
         self.state = State::Linked;
         Ok(OutboundSetupResponse::Accepted {
             remote_call: header.source_call_number,
@@ -1056,7 +1144,7 @@ impl OutboundCallSetup {
             acknowledgement.clone(),
         );
         self.remote_call = Some(header.source_call_number);
-        self.next_incoming = next_incoming;
+        self.consume_incoming(next_incoming);
         self.state = State::Rejected;
         Ok(OutboundSetupResponse::Rejected { acknowledgement })
     }
@@ -1066,6 +1154,7 @@ impl OutboundCallSetup {
         peer_header: &FullFrameHeader,
         incoming_sequence: u8,
     ) -> Result<Vec<u8>, CallSetupError> {
+        let incoming_sequence = self.advanced_incoming(incoming_sequence);
         serialize_full_frame(
             &FullFrameHeader {
                 source_call_number: self.local_call,
@@ -1090,6 +1179,7 @@ impl OutboundCallSetup {
         incoming_sequence: u8,
         subclass: u8,
     ) -> FullFrameHeader {
+        let incoming_sequence = self.advanced_incoming(incoming_sequence);
         FullFrameHeader {
             source_call_number: self.local_call,
             retransmission: false,
@@ -1153,3 +1243,7 @@ fn accepted_format(payload: &[u8]) -> Result<u32, CallSetupError> {
     }
     format.ok_or(CallSetupError::InvalidAcceptedFormat)
 }
+
+#[cfg(test)]
+#[path = "session_media_tests.rs"]
+mod media_tests;

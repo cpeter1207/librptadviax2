@@ -6,6 +6,25 @@ use rptadviax2::ffi::{
 use std::mem::size_of;
 
 #[test]
+fn async_descriptor_v1_creates_and_releases_a_runtime_for_external_consumers() {
+    let descriptor = rptadviax2::async_ffi::rptadv_iax2_async_descriptor_v1();
+    assert!(!descriptor.is_null());
+    let descriptor = unsafe { &*descriptor };
+    assert_eq!(
+        descriptor.struct_size as usize,
+        std::mem::size_of_val(descriptor)
+    );
+    assert_eq!(descriptor.abi_version, 1);
+    assert_eq!(descriptor.capability, *b"rptadv.iaxasync\0");
+    let mut runtime = std::ptr::null_mut();
+    unsafe {
+        assert_eq!((descriptor.runtime_create)(&mut runtime), 0);
+        assert!(!runtime.is_null());
+        (descriptor.runtime_destroy)(runtime);
+    }
+}
+
+#[test]
 fn descriptor_v1_exposes_dial_and_media_operations() {
     let descriptor = rptadv_iax2_client_descriptor_v1();
     assert!(!descriptor.is_null());

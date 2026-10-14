@@ -8,6 +8,146 @@ fn address(port: u16) -> SocketAddr {
 }
 
 #[test]
+fn queued_datagram_retains_observed_arrival_time() {
+    let (mut producer, mut owner) = producer_ingress(2, 77).unwrap();
+    let arrival = std::time::Instant::now();
+    producer.try_push_at(address(1), &[9], arrival).unwrap();
+    let packet = owner.try_pop().unwrap();
+    assert_eq!(packet.arrived_at(), arrival);
+    assert_eq!((packet.generation(), packet.payload()), (77, &[9][..]));
+}
+
+#[test]
+fn call_routes_preserve_captured_arrival_and_publish_terminal_failure() {
+    let mut router = PeerIngressRouter::new(2, 4).unwrap();
+    let mut full = router.register_call(address(1), 22, 42, 7).unwrap();
+    let mut fallback = router.register(address(2), 8).unwrap();
+    let arrival = std::time::Instant::now() - std::time::Duration::from_secs(1);
+    router
+        .route_call_at(address(1), 22, 42, &[1], arrival)
+        .unwrap();
+    router
+        .route_remote_call_at(address(1), 42, &[2], arrival)
+        .unwrap();
+    router
+        .route_call_at(address(2), 22, 42, &[3], arrival)
+        .unwrap();
+    router
+        .route_remote_call_at(address(2), 42, &[4], arrival)
+        .unwrap();
+    for value in [1, 2] {
+        let packet = full.try_pop().unwrap();
+        assert_eq!(packet.payload(), [value]);
+        assert_eq!(packet.arrived_at(), arrival);
+    }
+    for value in [3, 4] {
+        let packet = fallback.try_pop().unwrap();
+        assert_eq!(packet.payload(), [value]);
+        assert_eq!(packet.arrived_at(), arrival);
+    }
+    router.fail_all();
+    assert!(full.failed());
+    assert!(fallback.failed());
+}
+
+#[test]
+fn closed_peer_owner_rejects_every_router_admission_form() {
+    for call_route in [false, true] {
+        let mut router = PeerIngressRouter::new(1, 1).unwrap();
+        let owner = if call_route {
+            router.register_call(address(1), 22, 42, 1).unwrap()
+        } else {
+            router.register(address(1), 1).unwrap()
+        };
+        drop(owner);
+        for result in [
+            router.route_call(address(1), 22, 42, &[1]),
+            router.route_remote_call(address(1), 42, &[2]),
+            router.route(address(1), &[3]),
+        ] {
+            assert_eq!(result, Err(PeerIngressRouterError::UnknownPeer));
+        }
+    }
+}
+
+#[test]
+fn cloned_ingress_producers_share_one_bounded_owner() {
+    let (mut producer, mut owner) = producer_ingress(2, 19).unwrap();
+    let mut other = producer.clone();
+    producer.try_push(address(1), &[1]).unwrap();
+    other.try_push(address(1), &[2]).unwrap();
+    assert_eq!(
+        producer.try_push(address(1), &[3]),
+        Err(IngressPushError::Full)
+    );
+    assert_eq!(owner.stats().queued_packets, 2);
+    assert_eq!(owner.stats().capacity_packets, 2);
+    assert_eq!(owner.stats().dropped_packets, 1);
+    assert_eq!(owner.try_pop().unwrap().payload(), [1]);
+    assert_eq!(owner.stats().queued_packets, 1);
+    assert_eq!(owner.stats().dropped_packets, 1);
+    assert_eq!(owner.try_pop().unwrap().payload(), [2]);
+    drop(owner);
+    assert_eq!(
+        other.try_push(address(1), &[4]),
+        Err(IngressPushError::Closed)
+    );
+}
+
+#[test]
+fn stalled_peer_does_not_block_other_peers() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let (mut blocked, mut blocked_owner) = producer_ingress(1, 1).unwrap();
+        let (mut ready, mut ready_owner) = producer_ingress(1, 2).unwrap();
+        let (entered, entered_rx) = tokio::sync::oneshot::channel();
+        let (release, release_rx) = tokio::sync::oneshot::channel();
+        let blocked_task = tokio::spawn(async move {
+            let first = blocked_owner.receive().await.unwrap();
+            entered.send(()).unwrap();
+            release_rx.await.unwrap();
+            (first, blocked_owner.receive().await.unwrap())
+        });
+        blocked.try_push(address(1), &[1]).unwrap();
+        entered_rx.await.unwrap();
+        blocked.try_push(address(1), &[2]).unwrap();
+        assert_eq!(
+            blocked.try_push(address(1), &[3]),
+            Err(IngressPushError::Full)
+        );
+        ready.try_push(address(2), &[4]).unwrap();
+        assert_eq!(ready_owner.receive().await.unwrap().payload(), [4]);
+        release.send(()).unwrap();
+        let (first, second) = blocked_task.await.unwrap();
+        assert_eq!(first.payload(), [1]);
+        assert_eq!(second.payload(), [2]);
+    });
+}
+
+#[test]
+fn retired_generation_cannot_publish_after_slot_reuse() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let (mut old, retired) = producer_ingress(1, 10).unwrap();
+        drop(retired);
+        let (mut current, mut owner) = producer_ingress(1, 11).unwrap();
+        assert_eq!(
+            old.try_push(address(1), &[1]),
+            Err(IngressPushError::Closed)
+        );
+        current.try_push(address(1), &[2]).unwrap();
+        let packet = owner.receive().await.unwrap();
+        assert_eq!((packet.generation(), packet.payload()), (11, &[2][..]));
+        drop(current);
+        assert!(owner.receive().await.is_none());
+    });
+}
+
+#[test]
 fn producer_queue_preserves_order_and_peer_generation() {
     let (mut producer, mut owner) = producer_ingress(2, 77).unwrap();
     assert_eq!(producer.available_slots(), 2);
@@ -179,6 +319,7 @@ fn call_routes_validate_ids_track_drops_and_retire_by_generation() {
         crate::ingress::IngressStats {
             queued_packets: 1,
             dropped_packets: 1,
+            capacity_packets: 1,
         }
     );
     assert!(!router.unregister_call(address(10), 100, 200, 8));
@@ -269,4 +410,22 @@ fn router_removes_only_the_matching_generation_before_address_reuse() {
     assert_eq!(packet.generation(), 2);
     assert_eq!(packet.payload(), [2]);
     assert_eq!(router.stats(address(3)), None);
+}
+#[tokio::test]
+async fn wake_retains_backlog_after_coalesced_notifications() {
+    let (mut producer, mut consumer) = producer_ingress(2, 1).unwrap();
+    let wake = consumer.wake();
+    assert_eq!(wake.pending(), 0);
+    producer.try_push(address(1), &[1]).unwrap();
+    producer.try_push(address(1), &[2]).unwrap();
+    assert_eq!(
+        producer.try_push(address(1), &[3]),
+        Err(IngressPushError::Full)
+    );
+    wake.notified().await;
+    assert_eq!(wake.pending(), 2);
+    assert_eq!(consumer.try_pop().unwrap().payload(), [1]);
+    assert_eq!(wake.pending(), 1, "a bounded drain must be rescheduled");
+    assert_eq!(consumer.receive().await.unwrap().payload(), [2]);
+    assert_eq!(wake.pending(), 0);
 }

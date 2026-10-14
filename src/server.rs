@@ -2,11 +2,11 @@
 
 use crate::{
     call_token::CallTokenAuthority,
-    client::IaxPeer,
+    client::{DialError, IaxPeer},
     information_elements::parse_information_elements,
     ingress::{PeerIngressRouter, PeerIngressRouterError},
     network::UdpEndpoint,
-    protocol::{IaxCommand, decode_iax_command, parse_full_frame_packet, parse_mini_frame},
+    protocol::{parse_full_frame_packet, parse_mini_frame},
     session::{InboundNewAction, process_inbound_ulaw_new},
 };
 use std::{
@@ -16,7 +16,12 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicU32, Ordering},
     },
+    time::Instant,
 };
+
+#[path = "server_async.rs"]
+mod async_ingress;
+use async_ingress::ListenerIngress;
 
 static NEXT_INBOUND_CALL: AtomicU32 = AtomicU32::new(0);
 
@@ -46,7 +51,7 @@ impl InboundPeer {
 
 /// One result from polling the inbound endpoint.
 pub enum ListenerEvent {
-    /// A valid call passed token validation and product admission, and ACCEPT was sent.
+    /// A valid call passed token validation and product admission; ACCEPT and ANSWER were sent.
     Accepted(Box<InboundPeer>),
     /// A challenge, reject, or protocol reply was sent; no peer was admitted.
     Replied,
@@ -54,6 +59,15 @@ pub enum ListenerEvent {
     Ignored,
     /// No datagram was waiting.
     None,
+}
+
+/// Independently sampled listener admission and live-route occupancy counters.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ListenerIngressStats {
+    /// NEW queue occupancy, capacity, and cumulative full-queue drops; zero for synchronous receive.
+    pub admission: crate::ingress::IngressStats,
+    /// Number of established routes currently owned by the socket router.
+    pub active_routes: usize,
 }
 
 /// Failure from the standalone IAX2 listener.
@@ -95,6 +109,7 @@ pub struct InboundIaxListener {
     router: PeerIngressRouter,
     routes: Vec<InboundRoute>,
     generation: u64,
+    async_ingress: Option<ListenerIngress>,
     #[cfg(test)]
     fail_next_poll: bool,
 }
@@ -128,9 +143,50 @@ impl InboundIaxListener {
             router: PeerIngressRouter::new(1024, 16).map_err(|_| ListenerError::InvalidFrame)?,
             routes: Vec::with_capacity(1024),
             generation: 0,
+            async_ingress: None,
             #[cfg(test)]
             fail_next_poll: false,
         })
+    }
+
+    /// Transfer socket receive and established routing to the shared runtime.
+    ///
+    /// Call off-executor, with exclusive listener ownership; repeated enable is
+    /// a no-op success. Poll continues
+    /// to authorize only bounded queued NEW calls; slow policy never holds up
+    /// established traffic. Drop this listener off-executor before unloading its
+    /// DSO. The listener retains the runtime until its socket task has joined.
+    pub fn enable_async(
+        &mut self,
+        runtime: Arc<tokio::runtime::Runtime>,
+    ) -> Result<(), ListenerError> {
+        if self.async_ingress.is_some() {
+            return Ok(());
+        }
+        let socket = self
+            .endpoint
+            .shared_socket()
+            .try_clone()
+            .map_err(ListenerError::Network)?;
+        let _entered = runtime.enter();
+        let socket = tokio::net::UdpSocket::from_std(socket).map_err(ListenerError::Network)?;
+        drop(_entered);
+        // No fallible work remains before the sole router moves into its task.
+        let empty = PeerIngressRouter::new(1, 1).expect("nonzero placeholder limits");
+        let router = std::mem::replace(&mut self.router, empty);
+        self.async_ingress = Some(ListenerIngress::start(runtime, socket, router));
+        Ok(())
+    }
+
+    /// Snapshot bounded admission and route counters without waiting on the socket task.
+    pub fn ingress_stats(&self) -> ListenerIngressStats {
+        self.async_ingress.as_ref().map_or_else(
+            || ListenerIngressStats {
+                admission: crate::ingress::IngressStats::default(),
+                active_routes: self.router.route_count(),
+            },
+            ListenerIngress::stats,
+        )
     }
 
     #[cfg(test)]
@@ -173,19 +229,29 @@ impl InboundIaxListener {
                 "injected poll failure",
             )));
         }
-        self.reap_released_routes();
+        self.reap_released_routes()?;
         let mut packet = [0_u8; crate::ingress::MAX_DATAGRAM_SIZE];
-        let Some((length, remote)) = self
-            .endpoint
-            .try_receive(&mut packet)
-            .map_err(ListenerError::Network)?
-        else {
-            return Ok(ListenerEvent::None);
+        let (length, remote) = if let Some(ingress) = &mut self.async_ingress {
+            let Some(received) = ingress.try_receive().map_err(ListenerError::Network)? else {
+                return Ok(ListenerEvent::None);
+            };
+            let length = received.payload().len();
+            packet[..length].copy_from_slice(received.payload());
+            (length, received.remote())
+        } else {
+            let Some((length, remote)) = self
+                .endpoint
+                .try_receive(&mut packet)
+                .map_err(ListenerError::Network)?
+            else {
+                return Ok(ListenerEvent::None);
+            };
+            if self.route_existing(remote, &packet[..length]) {
+                return Ok(ListenerEvent::None);
+            }
+            (length, remote)
         };
         let bytes = &packet[..length];
-        if self.route_existing(remote, bytes) {
-            return Ok(ListenerEvent::None);
-        }
         let Ok(request) = parse_full_frame_packet(bytes) else {
             return Ok(ListenerEvent::Ignored);
         };
@@ -214,12 +280,24 @@ impl InboundIaxListener {
             }
             InboundNewAction::Accept(accepted) => {
                 self.generation = self.generation.wrapping_add(1).max(1);
-                let Ok(ingress) = self.router.register_call(
-                    remote,
-                    local_call,
-                    request.header.source_call_number,
-                    self.generation,
-                ) else {
+                let ingress = if let Some(ingress) = &self.async_ingress {
+                    ingress
+                        .register(
+                            remote,
+                            local_call,
+                            request.header.source_call_number,
+                            self.generation,
+                        )
+                        .map_err(ListenerError::Network)?
+                } else {
+                    self.router.register_call(
+                        remote,
+                        local_call,
+                        request.header.source_call_number,
+                        self.generation,
+                    )
+                };
+                let Ok(ingress) = ingress else {
                     let reject = self
                         .tokens
                         .reject_initial_new(bytes)
@@ -228,7 +306,7 @@ impl InboundIaxListener {
                     return Ok(ListenerEvent::Replied);
                 };
                 let local = self.endpoint.local_addr().map_err(ListenerError::Network)?;
-                let (peer, released) = IaxPeer::from_inbound(
+                let (mut peer, released) = IaxPeer::from_inbound(
                     self.endpoint.shared_socket(),
                     ingress,
                     local,
@@ -245,7 +323,8 @@ impl InboundIaxListener {
                     generation: self.generation,
                     released,
                 });
-                send_reply(&self.endpoint, &accepted.packet, remote)?;
+                peer.accept_inbound(accepted.packet)
+                    .map_err(map_inbound_peer_error)?;
                 Ok(ListenerEvent::Accepted(Box::new(InboundPeer {
                     local_node,
                     remote_node: accepted.remote_node,
@@ -259,7 +338,7 @@ impl InboundIaxListener {
         }
     }
 
-    fn reap_released_routes(&mut self) {
+    fn reap_released_routes(&mut self) -> Result<(), ListenerError> {
         let mut index = 0;
         while index < self.routes.len() {
             if self.routes[index]
@@ -267,69 +346,80 @@ impl InboundIaxListener {
                 .load(std::sync::atomic::Ordering::Acquire)
             {
                 let route = self.routes.swap_remove(index);
-                self.router.unregister_call(
-                    route.remote,
-                    route.local_call,
-                    route.remote_call,
-                    route.generation,
-                );
+                if let Some(ingress) = &self.async_ingress {
+                    ingress
+                        .unregister(
+                            route.remote,
+                            route.local_call,
+                            route.remote_call,
+                            route.generation,
+                        )
+                        .map_err(ListenerError::Network)?;
+                } else {
+                    self.router.unregister_call(
+                        route.remote,
+                        route.local_call,
+                        route.remote_call,
+                        route.generation,
+                    );
+                }
             } else {
                 index += 1;
             }
         }
-    }
-
-    fn remove_route(&mut self, remote: SocketAddr, local_call: u16, remote_call: u16) {
-        if let Some(index) = self.routes.iter().position(|route| {
-            route.remote == remote
-                && route.local_call == local_call
-                && route.remote_call == remote_call
-        }) {
-            let route = self.routes.swap_remove(index);
-            self.router
-                .unregister_call(remote, local_call, remote_call, route.generation);
-        }
+        Ok(())
     }
 
     fn next_available_call(&self) -> u16 {
         (0..16_384)
             .map(|_| next_call_number())
-            .find(|call| !self.router.contains_local_call(*call))
+            .find(|call| {
+                if self.async_ingress.is_some() {
+                    !self.routes.iter().any(|route| route.local_call == *call)
+                } else {
+                    !self.router.contains_local_call(*call)
+                }
+            })
             .expect("inbound peer limit is below the available local call-number space")
     }
 
     fn route_existing(&mut self, remote: SocketAddr, packet: &[u8]) -> bool {
-        if packet.first().is_some_and(|first| first & 0x80 != 0) {
-            let Ok(frame) = parse_full_frame_packet(packet) else {
-                return false;
-            };
-            let local_call = frame.header.destination_call_number;
-            let remote_call = frame.header.source_call_number;
-            match self
-                .router
-                .route_call(remote, local_call, remote_call, packet)
-            {
-                Ok(()) | Err(PeerIngressRouterError::Full) => {
-                    if decode_iax_command(&frame.header) == Ok(Some(IaxCommand::Hangup)) {
-                        self.remove_route(remote, local_call, remote_call);
-                    }
-                    true
-                }
-                Err(PeerIngressRouterError::UnknownPeer) => false,
-                Err(_) => true,
-            }
-        } else {
-            let Ok(frame) = parse_mini_frame(packet) else {
-                return false;
-            };
-            match self
-                .router
-                .route_remote_call(remote, frame.header.source_call_number, packet)
-            {
-                Ok(()) | Err(PeerIngressRouterError::Full) => true,
-                Err(PeerIngressRouterError::UnknownPeer) => false,
-                Err(_) => true,
-            }
+        route_established(&mut self.router, remote, packet, Instant::now())
+    }
+}
+
+fn route_established(
+    router: &mut PeerIngressRouter,
+    remote: SocketAddr,
+    packet: &[u8],
+    arrived_at: Instant,
+) -> bool {
+    if packet.first().is_some_and(|first| first & 0x80 != 0) {
+        let Ok(frame) = parse_full_frame_packet(packet) else {
+            return false;
+        };
+        let local_call = frame.header.destination_call_number;
+        let remote_call = frame.header.source_call_number;
+        match router.route_call_at(remote, local_call, remote_call, packet, arrived_at) {
+            // Admission is not protocol validation: even HANGUP may be dropped
+            // or rejected by its peer. Only released-generation reaping retires a route.
+            Ok(()) | Err(PeerIngressRouterError::Full) => true,
+            Err(PeerIngressRouterError::UnknownPeer) => false,
+            Err(_) => true,
+        }
+    } else {
+        let Ok(frame) = parse_mini_frame(packet) else {
+            return false;
+        };
+        match router.route_remote_call_at(
+            remote,
+            frame.header.source_call_number,
+            packet,
+            arrived_at,
+        ) {
+            Ok(()) | Err(PeerIngressRouterError::Full) => true,
+            Err(PeerIngressRouterError::UnknownPeer) => false,
+            Err(_) => true,
         }
     }
 }
@@ -361,6 +451,13 @@ fn send_reply(
     remote: SocketAddr,
 ) -> Result<(), ListenerError> {
     check_reply_send(endpoint.send_to(packet, remote), packet.len())
+}
+
+fn map_inbound_peer_error(error: DialError) -> ListenerError {
+    match error {
+        DialError::Network(error) => ListenerError::Network(error),
+        _ => ListenerError::InvalidFrame,
+    }
 }
 
 fn make_call_token_authority(

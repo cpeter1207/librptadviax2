@@ -33,6 +33,9 @@ pub const RPTADV_IAX2_EVENT_DIGIT: u32 = 4;
 pub const RPTADV_IAX2_EVENT_RADIO_KEY: u32 = 5;
 /// The remote radio released receive; event length is zero.
 pub const RPTADV_IAX2_EVENT_RADIO_UNKEY: u32 = 6;
+/// Ordered missing source samples; length is a count, not a PCM-buffer size.
+/// Only peers explicitly configured with the jitter capability emit this event.
+pub const RPTADV_IAX2_EVENT_GAP: u32 = 7;
 
 /// Caller-owned parameters for one outbound ULAW IAX2 call.
 #[repr(C)]
@@ -219,6 +222,25 @@ pub extern "C" fn rptadv_iax2_server_descriptor_v1() -> *const rptadv_iax2_serve
 }
 
 struct ServerHandle(crate::server::InboundIaxListener);
+
+pub(crate) unsafe fn server_enable_async(
+    handle: *mut c_void,
+    runtime: std::sync::Arc<tokio::runtime::Runtime>,
+) -> i32 {
+    boundary(-1, || {
+        let Some(server) = (unsafe { handle.cast::<ServerHandle>().as_mut() }) else {
+            return -1;
+        };
+        async_enable_status(server.0.enable_async(runtime))
+    })
+}
+
+fn async_enable_status(result: Result<(), crate::server::ListenerError>) -> i32 {
+    match result {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
+}
 
 unsafe extern "C" fn server_bind(
     options: *const rptadv_iax2_server_options_v1,
@@ -463,6 +485,11 @@ unsafe extern "C" fn poll(
                 *event_length = count;
                 0
             }
+            Ok(IaxPeerEvent::Gap(count)) => {
+                *event_kind = RPTADV_IAX2_EVENT_GAP;
+                *event_length = count;
+                0
+            }
             Ok(IaxPeerEvent::Text(count)) => {
                 *event_kind = RPTADV_IAX2_EVENT_TEXT;
                 *event_length = count;
@@ -524,6 +551,7 @@ fn dial_error_code(error: DialError) -> i32 {
         | DialError::ReliableWindowFull
         | DialError::Protocol(_)
         | DialError::Voice(_)
+        | DialError::Jitter
         | DialError::Encode(_)
         | DialError::Decode(_) => -6,
     }
