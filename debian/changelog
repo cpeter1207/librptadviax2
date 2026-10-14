@@ -1,3 +1,12 @@
+librptadviax2 (0.1.0~alpha6) unstable; urgency=medium
+
+  * Resume linked voice received after RADIO_UNKEY without requiring a new KEY.
+  * Use 160 ms minimum and 180 ms initial packet-jitter buffering, with a
+    500 ms maximum delay.
+  * Preserve the existing client and packet-jitter ABIs.
+
+ -- Chris Peterson <cpeter1207@users.noreply.github.com>  Wed, 14 Oct 2026 12:00:00 -0500
+
 librptadviax2 (0.1.0~alpha5) UNRELEASED; urgency=medium
 
   * Add optional per-peer readiness execution and composed packet-jitter ingress.

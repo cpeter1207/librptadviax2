@@ -134,7 +134,7 @@ pub(crate) struct Jitter {
 unsafe impl Send for Jitter {}
 
 impl Jitter {
-    /// Validate a readable descriptor and create the approved 40/60/500ms context.
+    /// Validate a readable descriptor and create the approved 160/180/500ms context.
     ///
     /// # Safety
     /// `descriptor` must be readable for its declared size, and its implementing
@@ -168,8 +168,8 @@ impl Jitter {
             struct_size: size_of::<Config>() as u32,
             abi_version: 1,
             clock_rate_hz: CLOCK_RATE_HZ,
-            minimum_delay: 320,
-            initial_delay: 480,
+            minimum_delay: 1280,
+            initial_delay: 1440,
             maximum_delay: 4000,
             adjustment_step: CONCEALMENT_SPAN,
             concealment_span: CONCEALMENT_SPAN,
@@ -309,6 +309,7 @@ mod tests {
     };
 
     struct State {
+        config: Config,
         destroyed: Arc<AtomicUsize>,
         puts: usize,
         admission: i32,
@@ -318,21 +319,9 @@ mod tests {
 
     unsafe extern "C" fn create(config: *const Config, context: *mut *mut c_void) -> i32 {
         let config = unsafe { &*config };
-        assert_eq!(
-            (
-                config.clock_rate_hz,
-                config.minimum_delay,
-                config.initial_delay,
-                config.maximum_delay,
-                config.adjustment_step,
-                config.concealment_span,
-                config.maximum_packets,
-                config.maximum_payload_bytes
-            ),
-            (8000, 320, 480, 4000, 80, 80, 64, 1500)
-        );
         unsafe {
             *context = Box::into_raw(Box::new(State {
+                config: *config,
                 destroyed: Arc::new(AtomicUsize::new(0)),
                 puts: 0,
                 admission: 0,
@@ -421,6 +410,20 @@ mod tests {
     fn composed_context_uses_approved_bounds_and_destroys_once() {
         let descriptor = descriptor();
         let mut jitter = unsafe { Jitter::new(ptr::from_ref(&descriptor).cast()) }.unwrap();
+        let config = unsafe { &*jitter.context.as_ptr().cast::<State>() }.config;
+        assert_eq!(
+            (
+                config.clock_rate_hz,
+                config.minimum_delay,
+                config.initial_delay,
+                config.maximum_delay,
+                config.adjustment_step,
+                config.concealment_span,
+                config.maximum_packets,
+                config.maximum_payload_bytes
+            ),
+            (8000, 1280, 1440, 4000, 80, 80, 64, 1500)
+        );
         let destroyed = unsafe { &*jitter.context.as_ptr().cast::<State>() }
             .destroyed
             .clone();
