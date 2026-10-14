@@ -5,7 +5,7 @@ use crate::{
     information_elements::InformationElement,
     ingress::IngressConsumer,
     media::{VoiceFrame, VoiceFrameEncodeError, VoiceFrameError, parse_voice_frame},
-    network::UdpEndpoint,
+    network::{SharedSocket, UdpEndpoint},
     playout::Playout,
     protocol::parse_full_frame_packet,
     session::{CallSetupError, LinkedCallResponse, OutboundCallSetup, OutboundSetupResponse},
@@ -13,7 +13,6 @@ use crate::{
 use std::{
     collections::VecDeque,
     io,
-    net::UdpSocket,
     net::{IpAddr, SocketAddr},
     thread,
     time::{Duration, Instant},
@@ -125,17 +124,26 @@ pub struct IaxPeer {
     voice_clock: Option<(u32, u64)>,
     release_on_drop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     async_attached: bool,
+    // None preserves polling for callers that never supply scheduling deadlines.
+    product_deadline: Option<Option<Instant>>,
+    send_blocked: std::cell::Cell<bool>,
     playout: Option<Playout>,
 }
 
 enum PeerEndpoint {
     Dedicated(UdpEndpoint),
     Shared {
-        socket: std::sync::Arc<UdpSocket>,
+        socket: std::sync::Arc<SharedSocket>,
         ingress: IngressConsumer,
         local: SocketAddr,
     },
 }
+
+/// Receive ownership transferred once from a dedicated socket to its Tokio pump.
+type SocketIngress = (
+    std::sync::Arc<tokio::net::UdpSocket>,
+    crate::ingress::IngressProducer,
+);
 
 impl PeerEndpoint {
     fn send_to(&self, packet: &[u8], remote: SocketAddr) -> io::Result<usize> {
@@ -250,6 +258,69 @@ pub struct IaxPeerObservation {
 }
 
 impl IaxPeer {
+    pub(crate) fn begin_turn(&self) {
+        // An expired uncommitted item must not leave stale writable interest.
+        self.send_blocked.set(false);
+    }
+
+    pub(crate) fn wait_state(&self) -> crate::async_driver::PeerWait {
+        let now = tokio::time::Instant::now().into_std();
+        let blocked = self.send_blocked.get();
+        let protocol = self
+            .pending_reliable
+            .iter()
+            .map(|frame| {
+                if blocked {
+                    frame.expires_at
+                } else {
+                    frame.next_retry.min(frame.expires_at)
+                }
+            })
+            .min();
+        let playout = self
+            .playout
+            .as_ref()
+            .and_then(|playout| playout.deadline(now));
+        // A due provider item left unconsumed by the bounded product turn means
+        // inbound PCM backpressure, not idle work. Retry that work at 10 ms.
+        let provider = protocol.into_iter().chain(playout).min().map(|deadline| {
+            if deadline <= now {
+                now + crate::async_driver::TIMER_INTERVAL
+            } else {
+                deadline
+            }
+        });
+        let product = self
+            .product_deadline
+            .unwrap_or(Some(now + crate::async_driver::TIMER_INTERVAL));
+        let writable = if blocked {
+            match &self.endpoint {
+                PeerEndpoint::Shared { socket, .. } => socket.registered(),
+                PeerEndpoint::Dedicated(_) => None,
+            }
+        } else {
+            None
+        };
+        crate::async_driver::PeerWait {
+            deadline: provider.into_iter().chain(product).min(),
+            writable,
+        }
+    }
+
+    pub(crate) fn set_product_deadline(&mut self, after_ns: u64) -> Result<(), DialError> {
+        let deadline = if after_ns == u64::MAX {
+            None
+        } else {
+            Some(
+                tokio::time::Instant::now()
+                    .into_std()
+                    .checked_add(Duration::from_nanos(after_ns))
+                    .ok_or(DialError::InvalidOptions)?,
+            )
+        };
+        self.product_deadline = Some(deadline);
+        Ok(())
+    }
     /// Read only on the exclusive callback owner or after it is quiesced.
     /// Requires composed jitter and queue-backed ingress; never call from audio.
     pub fn observe(&self) -> Result<IaxPeerObservation, DialError> {
@@ -306,10 +377,7 @@ impl IaxPeer {
     pub(crate) fn prepare_async_ingress(
         &mut self,
         runtime: &tokio::runtime::Handle,
-    ) -> io::Result<(
-        crate::ingress::IngressWake,
-        Option<(tokio::net::UdpSocket, crate::ingress::IngressProducer)>,
-    )> {
+    ) -> io::Result<(crate::ingress::IngressWake, Option<SocketIngress>)> {
         if self.async_attached {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -317,14 +385,16 @@ impl IaxPeer {
             ));
         }
         let shared = match &self.endpoint {
-            PeerEndpoint::Shared { ingress, .. } => {
+            PeerEndpoint::Shared {
+                socket, ingress, ..
+            } => {
+                socket.register(runtime)?;
                 self.async_attached = true;
                 return Ok((ingress.wake(), None));
             }
             PeerEndpoint::Dedicated(endpoint) => endpoint.shared_socket(),
         };
-        let _entered = runtime.enter();
-        let socket = tokio::net::UdpSocket::from_std(shared.try_clone()?)?;
+        let socket = shared.register(runtime)?;
         let local = shared.local_addr()?;
         // Each retired endpoint keeps its own queue; reusing call numbers cannot reuse it.
         let (producer, ingress) = crate::ingress::producer_ingress(64, u64::from(self.local_call))
@@ -340,7 +410,7 @@ impl IaxPeer {
     }
 
     pub(crate) fn from_inbound(
-        socket: std::sync::Arc<UdpSocket>,
+        socket: std::sync::Arc<SharedSocket>,
         ingress: IngressConsumer,
         local: SocketAddr,
         remote: SocketAddr,
@@ -371,6 +441,8 @@ impl IaxPeer {
             voice_clock: None,
             release_on_drop: Some(std::sync::Arc::clone(&released)),
             async_attached: false,
+            product_deadline: None,
+            send_blocked: std::cell::Cell::new(false),
             playout: None,
         };
         Ok((peer, released))
@@ -491,7 +563,12 @@ impl IaxPeer {
         packet[..2].copy_from_slice(&self.local_call.to_be_bytes());
         packet[2..4].copy_from_slice(&(timestamp_ms as u16).to_be_bytes());
         packet[4..4 + payload.len()].copy_from_slice(payload);
-        send_media(&self.endpoint, &packet[..4 + payload.len()], self.remote)
+        send_media(
+            &self.endpoint,
+            &packet[..4 + payload.len()],
+            self.remote,
+            &self.send_blocked,
+        )
     }
 
     /// Send one ASL text payload as a sequenced IAX full frame.
@@ -776,7 +853,9 @@ impl IaxPeer {
 
     fn flush_replies(&mut self) -> Result<(), DialError> {
         while let Some(packet) = self.pending_replies.front() {
-            if send_media(&self.endpoint, packet, self.remote)? == MediaSend::WouldBlock {
+            if send_media(&self.endpoint, packet, self.remote, &self.send_blocked)?
+                == MediaSend::WouldBlock
+            {
                 break;
             }
             self.pending_replies.pop_front();
@@ -829,7 +908,9 @@ impl IaxPeer {
             } else {
                 &frame.packet
             };
-            if send_media(&self.endpoint, packet, self.remote)? == MediaSend::WouldBlock {
+            if send_media(&self.endpoint, packet, self.remote, &self.send_blocked)?
+                == MediaSend::WouldBlock
+            {
                 break; // Still process inbound ACKs and control while the socket is full.
             }
             if frame.sent {
@@ -878,10 +959,14 @@ fn send_media(
     endpoint: &PeerEndpoint,
     packet: &[u8],
     remote: SocketAddr,
+    blocked: &std::cell::Cell<bool>,
 ) -> Result<MediaSend, DialError> {
     match endpoint.send_to(packet, remote) {
         Ok(_) => Ok(MediaSend::Accepted),
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(MediaSend::WouldBlock),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+            blocked.set(true);
+            Ok(MediaSend::WouldBlock)
+        }
         Err(error) => Err(DialError::Network(error)),
     }
 }
@@ -1028,6 +1113,8 @@ pub fn dial_ulaw(options: DialOptions<'_>) -> Result<IaxPeer, DialError> {
                     voice_clock: None,
                     release_on_drop: None,
                     async_attached: false,
+                    product_deadline: None,
+                    send_blocked: std::cell::Cell::new(false),
                     playout: None,
                 };
                 peer.wait_answer(deadline)?;

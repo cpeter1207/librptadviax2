@@ -5,7 +5,7 @@ use super::{
 use crate::{
     codec::IAX_FORMAT_ULAW,
     ingress::PeerIngressRouter,
-    network::UdpEndpoint,
+    network::{SharedSocket, UdpEndpoint},
     protocol::{FullFrameHeader, serialize_full_frame},
     session::OutboundCallSetup,
 };
@@ -261,12 +261,14 @@ fn linked_peer(remote: SocketAddr) -> IaxPeer {
         voice_clock: None,
         release_on_drop: None,
         async_attached: false,
+        product_deadline: None,
+        send_blocked: std::cell::Cell::new(false),
         playout: None,
     }
 }
 
 fn shared_peer(remote: SocketAddr) -> (IaxPeer, crate::ingress::IngressProducer) {
-    let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
+    let socket = Arc::new(SharedSocket::new(UdpSocket::bind("127.0.0.1:0").unwrap()));
     let (producer, ingress) = crate::ingress::producer_ingress(64, 1).unwrap();
     let (peer, _) = IaxPeer::from_inbound(
         Arc::clone(&socket),
@@ -279,6 +281,37 @@ fn shared_peer(remote: SocketAddr) -> (IaxPeer, crate::ingress::IngressProducer)
     )
     .unwrap();
     (peer, producer)
+}
+
+#[test]
+fn egress_blocked_readiness_does_not_spin_on_an_expired_retry_timer() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let (mut peer, _producer) = shared_peer(remote.local_addr().unwrap());
+    peer.prepare_async_ingress(runtime.handle()).unwrap();
+    peer.set_product_deadline(u64::MAX).unwrap();
+    assert!(peer.wait_state().deadline.is_none());
+    peer.begin_turn();
+    let fault = SendFault::set(remote.local_addr().unwrap(), std::io::ErrorKind::WouldBlock);
+    assert_eq!(
+        peer.send_prepared_ulaw(&[0x80], 1000).unwrap(),
+        super::MediaSend::Accepted
+    );
+    let wait = peer.wait_state();
+    assert!(wait.writable.is_some());
+    assert_eq!(
+        wait.deadline,
+        Some(peer.pending_reliable.front().unwrap().expires_at)
+    );
+    drop(fault);
+    peer.begin_turn();
+    assert!(
+        peer.wait_state().writable.is_none(),
+        "no stale interest after product expiry"
+    );
 }
 
 #[test]
@@ -446,7 +479,7 @@ fn composed_jitter_admits_a_receive_batch_before_fetching_due_media() {
     let origin = Instant::now() - Duration::from_millis(100);
     let first = (0x1_0000_0000 + 1000) * 8;
     fixture.packet(60_000_000, first, &[0x80; 160], 0);
-    let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
+    let socket = Arc::new(SharedSocket::new(UdpSocket::bind("127.0.0.1:0").unwrap()));
     let remote = UdpSocket::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
@@ -772,7 +805,7 @@ fn shared_endpoint_routes_sends_and_rejects_packets_larger_than_output_storage()
         .set_read_timeout(Some(Duration::from_secs(1)))
         .unwrap();
     let remote_address = remote.local_addr().unwrap();
-    let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").unwrap());
+    let socket = Arc::new(SharedSocket::new(UdpSocket::bind("127.0.0.1:0").unwrap()));
     let local = socket.local_addr().unwrap();
     let mut router = PeerIngressRouter::new(1, 2).unwrap();
     let ingress = router.register_call(remote_address, 1234, 5678, 1).unwrap();

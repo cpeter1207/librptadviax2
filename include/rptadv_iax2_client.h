@@ -82,6 +82,13 @@ struct rptadv_iax2_async_descriptor_v1 {
      * unchanged (including when jitter or async ingress is not configured).
      */
     int32_t (*peer_observe)(void *peer, struct rptadv_iax2_peer_observation_v1 *output);
+    /** Signal a retained peer owner without blocking. Keep registration alive
+     * through this call; quiesce all callers before peer_detach returns. */
+    void (*peer_wake)(void *registration);
+    /** Set the owner's next product turn relative to this call, in nanoseconds.
+     * UINT64_MAX clears the deadline; zero is due now. Call only on the peer
+     * owner. Protocol and jitter deadlines remain independently scheduled. */
+    int32_t (*peer_set_deadline)(void *peer, uint64_t wake_after_ns);
 };
 
 /** Obtain optional async ABI 1; existing synchronous clients need not use it. */
@@ -142,6 +149,15 @@ struct rptadv_iax2_client_descriptor_v1 {
     void (*destroy)(void *peer);
     /** Send one completed DTMF digit (0-9, A-D, *, or #). */
     int32_t (*send_digit)(void *peer, uint8_t digit);
+    /** Encode mono F32 with the negotiated ULAW codec, one byte per sample.
+     * Insufficient storage leaves output unchanged. Zero succeeds; negative fails. */
+    int32_t (*prepare_ulaw)(const float *samples, size_t count, uint8_t *output, size_t capacity);
+    /** Send already encoded ULAW at its source timestamp. Zero means sent or
+     * reliably retained; one means uncommitted WouldBlock (caller keeps payload
+     * and expiry); negative means terminal error. Empty input sends no packet. */
+    int32_t (*send_prepared_ulaw)(void *peer, const uint8_t *bytes, size_t count, uint32_t timestamp_ms);
+    /** Read the call clock on the exclusive peer owner; NULL returns zero. */
+    uint32_t (*elapsed_ms)(const void *peer);
 };
 
 /**

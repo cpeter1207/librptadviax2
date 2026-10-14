@@ -44,6 +44,9 @@ fn descriptor_v1_exposes_dial_and_media_operations() {
     assert!(descriptor.hangup.is_some());
     assert!(descriptor.destroy.is_some());
     assert!(descriptor.send_digit.is_some());
+    assert!(descriptor.prepare_ulaw.is_some());
+    assert!(descriptor.send_prepared_ulaw.is_some());
+    assert!(descriptor.elapsed_ms.is_some());
 }
 
 #[test]

@@ -47,12 +47,20 @@ fn packet_is_decoded_only_when_due_and_keeps_original_receive_time() {
     );
     assert_eq!(pcm, [9.0; 160]);
     assert_eq!(
+        playout.deadline(origin),
+        Some(origin + Duration::from_millis(60))
+    );
+    assert_eq!(
         playout
             .poll(origin + Duration::from_millis(60), &mut pcm)
             .unwrap(),
         IaxPeerEvent::Audio(2)
     );
     assert_eq!(&pcm[..2], &[32124.0 / 32768.0, -32124.0 / 32768.0]);
+    assert_eq!(
+        playout.deadline(origin),
+        Some(origin + Duration::from_millis(120))
+    );
     assert_eq!(
         fixture.puts(),
         vec![((0x1_0000_0000 + 1000) * 8, 2, 3_000_000, vec![0x80, 0x00])]

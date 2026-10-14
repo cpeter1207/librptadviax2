@@ -22,9 +22,23 @@ pub(crate) struct Playout {
     ending: bool,
     next_key: Option<u32>,
     completed: Observation,
+    release_deadline: Option<Instant>,
 }
 
 impl Playout {
+    pub(crate) fn deadline(&self, now: Instant) -> Option<Instant> {
+        if self.blocks_transport()
+            || (self.ending && self.tail_end.is_none_or(|end| self.released_to >= end))
+        {
+            return Some(now);
+        }
+        if self.tail_end.is_some_and(|end| self.released_to >= end) {
+            return self
+                .last_release
+                .map(|last| last + std::time::Duration::from_millis(60));
+        }
+        self.release_deadline.or_else(|| self.tail_end.map(|_| now))
+    }
     pub(crate) fn observe(&self) -> Result<Observation, DialError> {
         let mut current = self.jitter.observe().map_err(|_| DialError::Jitter)?;
         let completed = &self.completed;
@@ -59,6 +73,7 @@ impl Playout {
             ending: false,
             next_key: None,
             completed: Observation::default(),
+            release_deadline: None,
         }
     }
     pub(crate) fn put(
@@ -96,6 +111,7 @@ impl Playout {
         now: Instant,
         pcm: &mut [f32],
     ) -> Result<IaxPeerEvent, DialError> {
+        self.release_deadline = None;
         if self.pending.is_some() {
             return self.decode_pending(now, pcm);
         }
@@ -122,6 +138,11 @@ impl Playout {
             .map_err(|_| DialError::Jitter)?;
         match decision.kind {
             Kind::NotDue => {
+                if decision.deadline_ns != 0 {
+                    self.release_deadline = self
+                        .origin
+                        .checked_add(std::time::Duration::from_nanos(decision.deadline_ns));
+                }
                 // A genuine overload reset has no remaining native timeline.
                 if self.ending && decision.deadline_ns == 0 {
                     self.finish()
@@ -227,6 +248,7 @@ impl Playout {
         self.completed = self.observe()?;
         self.jitter.reset().map_err(|_| DialError::Jitter)?;
         self.pending = None;
+        self.release_deadline = None;
         self.tail_end = None;
         self.released_to = 0;
         self.skipped_span = 0;

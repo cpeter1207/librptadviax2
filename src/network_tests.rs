@@ -22,6 +22,31 @@ fn binds_nonblocking_loopback_endpoints() {
 }
 
 #[test]
+fn egress_shares_one_readiness_registration_with_listener_and_peers() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let endpoint = UdpEndpoint::bind(loopback()).unwrap();
+    let shared = endpoint.shared_socket();
+    let first = shared.register(runtime.handle()).unwrap();
+    let second = shared.register(runtime.handle()).unwrap();
+    assert!(std::sync::Arc::ptr_eq(&first, &second));
+    let receiver = UdpSocket::bind(loopback()).unwrap();
+    receiver
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    runtime.block_on(first.writable()).unwrap();
+    assert_eq!(
+        endpoint
+            .send_to(&[7], receiver.local_addr().unwrap())
+            .unwrap(),
+        1
+    );
+    assert_eq!(receiver.recv_from(&mut [0; 2]).unwrap().0, 1);
+}
+
+#[test]
 fn propagates_bind_and_nonblocking_configuration_errors() {
     let unassigned = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 0);
     assert!(UdpEndpoint::bind(unassigned).is_err());

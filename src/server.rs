@@ -166,11 +166,8 @@ impl InboundIaxListener {
         let socket = self
             .endpoint
             .shared_socket()
-            .try_clone()
+            .register(runtime.handle())
             .map_err(ListenerError::Network)?;
-        let _entered = runtime.enter();
-        let socket = tokio::net::UdpSocket::from_std(socket).map_err(ListenerError::Network)?;
-        drop(_entered);
         // No fallible work remains before the sole router moves into its task.
         let empty = PeerIngressRouter::new(1, 1).expect("nonzero placeholder limits");
         let router = std::mem::replace(&mut self.router, empty);

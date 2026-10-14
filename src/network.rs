@@ -5,7 +5,7 @@ use crate::protocol::{parse_full_frame_packet, parse_mini_frame};
 use std::net::{SocketAddr, UdpSocket};
 use std::{
     io::{self, ErrorKind},
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 
 /// Failure while receiving a datagram for peer-owner dispatch.
@@ -35,7 +35,55 @@ impl From<io::Error> for NetworkIngressError {
 
 /// A nonblocking UDP endpoint for one network-owner thread.
 pub struct UdpEndpoint {
-    socket: Arc<UdpSocket>,
+    socket: Arc<SharedSocket>,
+}
+
+/// One OS socket and one readiness registration, shared by listener and peers.
+pub(crate) struct SharedSocket {
+    socket: UdpSocket,
+    registered: OnceLock<Arc<tokio::net::UdpSocket>>,
+}
+
+impl SharedSocket {
+    pub(crate) fn new(socket: UdpSocket) -> Self {
+        Self {
+            socket,
+            registered: OnceLock::new(),
+        }
+    }
+
+    pub(crate) fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.socket.local_addr()
+    }
+
+    pub(crate) fn register(
+        &self,
+        runtime: &tokio::runtime::Handle,
+    ) -> io::Result<Arc<tokio::net::UdpSocket>> {
+        if let Some(socket) = self.registered.get() {
+            return Ok(Arc::clone(socket));
+        }
+        let _entered = runtime.enter();
+        let socket = self.socket.try_clone()?;
+        socket.set_nonblocking(true)?;
+        let registered = Arc::new(tokio::net::UdpSocket::from_std(socket)?);
+        // Peers can attach concurrently; retain only the winning registration.
+        let _ = self.registered.set(registered);
+        Ok(Arc::clone(
+            self.registered.get().expect("registered socket"),
+        ))
+    }
+
+    pub(crate) fn send_to(&self, payload: &[u8], remote: SocketAddr) -> io::Result<usize> {
+        match self.registered.get() {
+            Some(socket) => socket.try_send_to(payload, remote),
+            None => self.socket.send_to(payload, remote),
+        }
+    }
+
+    pub(crate) fn registered(&self) -> Option<Arc<tokio::net::UdpSocket>> {
+        self.registered.get().map(Arc::clone)
+    }
 }
 
 impl UdpEndpoint {
@@ -55,13 +103,13 @@ impl UdpEndpoint {
         self.socket.send_to(payload, remote)
     }
 
-    pub(crate) fn shared_socket(&self) -> Arc<UdpSocket> {
+    pub(crate) fn shared_socket(&self) -> Arc<SharedSocket> {
         Arc::clone(&self.socket)
     }
 
     /// Try to receive one datagram; `None` means the socket would block.
     pub fn try_receive(&self, buffer: &mut [u8]) -> io::Result<Option<(usize, SocketAddr)>> {
-        receive_result(self.socket.recv_from(buffer))
+        receive_result(self.socket.socket.recv_from(buffer))
     }
 
     /// Receive one UDP payload and enqueue it for its registered peer owner.
@@ -125,7 +173,7 @@ fn configure_socket(
 ) -> io::Result<UdpEndpoint> {
     configure_nonblocking(&socket)?;
     Ok(UdpEndpoint {
-        socket: Arc::new(socket),
+        socket: Arc::new(SharedSocket::new(socket)),
     })
 }
 
