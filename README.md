@@ -1,6 +1,6 @@
 # librptadviax2
 
-An independent Rust IAX2 implementation for rpt_advanced. It will keep packet
+An independent Rust IAX2 implementation for rpt_advanced. It keeps packet
 construction/parsing separate from network I/O and codec adapters. Codec
 implementations belong in adapters that use released libraries where available;
 this project does not implement audio codecs.
@@ -52,6 +52,22 @@ caller's runtime handle does not invalidate them.
 owner (or after detach); control threads must consume the host's copied snapshot,
 not read live jitter state concurrently. Rust listener `ingress_stats()` provides
 NEW-queue occupancy/full drops and active-route count without a routing lock.
+
+## Release integration
+
+Alpha5 retains SONAME `librptadviax2.so.1` and the existing synchronous ABI 1.
+Debian 13 release assets provide `librptadv-iax2-client1` and
+`librptadv-iax2-client-dev` for amd64 and arm64. Consumers select an explicit
+release tag and use the versioned dynamic library; IAX packages are not currently
+included in the shared signed package index.
+
+The optional async table composes a host-supplied packet-jitter descriptor; the
+host retains that descriptor's dynamic library until peer destruction. Peers
+configured this way may emit event `RPTADV_IAX2_EVENT_GAP` (7), whose length is an
+ordered count of missing 8 kHz source samples, not a PCM-buffer length. Forward
+that count to the shared PCM ring's counted-gap operation before later PCM.
+Only the ring performs concealment; this library does not fill gaps with zeros
+or run a second PLC. Unconfigured synchronous peers do not emit this event.
 
 ## Local checks
 

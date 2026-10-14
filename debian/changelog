@@ -2,6 +2,8 @@ librptadviax2 (0.1.0~alpha5) UNRELEASED; urgency=medium
 
   * Add optional per-peer readiness execution and composed packet-jitter ingress.
   * Preserve synchronous client/server ABI 1 and ordered protocol control handling.
+  * Answer authorized inbound calls reliably and retain comfort-noise and
+    delayed linked-frame acknowledgement fixes.
 
  -- Chris Peterson <cpeter1207@users.noreply.github.com>  Tue, 13 Oct 2026 12:00:00 -0500
 
