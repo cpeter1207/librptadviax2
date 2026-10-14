@@ -159,7 +159,8 @@ struct rptadv_iax2_client_descriptor_v1 {
     int32_t (*prepare_ulaw)(const float *samples, size_t count, uint8_t *output, size_t capacity);
     /** Send already encoded ULAW at its source timestamp. Zero means sent or
      * reliably retained; one means uncommitted WouldBlock (caller keeps payload
-     * and expiry); negative means terminal error. Empty input sends no packet. */
+     * and expiry); negative means terminal error. A zero count submits the
+     * source-timed idle marker under the same congestion contract. */
     int32_t (*send_prepared_ulaw)(void *peer, const uint8_t *bytes, size_t count, uint32_t timestamp_ms);
     /** Read the call clock on the exclusive peer owner; NULL returns zero. */
     uint32_t (*elapsed_ms)(const void *peer);

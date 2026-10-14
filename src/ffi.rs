@@ -117,6 +117,7 @@ pub struct rptadv_iax2_client_descriptor_v1 {
     /// Encode into caller storage: one ULAW byte per source sample, no peer mutation.
     pub prepare_ulaw: Option<unsafe extern "C" fn(*const f32, usize, *mut u8, usize) -> i32>,
     /// Submit encoded media: zero transfers ownership, one leaves an uncommitted item with caller.
+    /// Zero bytes submit an end-of-burst marker at the supplied source timestamp.
     pub send_prepared_ulaw: Option<unsafe extern "C" fn(*mut c_void, *const u8, usize, u32) -> i32>,
     /// Existing call-relative clock, sampled only by the serialized non-audio owner.
     pub elapsed_ms: Option<unsafe extern "C" fn(*const c_void) -> u32>,

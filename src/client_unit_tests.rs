@@ -166,6 +166,53 @@ fn egress_ack_cannot_retire_unsent_frame() {
 }
 
 #[test]
+fn egress_idle_marker_waits_for_full_voice_and_socket_recovery() {
+    let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
+    remote
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    let address = remote.local_addr().unwrap();
+    let mut peer = linked_peer(address);
+    let api = unsafe { &*crate::ffi::rptadv_iax2_client_descriptor_v1() };
+    let send = api.send_prepared_ulaw.unwrap();
+    let handle = (&mut peer as *mut IaxPeer).cast();
+    let payload = [0xff; 160];
+    let fault = SendFault::set(address, std::io::ErrorKind::WouldBlock);
+    assert_eq!(
+        unsafe { send(handle, payload.as_ptr(), payload.len(), 100) },
+        0
+    );
+    assert_eq!(unsafe { send(handle, payload.as_ptr(), 0, 120) }, 1);
+    assert_eq!(peer.pending_reliable.len(), 1);
+
+    let healthy = UdpSocket::bind("127.0.0.1:0").unwrap();
+    healthy
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    linked_peer(healthy.local_addr().unwrap())
+        .send_ulaw(&[0.25; 160], 100)
+        .unwrap();
+    let mut bytes = [0; 1500];
+    assert!(healthy.recv_from(&mut bytes).unwrap().0 > 12);
+    drop(fault);
+
+    peer.retry_reliable_frames().unwrap();
+    let count = remote.recv_from(&mut bytes).unwrap().0;
+    assert_eq!(
+        crate::protocol::parse_full_frame_packet(&bytes[..count])
+            .unwrap()
+            .payload,
+        payload
+    );
+    let fault = SendFault::set(address, std::io::ErrorKind::WouldBlock);
+    assert_eq!(unsafe { send(handle, payload.as_ptr(), 0, 120) }, 1);
+    drop(fault);
+    assert_eq!(unsafe { send(handle, payload.as_ptr(), 0, 120) }, 0);
+    let count = remote.recv_from(&mut bytes).unwrap().0;
+    assert_eq!(&bytes[..count], &[4, 210, 0, 120]);
+}
+
+#[test]
 fn egress_mini_would_block_is_uncommitted() {
     use super::MediaSend;
     let remote = UdpSocket::bind("127.0.0.1:0").unwrap();

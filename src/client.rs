@@ -549,14 +549,12 @@ impl IaxPeer {
 
     /// Submit caller-encoded ULAW at its source timestamp. A committed full frame
     /// survives congestion; a blocked mini remains with the caller for expiry.
+    /// Empty payloads carry the end-of-burst marker under the same ordering rules.
     pub fn send_prepared_ulaw(
         &mut self,
         payload: &[u8],
         timestamp_ms: u32,
     ) -> Result<MediaSend, DialError> {
-        if payload.is_empty() {
-            return Ok(MediaSend::Accepted);
-        }
         self.send_encoded_ulaw(payload, timestamp_ms)
     }
 
