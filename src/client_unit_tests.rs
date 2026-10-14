@@ -16,6 +16,234 @@ use std::{
     time::{Duration, Instant},
 };
 
+thread_local! {
+    static SEND_FAULT: std::cell::Cell<Option<(SocketAddr, std::io::ErrorKind)>> = const { std::cell::Cell::new(None) };
+}
+
+/// Inject only the UDP send boundary; sequencing and received bytes remain real.
+pub(super) fn send_fault(remote: SocketAddr) -> std::io::Result<()> {
+    match SEND_FAULT.get() {
+        Some((address, kind)) if address == remote => Err(kind.into()),
+        _ => Ok(()),
+    }
+}
+
+struct SendFault;
+
+impl SendFault {
+    fn set(remote: SocketAddr, kind: std::io::ErrorKind) -> Self {
+        SEND_FAULT.set(Some((remote, kind)));
+        Self
+    }
+}
+
+impl Drop for SendFault {
+    fn drop(&mut self) {
+        SEND_FAULT.set(None);
+    }
+}
+
+#[test]
+fn egress_congestion_preserves_sequence_and_epoch() {
+    let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
+    remote
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    let address = remote.local_addr().unwrap();
+    let mut peer = linked_peer(address);
+    let mut bytes = [0; 1500];
+    // Reach outgoing sequence 255 using real committed/acknowledged frames.
+    for sequence in 1..255u8 {
+        peer.send_text(b"L").unwrap();
+        remote.recv_from(&mut bytes).unwrap();
+        peer.acknowledge_reliable_frames(sequence.wrapping_add(1));
+    }
+    for (timestamp, sequence) in [(65_520, 255), (65_540, 0)] {
+        let fault = SendFault::set(address, std::io::ErrorKind::WouldBlock);
+        assert!(
+            peer.send_ulaw(&[0.25; 160], timestamp).is_ok(),
+            "committed full voice must survive WouldBlock"
+        );
+        assert_eq!(peer.pending_reliable.len(), 1);
+        let retained = peer.pending_reliable[0].packet.clone();
+        assert_eq!(
+            peer.send_prepared_ulaw(&[0xff; 160], timestamp + 1)
+                .unwrap(),
+            super::MediaSend::WouldBlock
+        );
+        assert_eq!(peer.pending_reliable.len(), 1);
+        assert_eq!(
+            crate::protocol::parse_full_frame_packet(&retained)
+                .unwrap()
+                .header
+                .outgoing_sequence,
+            sequence
+        );
+        drop(fault);
+        peer.retry_reliable_frames().unwrap();
+        let count = remote.recv_from(&mut bytes).unwrap().0;
+        assert_eq!(
+            &bytes[..count],
+            retained,
+            "first successful send must not rebuild or retransmit the frame"
+        );
+        peer.acknowledge_reliable_frames(sequence.wrapping_add(1));
+        assert!(peer.pending_reliable.is_empty());
+    }
+}
+
+#[test]
+fn egress_ack_cannot_retire_unsent_frame() {
+    let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let mut peer = linked_peer(remote.local_addr().unwrap());
+    let _fault = SendFault::set(remote.local_addr().unwrap(), std::io::ErrorKind::WouldBlock);
+    assert!(peer.send_text(b"L").is_ok());
+    peer.acknowledge_reliable_frames(2);
+    assert_eq!(
+        peer.pending_reliable.len(),
+        1,
+        "ACK cannot cover a frame the socket has never accepted"
+    );
+}
+
+#[test]
+fn egress_mini_would_block_is_uncommitted() {
+    use super::MediaSend;
+    let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
+    remote
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    let address = remote.local_addr().unwrap();
+    let mut peer = linked_peer(address);
+    let mut bytes = [0; 1500];
+    assert_eq!(
+        peer.send_prepared_ulaw(&[0xff; 160], 100).unwrap(),
+        MediaSend::Accepted
+    );
+    remote.recv_from(&mut bytes).unwrap();
+    peer.acknowledge_reliable_frames(2);
+    let fault = SendFault::set(address, std::io::ErrorKind::WouldBlock);
+    assert_eq!(
+        peer.send_prepared_ulaw(&[0x80; 160], 120).unwrap(),
+        MediaSend::WouldBlock
+    );
+    assert_eq!(peer.voice_epoch, Some(0));
+    assert!(peer.pending_reliable.is_empty());
+    drop(fault);
+    assert_eq!(
+        peer.send_prepared_ulaw(&[0x80; 160], 120).unwrap(),
+        MediaSend::Accepted
+    );
+    let count = remote.recv_from(&mut bytes).unwrap().0;
+    assert_eq!(&bytes[..4], &[4, 210, 0, 120]);
+    assert_eq!(&bytes[4..count], &[0x80; 160]);
+    let _fault = SendFault::set(address, std::io::ErrorKind::PermissionDenied);
+    assert!(
+        matches!(peer.send_prepared_ulaw(&[0xff; 160], 140), Err(DialError::Network(error)) if error.kind() == std::io::ErrorKind::PermissionDenied)
+    );
+    let healthy = UdpSocket::bind("127.0.0.1:0").unwrap();
+    linked_peer(healthy.local_addr().unwrap())
+        .send_ulaw(&[0.0; 160], 140)
+        .unwrap();
+}
+
+#[test]
+fn egress_blocked_ack_does_not_prevent_inbound_delivery() {
+    let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
+    remote
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    let address = remote.local_addr().unwrap();
+    let mut peer = linked_peer(address);
+    let incoming = serialize_full_frame(
+        &FullFrameHeader {
+            source_call_number: 5678,
+            destination_call_number: 1234,
+            retransmission: false,
+            timestamp: 100,
+            outgoing_sequence: 1,
+            incoming_sequence: 1,
+            frame_type: 7,
+            subclass: 0,
+            subclass_is_log: false,
+        },
+        b"L",
+    )
+    .unwrap();
+    let fault = SendFault::set(address, std::io::ErrorKind::WouldBlock);
+    let mut text = [0; 32];
+    assert_eq!(
+        peer.receive_event(&incoming, Instant::now(), &mut [], &mut text)
+            .unwrap(),
+        super::IaxPeerEvent::Text(1)
+    );
+    assert_eq!(text[0], b'L');
+    drop(fault);
+    peer.poll_event(&mut [], &mut text).unwrap();
+    let mut bytes = [0; 1500];
+    let count = remote.recv_from(&mut bytes).unwrap().0;
+    let frame = crate::protocol::parse_full_frame_packet(&bytes[..count]).unwrap();
+    assert_eq!(
+        (
+            frame.header.frame_type,
+            frame.header.subclass,
+            frame.header.incoming_sequence
+        ),
+        (6, 4, 2)
+    );
+}
+
+#[test]
+fn egress_full_window_ping_can_ack_before_committing_its_reply() {
+    let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let mut peer = linked_peer(remote.local_addr().unwrap());
+    for _ in 0..super::MAX_RELIABLE_WINDOW {
+        peer.send_text(b"L").unwrap();
+    }
+    let ping = serialize_full_frame(
+        &FullFrameHeader {
+            source_call_number: 5678,
+            destination_call_number: 1234,
+            retransmission: false,
+            timestamp: 100,
+            outgoing_sequence: 1,
+            incoming_sequence: 65,
+            frame_type: 6,
+            subclass: 2,
+            subclass_is_log: false,
+        },
+        &[],
+    )
+    .unwrap();
+    peer.receive_event(&ping, Instant::now(), &mut [], &mut [])
+        .unwrap();
+    assert_eq!(peer.pending_reliable.len(), 1);
+    let pong = crate::protocol::parse_full_frame_packet(&peer.pending_reliable[0].packet).unwrap();
+    assert_eq!(
+        (pong.header.subclass, pong.header.outgoing_sequence),
+        (3, 65)
+    );
+}
+
+#[test]
+fn egress_blocked_send_has_a_bounded_unchanging_failure_deadline() {
+    let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let mut peer = linked_peer(remote.local_addr().unwrap());
+    let _fault = SendFault::set(remote.local_addr().unwrap(), std::io::ErrorKind::WouldBlock);
+    peer.send_text(b"L").unwrap();
+    let deadline = peer.pending_reliable[0].expires_at;
+    for _ in 0..3 {
+        peer.retry_reliable_frames().unwrap();
+        assert_eq!(peer.pending_reliable[0].expires_at, deadline);
+        assert_eq!(peer.pending_reliable[0].retries, 0);
+    }
+    peer.pending_reliable[0].expires_at = Instant::now();
+    assert!(matches!(
+        peer.retry_reliable_frames(),
+        Err(DialError::Timeout)
+    ));
+}
+
 fn linked_peer(remote: SocketAddr) -> IaxPeer {
     IaxPeer {
         endpoint: PeerEndpoint::Dedicated(UdpEndpoint::bind(wildcard_for(remote.ip())).unwrap()),
@@ -26,6 +254,7 @@ fn linked_peer(remote: SocketAddr) -> IaxPeer {
         connected_at: Instant::now(),
         setup: OutboundCallSetup::for_inbound_call(1234, 5678).unwrap(),
         pending_reliable: VecDeque::new(),
+        pending_replies: VecDeque::new(),
         pending_events: VecDeque::new(),
         answered: true,
         voice_epoch: None,
@@ -515,6 +744,8 @@ fn cumulative_acknowledgements_handle_wrap_and_ignore_future_sequences() {
             next_retry: now,
             retry_interval: Duration::from_secs(2),
             retries: 0,
+            sent: true,
+            expires_at: now + Duration::from_secs(42),
         })
         .into();
 
@@ -594,6 +825,8 @@ fn reliable_capacity_and_text_size_are_bounded_before_sending() {
             next_retry: now,
             retry_interval: Duration::from_secs(2),
             retries: super::MAX_RELIABLE_RETRIES,
+            sent: true,
+            expires_at: now + Duration::from_secs(42),
         })
         .collect();
     assert!(matches!(
