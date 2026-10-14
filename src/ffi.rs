@@ -421,8 +421,7 @@ unsafe extern "C" fn send_audio(peer: *mut c_void, samples: *const f32, count: u
         }) else {
             return -1;
         };
-        peer.send_ulaw(samples, peer.elapsed_ms())
-            .map_or_else(|_| -1, |_| 0)
+        peer.send_audio(samples).map_or_else(|_| -1, |_| 0)
     })
 }
 

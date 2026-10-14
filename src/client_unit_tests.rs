@@ -29,6 +29,7 @@ fn linked_peer(remote: SocketAddr) -> IaxPeer {
         pending_events: VecDeque::new(),
         answered: true,
         voice_epoch: None,
+        voice_clock: None,
         release_on_drop: None,
         async_attached: false,
         playout: None,
@@ -302,6 +303,138 @@ fn jitter_composition_is_once_before_attach_and_requires_gap_aware_polling() {
         Err(DialError::InvalidOptions)
     ));
     assert!(attached.playout.is_none());
+}
+
+#[test]
+fn interop_ffi_contiguous_audio_keeps_sample_timestamps_during_send_jitter() {
+    let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
+    remote
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    let mut peer = linked_peer(remote.local_addr().unwrap());
+    let descriptor = unsafe { &*crate::ffi::rptadv_iax2_client_descriptor_v1() };
+    let samples = [0.25; 160];
+    let mut packet = [0; 1500];
+    let mut timestamps = Vec::new();
+    // One delayed owner turn drains three consecutive 20 ms media blocks.
+    for elapsed in [1000, 1070, 1070, 1070] {
+        peer.connected_at = Instant::now() - Duration::from_millis(elapsed);
+        assert_eq!(
+            unsafe {
+                descriptor.send_audio.unwrap()(
+                    (&mut peer as *mut IaxPeer).cast(),
+                    samples.as_ptr(),
+                    samples.len(),
+                )
+            },
+            0
+        );
+        let (length, _) = remote.recv_from(&mut packet).unwrap();
+        let (timestamp, payload) =
+            match crate::media::parse_voice_frame(&packet[..length], IAX_FORMAT_ULAW).unwrap() {
+                crate::media::VoiceFrame::Full {
+                    header, payload, ..
+                } => (header.timestamp, payload),
+                crate::media::VoiceFrame::Mini {
+                    header, payload, ..
+                } => (u32::from(header.timestamp), payload),
+            };
+        assert_eq!(payload.len(), 160);
+        timestamps.push(timestamp);
+    }
+    let first = timestamps[0];
+    assert_eq!(timestamps, [first, first + 20, first + 40, first + 60]);
+}
+
+#[test]
+fn interop_ffi_sample_clock_preserves_fractional_samples_bursts_wrap_and_failures() {
+    for (name, next_sample, steps) in [
+        (
+            "fractional samples",
+            None,
+            &[
+                (3, 0, 0, true),
+                (3, 0, 0, false),
+                (3, 0, 0, false),
+                (3, 0, 1, false),
+            ][..],
+        ),
+        (
+            "mini timestamp epoch",
+            Some(65_530 * 8),
+            &[
+                (80, 0, 65_530, true),
+                (80, 0, 65_540, true),
+                (80, 0, 14, false),
+            ][..],
+        ),
+        (
+            "failed send",
+            None,
+            &[
+                (1501, -1, 0, false),
+                (160, 0, 0, true),
+                (1501, -1, 0, false),
+                (160, 0, 20, false),
+            ][..],
+        ),
+        (
+            "empty burst marker",
+            Some(1000 * 8),
+            &[
+                (160, 0, 1000, true),
+                (0, 0, 1020, false),
+                (160, 0, 0, false),
+            ][..],
+        ),
+    ] {
+        let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
+        remote
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut peer = linked_peer(remote.local_addr().unwrap());
+        // Pin elapsed call time at zero while exercising nonzero media positions.
+        peer.connected_at = Instant::now() + Duration::from_secs(3600);
+        peer.voice_clock = next_sample.map(|sample| (0, sample));
+        let descriptor = unsafe { &*crate::ffi::rptadv_iax2_client_descriptor_v1() };
+        let samples = [0.25; 1501];
+        let mut packet = [0; 1500];
+        for &(count, result, expected_timestamp, expected_full) in steps {
+            assert_eq!(
+                unsafe {
+                    descriptor.send_audio.unwrap()(
+                        (&mut peer as *mut IaxPeer).cast(),
+                        samples.as_ptr(),
+                        count,
+                    )
+                },
+                result,
+                "{name}"
+            );
+            if result != 0 {
+                continue;
+            }
+            let (length, _) = remote.recv_from(&mut packet).unwrap();
+            let (timestamp, payload, full) = match crate::media::parse_voice_frame(
+                &packet[..length],
+                IAX_FORMAT_ULAW,
+            )
+            .unwrap()
+            {
+                crate::media::VoiceFrame::Full {
+                    header, payload, ..
+                } => (header.timestamp, payload, true),
+                crate::media::VoiceFrame::Mini {
+                    header, payload, ..
+                } => (u32::from(header.timestamp), payload, false),
+            };
+            assert_eq!(
+                (timestamp, full, payload.len()),
+                (expected_timestamp, expected_full, count),
+                "{name}"
+            );
+        }
+    }
 }
 
 #[test]

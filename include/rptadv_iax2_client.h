@@ -126,7 +126,9 @@ struct rptadv_iax2_client_descriptor_v1 {
     int32_t (*dial)(const struct rptadv_iax2_dial_options_v1 *options, void **peer);
     /** Return the negotiated linear PCM rate in samples per second. */
     uint32_t (*sample_rate_hz)(const void *peer);
-    /** Encode and send normalized mono F32 audio samples at 8 kHz. */
+    /** Encode mono F32 at 8 kHz with sample-contiguous timestamps. Zero samples
+     * end a burst; the next burst anchors to call time. Gaps above 160 ms also
+     * reanchor callers without an idle marker. Failed sends do not advance time. */
     int32_t (*send_audio)(void *peer, const float *samples, size_t sample_count);
     /** Send an ASL text message as one reliable IAX text frame. */
     int32_t (*send_text)(void *peer, const uint8_t *bytes, size_t length);
