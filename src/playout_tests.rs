@@ -240,7 +240,7 @@ fn short_pcm_output_preserves_the_fetched_packet_until_retry() {
 }
 
 #[test]
-fn empty_unkey_releases_without_manufacturing_gap_and_ignores_retired_voice() {
+fn empty_unkey_releases_without_manufacturing_gap() {
     let fixture = Fixture::new();
     let origin = Instant::now();
     let mut playout = Playout::new(
@@ -252,14 +252,44 @@ fn empty_unkey_releases_without_manufacturing_gap_and_ignores_retired_voice() {
         playout.poll(origin, &mut []).unwrap(),
         IaxPeerEvent::RadioUnkey
     );
-    playout.put(1000, false, origin, &[0x80; 160]).unwrap();
-    assert!(fixture.puts().is_empty());
     assert_eq!(
         playout
             .poll(origin + Duration::from_secs(1), &mut [])
             .unwrap(),
         IaxPeerEvent::None
     );
+}
+
+#[test]
+fn voice_after_unkey_resumes_without_requiring_another_radio_key() {
+    for (mini, delayed_key) in [(false, false), (false, true), (true, false), (true, true)] {
+        let fixture = Fixture::new();
+        let origin = Instant::now();
+        let mut playout = Playout::new(
+            unsafe { Jitter::new(fixture.descriptor()) }.unwrap(),
+            origin,
+        );
+        playout.unkey();
+        assert_eq!(
+            playout.poll(origin, &mut []).unwrap(),
+            IaxPeerEvent::RadioUnkey
+        );
+        // ASL media can continue after UNKEY without another explicit KEY.
+        playout.put(1000, mini, origin, &[0x80; 160]).unwrap();
+        assert_eq!(fixture.puts().len(), 1);
+        fixture.packet(60_000_000, (0x1_0000_0000 + 1000) * 8, &[0x80; 160], 0);
+        if delayed_key {
+            assert!(playout.key(1000).unwrap());
+        }
+        let mut pcm = [0.0; 160];
+        assert_eq!(
+            playout
+                .poll(origin + Duration::from_millis(60), &mut pcm)
+                .unwrap(),
+            IaxPeerEvent::Audio(160)
+        );
+        assert!(pcm.iter().all(|sample| *sample == 32124.0 / 32768.0));
+    }
 }
 
 #[test]

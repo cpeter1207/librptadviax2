@@ -55,11 +55,15 @@ NEW-queue occupancy/full drops and active-route count without a routing lock.
 
 ## Release integration
 
-Alpha5 retains SONAME `librptadviax2.so.1` and the existing synchronous ABI 1.
+The library uses SONAME `librptadviax2.so.1` and synchronous ABI 1.
 Debian 13 release assets provide `librptadv-iax2-client1` and
 `librptadv-iax2-client-dev` for amd64 and arm64. Consumers select an explicit
-release tag and use the versioned dynamic library; IAX packages are not currently
-included in the shared signed package index.
+release tag and use the versioned dynamic library. Packages are also available
+from the [shared signed APT repository](https://cpeter1207.github.io/USBRadioPlus/).
+
+Packet-jitter buffering starts at 180 ms, with a 160 ms minimum and a 500 ms
+maximum. Valid voice resumes playout after a radio-unkey event even when the
+peer does not send another radio-key event.
 
 The optional async table composes a host-supplied packet-jitter descriptor; the
 host retains that descriptor's dynamic library until peer destruction. Peers

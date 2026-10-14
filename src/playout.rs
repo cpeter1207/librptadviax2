@@ -68,9 +68,9 @@ impl Playout {
         arrived_at: Instant,
         payload: &[u8],
     ) -> Result<(), DialError> {
-        if !self.active {
-            return Ok(());
-        }
+        // ASL peers can send valid voice after UNKEY without another KEY. Media
+        // resumes playout; the controller still owns receive/PTT qualification.
+        self.active = true;
         self.expire_quiet(arrived_at)?;
         let timestamp = self.unwrap_ms(timestamp, mini) * 8;
         let admission = self
