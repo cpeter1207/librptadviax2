@@ -362,6 +362,36 @@ fn egress_admission_exhausted_call_numbers_do_not_panic_or_reuse_live_calls() {
         );
     }
     assert_eq!(listener.next_available_call(), None);
+    // Exhaustion must reject a new call without invoking authorization or
+    // disturbing the established call routes; non-NEW traffic is ignored.
+    let server = listener.local_addr().unwrap();
+    let (client, _) = initial_new("127.0.0.1:0".parse().unwrap(), server);
+    assert!(matches!(
+        send_until_event(
+            || match listener.poll(100, |_| panic!("no free call")).unwrap() {
+                ListenerEvent::None => None,
+                event => Some(event),
+            }
+        ),
+        ListenerEvent::Replied
+    ));
+    let mut bytes = [0; 1500];
+    let (length, _) = send_until_event(|| client.try_receive(&mut bytes).unwrap());
+    assert_eq!(
+        decode_iax_command(&parse_full_frame_packet(&bytes[..length]).unwrap().header),
+        Ok(Some(IaxCommand::Reject))
+    );
+    client.send_to(&full_packet(42, 0, 2), server).unwrap();
+    assert!(matches!(
+        send_until_event(
+            || match listener.poll(100, |_| panic!("not NEW")).unwrap() {
+                ListenerEvent::None => None,
+                event => Some(event),
+            }
+        ),
+        ListenerEvent::Ignored
+    ));
+    assert_eq!(listener.router.route_count(), 16384);
     assert!(listener.router.unregister_call(remote, 20000, 20000, 1));
     assert_eq!(listener.next_available_call(), Some(20000));
     assert!(listener.router.contains_local_call(20001));

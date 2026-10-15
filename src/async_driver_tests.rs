@@ -20,6 +20,96 @@ fn attach_polling(
 }
 
 #[test]
+fn egress_socket_readiness_resumes_owner_and_shutdown_ends_it() {
+    for shutdown in [false, true] {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let socket_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let handle = if shutdown {
+            socket_runtime.handle()
+        } else {
+            runtime.handle()
+        };
+        let socket = {
+            let _entered = handle.enter();
+            let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            socket.set_nonblocking(true).unwrap();
+            Arc::new(tokio::net::UdpSocket::from_std(socket).unwrap())
+        };
+        drop(socket_runtime);
+        let (_producer, consumer) = producer_ingress(2, 1).unwrap();
+        let turns = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&turns);
+        let driver = PeerDriver::attach(runtime.handle(), consumer.wake(), move || {
+            let turn = turns.fetch_add(1, Ordering::Relaxed);
+            (turn == 0).then(|| crate::async_driver::PeerWait {
+                deadline: None,
+                writable: Some(Arc::clone(&socket)),
+            })
+        });
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !driver.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        });
+        driver.detach();
+        assert_eq!(
+            observed.load(Ordering::Relaxed),
+            if shutdown { 1 } else { 2 }
+        );
+    }
+}
+
+#[test]
+fn egress_negative_product_callback_ends_registration_before_later_wakes() {
+    use std::{ffi::c_void, ptr};
+    unsafe extern "C" fn step(context: *mut c_void) -> i32 {
+        unsafe { &*context.cast::<AtomicUsize>() }.fetch_add(1, Ordering::Relaxed);
+        -1
+    }
+    let runtime = Arc::new(
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap(),
+    );
+    let mut owner = Arc::clone(&runtime);
+    let (mut peer, _producer) = inbound_peer();
+    let calls = AtomicUsize::new(0);
+    let api = unsafe { &*crate::async_ffi::rptadv_iax2_async_descriptor_v1() };
+    let mut registration = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            (api.peer_attach)(
+                (&mut owner as *mut Arc<tokio::runtime::Runtime>).cast(),
+                (&mut *peer as *mut crate::client::IaxPeer).cast(),
+                Some(step),
+                (&calls as *const AtomicUsize).cast_mut().cast(),
+                &mut registration,
+            )
+        },
+        0
+    );
+    runtime.block_on(async {
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        unsafe { (api.peer_wake)(registration) };
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    });
+    unsafe { (api.peer_detach)(registration) };
+}
+
+#[test]
 fn datagram_pump_configures_blocking_socket_and_stops_before_queue_release() {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)

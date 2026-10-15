@@ -229,6 +229,11 @@ fn egress_mini_would_block_is_uncommitted() {
     remote.recv_from(&mut bytes).unwrap();
     peer.acknowledge_reliable_frames(2);
     let fault = SendFault::set(address, std::io::ErrorKind::WouldBlock);
+    assert!(matches!(
+        peer.send_ulaw(&[0.25; 160], 120),
+        Err(DialError::Network(error)) if error.kind() == std::io::ErrorKind::WouldBlock
+    ));
+    assert!(peer.wait_state().writable.is_none());
     assert_eq!(
         peer.send_prepared_ulaw(&[0x80; 160], 120).unwrap(),
         MediaSend::WouldBlock
@@ -306,7 +311,7 @@ fn egress_full_window_ping_can_ack_before_committing_its_reply() {
     for _ in 0..super::MAX_RELIABLE_WINDOW {
         peer.send_text(b"L").unwrap();
     }
-    let ping = serialize_full_frame(
+    let mut ping = serialize_full_frame(
         &FullFrameHeader {
             source_call_number: 5678,
             destination_call_number: 1234,
@@ -321,6 +326,19 @@ fn egress_full_window_ping_can_ack_before_committing_its_reply() {
         &[],
     )
     .unwrap();
+    // Without ACK credit, neither PING nor LAGRQ may consume a sequence.
+    for subclass in [2, 11] {
+        ping[9] = 1;
+        ping[11] = subclass;
+        assert_eq!(
+            peer.receive_event(&ping, Instant::now(), &mut [], &mut [])
+                .unwrap(),
+            super::IaxPeerEvent::None
+        );
+        assert_eq!(peer.pending_reliable.len(), super::MAX_RELIABLE_WINDOW);
+    }
+    ping[9] = 65;
+    ping[11] = 2;
     peer.receive_event(&ping, Instant::now(), &mut [], &mut [])
         .unwrap();
     assert_eq!(peer.pending_reliable.len(), 1);
@@ -329,6 +347,81 @@ fn egress_full_window_ping_can_ack_before_committing_its_reply() {
         (pong.header.subclass, pong.header.outgoing_sequence),
         (3, 65)
     );
+}
+
+#[test]
+fn egress_prepared_oversize_is_rejected_before_committing_protocol_state() {
+    let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
+    remote.set_nonblocking(true).unwrap();
+    let mut peer = linked_peer(remote.local_addr().unwrap());
+    let api = unsafe { &*crate::ffi::rptadv_iax2_client_descriptor_v1() };
+    let payload = [0xff; 1489];
+    assert_eq!(
+        unsafe {
+            api.send_prepared_ulaw.unwrap()(
+                (&mut peer as *mut IaxPeer).cast(),
+                payload.as_ptr(),
+                payload.len(),
+                100,
+            )
+        },
+        -1
+    );
+    assert!(peer.pending_reliable.is_empty());
+    assert!(peer.voice_epoch.is_none());
+    assert_eq!(
+        remote.recv_from(&mut [0; 1500]).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[test]
+fn egress_ack_flood_retains_recent_replies_and_delivers_every_text() {
+    let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
+    remote
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    let address = remote.local_addr().unwrap();
+    let mut peer = linked_peer(address);
+    let fault = SendFault::set(address, std::io::ErrorKind::WouldBlock);
+    for sequence in 1..=65 {
+        let text = serialize_full_frame(
+            &FullFrameHeader {
+                source_call_number: 5678,
+                destination_call_number: 1234,
+                retransmission: false,
+                timestamp: u32::from(sequence),
+                outgoing_sequence: sequence,
+                incoming_sequence: 1,
+                frame_type: 7,
+                subclass: 0,
+                subclass_is_log: false,
+            },
+            &[sequence],
+        )
+        .unwrap();
+        let mut received = [0];
+        assert_eq!(
+            peer.receive_event(&text, Instant::now(), &mut [], &mut received)
+                .unwrap(),
+            super::IaxPeerEvent::Text(1)
+        );
+        assert_eq!(received, [sequence]);
+    }
+    assert_eq!(peer.pending_replies.len(), 64);
+    assert!(peer.pending_reliable.is_empty());
+    drop(fault);
+    peer.flush_replies().unwrap();
+    for sequence in 3..=66 {
+        let mut packet = [0; 1500];
+        let count = remote.recv_from(&mut packet).unwrap().0;
+        let ack = crate::protocol::parse_full_frame_packet(&packet[..count]).unwrap();
+        assert_eq!(
+            (ack.header.subclass, ack.header.incoming_sequence),
+            (4, sequence)
+        );
+    }
+    assert!(peer.pending_replies.is_empty());
 }
 
 #[test]
