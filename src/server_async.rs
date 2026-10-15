@@ -52,7 +52,7 @@ pub(super) struct ListenerIngress {
 impl ListenerIngress {
     pub(super) fn start(
         runtime: Arc<Runtime>,
-        socket: UdpSocket,
+        socket: Arc<UdpSocket>,
         mut router: PeerIngressRouter,
     ) -> Self {
         let (commands, mut updates) = mpsc::channel(64);
@@ -192,11 +192,11 @@ mod tests {
                 .unwrap(),
         );
         let socket = runtime.block_on(UdpSocket::bind("127.0.0.1:0")).unwrap();
-        let mut router = PeerIngressRouter::new(1, 1).unwrap();
+        let mut router = PeerIngressRouter::new(1).unwrap();
         let peer = router
             .register_call("127.0.0.1:4569".parse().unwrap(), 22, 42, 7)
             .unwrap();
-        let mut pump = ListenerIngress::start(runtime.clone(), socket, router);
+        let mut pump = ListenerIngress::start(runtime.clone(), Arc::new(socket), router);
         pump.stop.send_replace(true);
 
         assert!(runtime.block_on(pump.admission.receive()).is_none());
@@ -226,9 +226,9 @@ mod tests {
             let _entered = runtime.enter();
             UdpSocket::from_std(receiver).unwrap()
         };
-        let mut router = PeerIngressRouter::new(1, 4).unwrap();
+        let mut router = PeerIngressRouter::new(4).unwrap();
         let mut peer = router.register_call(remote, 22, 42, 7).unwrap();
-        let mut pump = ListenerIngress::start(runtime.clone(), socket, router);
+        let mut pump = ListenerIngress::start(runtime.clone(), Arc::new(socket), router);
         let packet = |destination, command: IaxCommand| {
             serialize_full_frame(
                 &FullFrameHeader {
@@ -319,9 +319,9 @@ mod tests {
             let _entered = runtime.enter();
             UdpSocket::from_std(receiver).unwrap()
         };
-        let mut router = PeerIngressRouter::new(1, 1).unwrap();
+        let mut router = PeerIngressRouter::new(1).unwrap();
         let peer = router.register_call(remote, 22, 42, 7).unwrap();
-        let mut pump = ListenerIngress::start(runtime.clone(), socket, router);
+        let mut pump = ListenerIngress::start(runtime.clone(), Arc::new(socket), router);
         runtime.block_on(async {
             tokio::time::timeout(Duration::from_secs(2), pump.admission.wake().notified())
                 .await

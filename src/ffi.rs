@@ -1,6 +1,9 @@
 //! Versioned C boundary for the standalone ULAW IAX2 client.
 
-use crate::client::{DialError, DialOptions, IaxPeer, IaxPeerEvent, dial_ulaw};
+use crate::{
+    client::{DialError, DialOptions, IaxPeer, IaxPeerEvent, MediaSend, dial_ulaw},
+    codec::{CodecAdapter, G711Ulaw},
+};
 use std::{
     ffi::c_void,
     mem::size_of,
@@ -111,6 +114,13 @@ pub struct rptadv_iax2_client_descriptor_v1 {
     pub destroy: Option<unsafe extern "C" fn(peer: *mut c_void)>,
     /// Send one completed DTMF digit.
     pub send_digit: Option<unsafe extern "C" fn(peer: *mut c_void, digit: u8) -> i32>,
+    /// Encode into caller storage: one ULAW byte per source sample, no peer mutation.
+    pub prepare_ulaw: Option<unsafe extern "C" fn(*const f32, usize, *mut u8, usize) -> i32>,
+    /// Submit encoded media: zero transfers ownership, one leaves an uncommitted item with caller.
+    /// Zero bytes submit an end-of-burst marker at the supplied source timestamp.
+    pub send_prepared_ulaw: Option<unsafe extern "C" fn(*mut c_void, *const u8, usize, u32) -> i32>,
+    /// Existing call-relative clock, sampled only by the serialized non-audio owner.
+    pub elapsed_ms: Option<unsafe extern "C" fn(*const c_void) -> u32>,
 }
 
 /// Caller-owned options for a single UDP endpoint serving configured local nodes.
@@ -193,6 +203,9 @@ const DESCRIPTOR: rptadv_iax2_client_descriptor_v1 = rptadv_iax2_client_descript
     hangup: Some(hangup),
     destroy: Some(destroy),
     send_digit: Some(send_digit),
+    prepare_ulaw: Some(prepare_ulaw),
+    send_prepared_ulaw: Some(send_prepared_ulaw),
+    elapsed_ms: Some(elapsed_ms),
 };
 
 const SERVER_DESCRIPTOR: rptadv_iax2_server_descriptor_v1 = rptadv_iax2_server_descriptor_v1 {
@@ -449,6 +462,46 @@ unsafe extern "C" fn send_digit(peer: *mut c_void, digit: u8) -> i32 {
         };
         peer.send_dtmf(digit).map_or_else(|_| -1, |_| 0)
     })
+}
+
+unsafe extern "C" fn prepare_ulaw(
+    samples: *const f32,
+    count: usize,
+    output: *mut u8,
+    capacity: usize,
+) -> i32 {
+    boundary(-1, || {
+        let (Some(samples), Some(output)) = (unsafe { input_slice(samples, count) }, unsafe {
+            output_slice(output, capacity)
+        }) else {
+            return -1;
+        };
+        G711Ulaw.encode(samples, output).map_or(-1, |_| 0)
+    })
+}
+
+unsafe extern "C" fn send_prepared_ulaw(
+    peer: *mut c_void,
+    bytes: *const u8,
+    count: usize,
+    timestamp: u32,
+) -> i32 {
+    boundary(-1, || {
+        let (Some(peer), Some(payload)) = (unsafe { peer.cast::<IaxPeer>().as_mut() }, unsafe {
+            input_slice(bytes, count)
+        }) else {
+            return -1;
+        };
+        match peer.send_prepared_ulaw(payload, timestamp) {
+            Ok(MediaSend::Accepted) => 0,
+            Ok(MediaSend::WouldBlock) => 1,
+            Err(_) => -1,
+        }
+    })
+}
+
+unsafe extern "C" fn elapsed_ms(peer: *const c_void) -> u32 {
+    unsafe { peer.cast::<IaxPeer>().as_ref() }.map_or(0, IaxPeer::elapsed_ms)
 }
 
 unsafe extern "C" fn poll(

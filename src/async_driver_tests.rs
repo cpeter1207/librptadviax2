@@ -6,6 +6,109 @@ use std::sync::{
 };
 use std::time::Duration;
 
+fn attach_polling(
+    runtime: &tokio::runtime::Handle,
+    wake: crate::ingress::IngressWake,
+    mut step: impl FnMut() -> bool + Send + 'static,
+) -> PeerDriver {
+    PeerDriver::attach(runtime, wake, move || {
+        step().then(|| crate::async_driver::PeerWait {
+            deadline: Some(std::time::Instant::now() + Duration::from_millis(10)),
+            writable: None,
+        })
+    })
+}
+
+#[test]
+fn egress_socket_readiness_resumes_owner_and_shutdown_ends_it() {
+    for shutdown in [false, true] {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let socket_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let handle = if shutdown {
+            socket_runtime.handle()
+        } else {
+            runtime.handle()
+        };
+        let socket = {
+            let _entered = handle.enter();
+            let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            socket.set_nonblocking(true).unwrap();
+            Arc::new(tokio::net::UdpSocket::from_std(socket).unwrap())
+        };
+        drop(socket_runtime);
+        let (_producer, consumer) = producer_ingress(2, 1).unwrap();
+        let turns = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&turns);
+        let driver = PeerDriver::attach(runtime.handle(), consumer.wake(), move || {
+            let turn = turns.fetch_add(1, Ordering::Relaxed);
+            (turn == 0).then(|| crate::async_driver::PeerWait {
+                deadline: None,
+                writable: Some(Arc::clone(&socket)),
+            })
+        });
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !driver.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        });
+        driver.detach();
+        assert_eq!(
+            observed.load(Ordering::Relaxed),
+            if shutdown { 1 } else { 2 }
+        );
+    }
+}
+
+#[test]
+fn egress_negative_product_callback_ends_registration_before_later_wakes() {
+    use std::{ffi::c_void, ptr};
+    unsafe extern "C" fn step(context: *mut c_void) -> i32 {
+        unsafe { &*context.cast::<AtomicUsize>() }.fetch_add(1, Ordering::Relaxed);
+        -1
+    }
+    let runtime = Arc::new(
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap(),
+    );
+    let mut owner = Arc::clone(&runtime);
+    let (mut peer, _producer) = inbound_peer();
+    let calls = AtomicUsize::new(0);
+    let api = unsafe { &*crate::async_ffi::rptadv_iax2_async_descriptor_v1() };
+    let mut registration = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            (api.peer_attach)(
+                (&mut owner as *mut Arc<tokio::runtime::Runtime>).cast(),
+                (&mut *peer as *mut crate::client::IaxPeer).cast(),
+                Some(step),
+                (&calls as *const AtomicUsize).cast_mut().cast(),
+                &mut registration,
+            )
+        },
+        0
+    );
+    runtime.block_on(async {
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        unsafe { (api.peer_wake)(registration) };
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    });
+    unsafe { (api.peer_detach)(registration) };
+}
+
 #[test]
 fn datagram_pump_configures_blocking_socket_and_stops_before_queue_release() {
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -146,7 +249,7 @@ fn inbound_peer() -> (Box<crate::client::IaxPeer>, crate::ingress::IngressProduc
     let local = socket.local_addr().unwrap();
     let (producer, consumer) = producer_ingress(8, 9).unwrap();
     let (peer, _) = crate::client::IaxPeer::from_inbound(
-        Arc::new(socket),
+        Arc::new(crate::network::SharedSocket::new(socket)),
         consumer,
         local,
         "127.0.0.1:4569".parse().unwrap(),
@@ -214,7 +317,8 @@ fn peer_observation_validates_only_output_prefix_before_touching_the_record() {
         ptr,
     };
     let api = unsafe { &*crate::async_ffi::rptadv_iax2_async_descriptor_v1() };
-    assert_eq!(size_of::<IaxPeerObservation>(), 112);
+    assert_eq!(size_of::<IaxPeerObservation>(), 144);
+    assert_eq!(offset_of!(IaxPeerObservation, egress_datagrams), 112);
     assert_eq!(
         offset_of!(AsyncDescriptor, peer_observe),
         24 + 7 * size_of::<usize>()
@@ -410,7 +514,7 @@ fn peer_driver_drains_coalesced_work_without_overlapping_callbacks() {
     let (sent, received) = mpsc::channel();
     let calls = Arc::new(AtomicUsize::new(0));
     let observed = calls.clone();
-    let driver = PeerDriver::attach(runtime.handle(), wake, move || {
+    let driver = attach_polling(runtime.handle(), wake, move || {
         calls.fetch_add(1, Ordering::Relaxed);
         if let Some(packet) = consumer.try_pop() {
             sent.send(packet.payload()[0]).unwrap();
@@ -447,14 +551,14 @@ fn stalled_peer_does_not_serialize_another_peer_and_detach_waits() {
     let (_producer_b, consumer_b) = producer_ingress(1, 2).unwrap();
     let (entered, waiting) = mpsc::sync_channel(1);
     let (release, released) = mpsc::sync_channel(1);
-    let driver_a = PeerDriver::attach(runtime.handle(), consumer_a.wake(), move || {
+    let driver_a = attach_polling(runtime.handle(), consumer_a.wake(), move || {
         entered.send(()).unwrap();
         released.recv().unwrap();
         false
     });
     waiting.recv_timeout(Duration::from_secs(2)).unwrap();
     let (progress, progressed) = mpsc::sync_channel(1);
-    let driver_b = PeerDriver::attach(runtime.handle(), consumer_b.wake(), move || {
+    let driver_b = attach_polling(runtime.handle(), consumer_b.wake(), move || {
         progress.send(()).unwrap();
         false
     });
@@ -484,7 +588,7 @@ fn pending_mailbox_without_callback_progress_waits_for_timer_instead_of_spinning
     let observed = calls.clone();
     let (entered, waiting) = mpsc::sync_channel(1);
     let started = std::time::Instant::now();
-    let driver = PeerDriver::attach(runtime.handle(), consumer.wake(), move || {
+    let driver = attach_polling(runtime.handle(), consumer.wake(), move || {
         if calls.fetch_add(1, Ordering::Relaxed) == 0 {
             entered.send(()).unwrap();
         }
@@ -519,7 +623,7 @@ fn future_media_deadline_wakes_without_ingress_at_the_concealment_cadence() {
     let (_producer, consumer) = producer_ingress(1, 1).unwrap();
     let (progress, progressed) = mpsc::sync_channel(1);
     let deadline = std::time::Instant::now() + quantum;
-    let driver = PeerDriver::attach(runtime.handle(), consumer.wake(), move || {
+    let driver = attach_polling(runtime.handle(), consumer.wake(), move || {
         let now = std::time::Instant::now();
         if now < deadline {
             return true;
@@ -570,7 +674,7 @@ fn peer_scaling_100_and_1000_keeps_fixed_workers_and_isolates_stalled_flood() {
             let progress = progress.clone();
             let entered = entered.clone();
             let mut block = if peer == 0 { released.take() } else { None };
-            let driver = PeerDriver::attach(runtime.handle(), consumer.wake(), move || {
+            let driver = attach_polling(runtime.handle(), consumer.wake(), move || {
                 if let Some(release) = block.take() {
                     entered.send(()).unwrap();
                     release.recv_timeout(Duration::from_secs(20)).unwrap();
@@ -624,4 +728,168 @@ fn peer_scaling_100_and_1000_keeps_fixed_workers_and_isolates_stalled_flood() {
             started.elapsed().as_millis()
         );
     }
+}
+#[test]
+fn egress_wake_deadline_descriptor_is_available_without_changing_its_prefix() {
+    use std::{ffi::c_void, mem::size_of, ptr};
+    type Wake = unsafe extern "C" fn(*mut c_void);
+    type Deadline = unsafe extern "C" fn(*mut c_void, u64) -> i32;
+    let api = crate::async_ffi::rptadv_iax2_async_descriptor_v1();
+    assert!(unsafe { (*api).struct_size } as usize >= 24 + 10 * size_of::<usize>());
+    assert_eq!(unsafe { (*api).abi_version }, 1);
+    let tail = unsafe { api.cast::<u8>().add(24 + size_of::<[usize; 8]>()) };
+    let wake = unsafe { tail.cast::<Wake>().read() };
+    let deadline = unsafe { tail.add(size_of::<usize>()).cast::<Deadline>().read() };
+    unsafe {
+        wake(ptr::null_mut());
+        assert_eq!(deadline(ptr::null_mut(), 0), -1);
+    }
+}
+
+#[test]
+fn egress_product_wake_coalesces_and_expiry_wakes_without_ingress() {
+    use std::ffi::c_void;
+    struct Context {
+        peer: *mut c_void,
+        turns: Arc<AtomicUsize>,
+    }
+    unsafe extern "C" fn step(context: *mut c_void) -> i32 {
+        let context = unsafe { &mut *context.cast::<Context>() };
+        let turn = context.turns.fetch_add(1, Ordering::Relaxed);
+        let api = unsafe { &*crate::async_ffi::rptadv_iax2_async_descriptor_v1() };
+        unsafe {
+            (api.peer_set_deadline)(context.peer, if turn == 1 { 50_000_000 } else { u64::MAX })
+        }
+    }
+    struct Attached(*mut c_void);
+    impl Drop for Attached {
+        fn drop(&mut self) {
+            let api = unsafe { &*crate::async_ffi::rptadv_iax2_async_descriptor_v1() };
+            unsafe { (api.peer_detach)(self.0) };
+        }
+    }
+    let runtime = Arc::new(
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .unwrap(),
+    );
+    let mut runtime_owner = Box::new(Arc::clone(&runtime));
+    let (mut peer, _producer) = inbound_peer();
+    let turns = Arc::new(AtomicUsize::new(0));
+    let mut context = Context {
+        peer: (&mut *peer as *mut crate::client::IaxPeer).cast(),
+        turns: Arc::clone(&turns),
+    };
+    let api = unsafe { &*crate::async_ffi::rptadv_iax2_async_descriptor_v1() };
+    let mut registration = std::ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            (api.peer_attach)(
+                (&mut *runtime_owner as *mut Arc<tokio::runtime::Runtime>).cast(),
+                context.peer,
+                Some(step),
+                (&mut context as *mut Context).cast(),
+                &mut registration,
+            )
+        },
+        0
+    );
+    let attached = Attached(registration);
+    let observed = runtime.block_on(async {
+        tokio::task::yield_now().await;
+        let initial = turns.load(Ordering::Relaxed);
+        tokio::time::advance(Duration::from_millis(200)).await;
+        tokio::task::yield_now().await;
+        let idle = turns.load(Ordering::Relaxed);
+        for _ in 0..3 {
+            unsafe { (api.peer_wake)(registration) };
+        }
+        tokio::task::yield_now().await;
+        let woken = turns.load(Ordering::Relaxed);
+        tokio::time::advance(Duration::from_millis(49)).await;
+        tokio::task::yield_now().await;
+        let before_deadline = turns.load(Ordering::Relaxed);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        let expired = turns.load(Ordering::Relaxed);
+        // Drive stop on this current-thread executor before joining off-executor.
+        unsafe { (api.peer_stop)(registration) };
+        tokio::task::yield_now().await;
+        [initial, idle, woken, before_deadline, expired]
+    });
+    drop(attached);
+    assert_eq!(observed, [1, 1, 2, 2, 3], "idle, wake and expiry turns");
+}
+
+#[test]
+fn egress_wake_deadline_and_blocked_peer_isolation() {
+    use crate::async_driver::{PeerWait, WRITABLE_TEST_SIGNAL};
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
+        .build()
+        .unwrap();
+    let ready = Arc::new(tokio::sync::Notify::new());
+    WRITABLE_TEST_SIGNAL.with_borrow_mut(|slot| *slot = Some(Arc::clone(&ready)));
+    let socket = runtime
+        .block_on(tokio::net::UdpSocket::bind("127.0.0.1:0"))
+        .unwrap();
+    let socket = Arc::new(socket);
+    let (_producer, consumer) = producer_ingress(2, 1).unwrap();
+    let (mut other_producer, mut other_consumer) = producer_ingress(2, 2).unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&calls);
+    let blocked = PeerDriver::attach(runtime.handle(), consumer.wake(), move || {
+        let turn = calls.fetch_add(1, Ordering::Relaxed);
+        (turn < 2).then(|| PeerWait {
+            deadline: (turn == 0)
+                .then(|| (tokio::time::Instant::now() + Duration::from_millis(50)).into_std()),
+            writable: Some(Arc::clone(&socket)),
+        })
+    });
+    let healthy = Arc::new(AtomicUsize::new(0));
+    let progressed = Arc::clone(&healthy);
+    let other = PeerDriver::attach(runtime.handle(), other_consumer.wake(), move || {
+        if other_consumer.try_pop().is_some() {
+            progressed.fetch_add(1, Ordering::Relaxed);
+        }
+        Some(PeerWait {
+            deadline: None,
+            writable: None,
+        })
+    });
+    let counts = runtime.block_on(async {
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(40)).await;
+        tokio::task::yield_now().await;
+        let before = observed.load(Ordering::Relaxed);
+        other_producer
+            .try_push("127.0.0.1:4569".parse().unwrap(), &[1])
+            .unwrap();
+        tokio::task::yield_now().await;
+        let progress = healthy.load(Ordering::Relaxed);
+        tokio::time::advance(Duration::from_millis(10)).await;
+        tokio::task::yield_now().await;
+        let expiry = observed.load(Ordering::Relaxed);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        let parked = observed.load(Ordering::Relaxed);
+        ready.notify_one();
+        tokio::task::yield_now().await;
+        let writable = observed.load(Ordering::Relaxed);
+        blocked.stop();
+        other.stop();
+        tokio::task::yield_now().await;
+        [before, progress, expiry, parked, writable]
+    });
+    blocked.detach();
+    other.detach();
+    WRITABLE_TEST_SIGNAL.with_borrow_mut(|slot| *slot = None);
+    assert_eq!(
+        counts,
+        [1, 1, 2, 2, 3],
+        "blocked peer parks while healthy peer and expiry progress"
+    );
 }

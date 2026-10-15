@@ -4,19 +4,15 @@ use crate::{
     codec::{CodecAdapter, CodecError, G711Ulaw, IAX_FORMAT_ULAW, ULAW_SAMPLE_RATE_HZ},
     information_elements::InformationElement,
     ingress::IngressConsumer,
-    media::{
-        VoiceFrame, VoiceFrameEncodeError, VoiceFrameError, encode_mini_voice_frame,
-        parse_voice_frame,
-    },
-    network::UdpEndpoint,
+    media::{VoiceFrame, VoiceFrameEncodeError, VoiceFrameError, parse_voice_frame},
+    network::{SharedSocket, UdpEndpoint},
     playout::Playout,
-    protocol::{MiniFrameHeader, parse_full_frame_packet},
+    protocol::parse_full_frame_packet,
     session::{CallSetupError, LinkedCallResponse, OutboundCallSetup, OutboundSetupResponse},
 };
 use std::{
     collections::VecDeque,
     io,
-    net::UdpSocket,
     net::{IpAddr, SocketAddr},
     thread,
     time::{Duration, Instant},
@@ -50,6 +46,17 @@ struct PendingReliableFrame {
     next_retry: Instant,
     retry_interval: Duration,
     retries: u8,
+    sent: bool,
+    expires_at: Instant,
+}
+
+/// Ownership of one outgoing encoded media item after a nonblocking send.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MediaSend {
+    /// Sent, or committed to the provider's bounded reliable window.
+    Accepted,
+    /// No sequence was consumed; the caller retains the item and its age.
+    WouldBlock,
 }
 
 /// Inputs required to establish a direct outbound AllStarLink-compatible call.
@@ -109,6 +116,7 @@ pub struct IaxPeer {
     connected_at: Instant,
     setup: OutboundCallSetup,
     pending_reliable: VecDeque<PendingReliableFrame>,
+    pending_replies: VecDeque<Vec<u8>>,
     pending_events: VecDeque<PendingEvent>,
     answered: bool,
     voice_epoch: Option<u32>,
@@ -116,20 +124,40 @@ pub struct IaxPeer {
     voice_clock: Option<(u32, u64)>,
     release_on_drop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     async_attached: bool,
+    // None preserves polling for callers that never supply scheduling deadlines.
+    product_deadline: Option<Option<Instant>>,
+    send_stats: SendStatistics,
     playout: Option<Playout>,
+}
+
+/// Exclusive peer-owner counters; send helpers borrow only the cell-backed fields.
+#[derive(Default)]
+struct SendStatistics {
+    blocked: std::cell::Cell<bool>,
+    datagrams: std::cell::Cell<u64>,
+    would_block: std::cell::Cell<u64>,
+    retries: u64,
 }
 
 enum PeerEndpoint {
     Dedicated(UdpEndpoint),
     Shared {
-        socket: std::sync::Arc<UdpSocket>,
+        socket: std::sync::Arc<SharedSocket>,
         ingress: IngressConsumer,
         local: SocketAddr,
     },
 }
 
+/// Receive ownership transferred once from a dedicated socket to its Tokio pump.
+type SocketIngress = (
+    std::sync::Arc<tokio::net::UdpSocket>,
+    crate::ingress::IngressProducer,
+);
+
 impl PeerEndpoint {
     fn send_to(&self, packet: &[u8], remote: SocketAddr) -> io::Result<usize> {
+        #[cfg(test)]
+        unit_tests::send_fault(remote)?;
         match self {
             Self::Dedicated(endpoint) => endpoint.send_to(packet, remote),
             Self::Shared { socket, .. } => socket.send_to(packet, remote),
@@ -202,7 +230,7 @@ pub enum IaxPeerEvent {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct IaxPeerObservation {
-    /// Complete record size, currently 112 bytes.
+    /// Complete record size, currently 144 bytes; the original prefix is 112 bytes.
     pub struct_size: u32,
     /// Record revision, currently one.
     pub abi_version: u32,
@@ -236,9 +264,82 @@ pub struct IaxPeerObservation {
     pub ingress_queued_packets: u32,
     /// Fixed mailbox capacity.
     pub ingress_capacity_packets: u32,
+    /// Datagrams accepted by the local socket, not proof of remote delivery.
+    pub egress_datagrams: u64,
+    /// Actual socket WouldBlock results across media, replies, and reliable frames.
+    pub egress_would_block: u64,
+    /// Previously transmitted reliable frames sent again successfully.
+    pub egress_reliable_retries: u64,
+    /// Current committed reliable window occupancy.
+    pub egress_reliable_pending: u32,
+    /// Current bounded best-effort reply queue occupancy.
+    pub egress_reply_pending: u32,
 }
 
 impl IaxPeer {
+    pub(crate) fn begin_turn(&self) {
+        // An expired uncommitted item must not leave stale writable interest.
+        self.send_stats.blocked.set(false);
+    }
+
+    pub(crate) fn wait_state(&self) -> crate::async_driver::PeerWait {
+        let now = tokio::time::Instant::now().into_std();
+        let blocked = self.send_stats.blocked.get();
+        let protocol = self
+            .pending_reliable
+            .iter()
+            .map(|frame| {
+                if blocked {
+                    frame.expires_at
+                } else {
+                    frame.next_retry.min(frame.expires_at)
+                }
+            })
+            .min();
+        let playout = self
+            .playout
+            .as_ref()
+            .and_then(|playout| playout.deadline(now));
+        // A due provider item left unconsumed by the bounded product turn means
+        // inbound PCM backpressure, not idle work. Retry that work at 10 ms.
+        let provider = protocol.into_iter().chain(playout).min().map(|deadline| {
+            if deadline <= now {
+                now + crate::async_driver::TIMER_INTERVAL
+            } else {
+                deadline
+            }
+        });
+        let product = self
+            .product_deadline
+            .unwrap_or(Some(now + crate::async_driver::TIMER_INTERVAL));
+        let writable = if blocked {
+            match &self.endpoint {
+                PeerEndpoint::Shared { socket, .. } => socket.registered(),
+                PeerEndpoint::Dedicated(_) => None,
+            }
+        } else {
+            None
+        };
+        crate::async_driver::PeerWait {
+            deadline: provider.into_iter().chain(product).min(),
+            writable,
+        }
+    }
+
+    pub(crate) fn set_product_deadline(&mut self, after_ns: u64) -> Result<(), DialError> {
+        let deadline = if after_ns == u64::MAX {
+            None
+        } else {
+            Some(
+                tokio::time::Instant::now()
+                    .into_std()
+                    .checked_add(Duration::from_nanos(after_ns))
+                    .ok_or(DialError::InvalidOptions)?,
+            )
+        };
+        self.product_deadline = Some(deadline);
+        Ok(())
+    }
     /// Read only on the exclusive callback owner or after it is quiesced.
     /// Requires composed jitter and queue-backed ingress; never call from audio.
     pub fn observe(&self) -> Result<IaxPeerObservation, DialError> {
@@ -269,6 +370,11 @@ impl IaxPeer {
             ingress_overflow_drops: ingress.dropped_packets,
             ingress_queued_packets: ingress.queued_packets as u32,
             ingress_capacity_packets: ingress.capacity_packets as u32,
+            egress_datagrams: self.send_stats.datagrams.get(),
+            egress_would_block: self.send_stats.would_block.get(),
+            egress_reliable_retries: self.send_stats.retries,
+            egress_reliable_pending: self.pending_reliable.len() as u32,
+            egress_reply_pending: self.pending_replies.len() as u32,
         })
     }
 
@@ -295,10 +401,7 @@ impl IaxPeer {
     pub(crate) fn prepare_async_ingress(
         &mut self,
         runtime: &tokio::runtime::Handle,
-    ) -> io::Result<(
-        crate::ingress::IngressWake,
-        Option<(tokio::net::UdpSocket, crate::ingress::IngressProducer)>,
-    )> {
+    ) -> io::Result<(crate::ingress::IngressWake, Option<SocketIngress>)> {
         if self.async_attached {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
@@ -306,14 +409,16 @@ impl IaxPeer {
             ));
         }
         let shared = match &self.endpoint {
-            PeerEndpoint::Shared { ingress, .. } => {
+            PeerEndpoint::Shared {
+                socket, ingress, ..
+            } => {
+                socket.register(runtime)?;
                 self.async_attached = true;
                 return Ok((ingress.wake(), None));
             }
             PeerEndpoint::Dedicated(endpoint) => endpoint.shared_socket(),
         };
-        let _entered = runtime.enter();
-        let socket = tokio::net::UdpSocket::from_std(shared.try_clone()?)?;
+        let socket = shared.register(runtime)?;
         let local = shared.local_addr()?;
         // Each retired endpoint keeps its own queue; reusing call numbers cannot reuse it.
         let (producer, ingress) = crate::ingress::producer_ingress(64, u64::from(self.local_call))
@@ -329,7 +434,7 @@ impl IaxPeer {
     }
 
     pub(crate) fn from_inbound(
-        socket: std::sync::Arc<UdpSocket>,
+        socket: std::sync::Arc<SharedSocket>,
         ingress: IngressConsumer,
         local: SocketAddr,
         remote: SocketAddr,
@@ -353,12 +458,15 @@ impl IaxPeer {
             connected_at: Instant::now(),
             setup,
             pending_reliable: VecDeque::new(),
+            pending_replies: VecDeque::new(),
             pending_events: VecDeque::new(),
             answered: true,
             voice_epoch: None,
             voice_clock: None,
             release_on_drop: Some(std::sync::Arc::clone(&released)),
             async_attached: false,
+            product_deadline: None,
+            send_stats: SendStatistics::default(),
             playout: None,
         };
         Ok((peer, released))
@@ -429,35 +537,60 @@ impl IaxPeer {
 
     /// Establish codec and timestamp epoch with full voice; use mini frames within that epoch.
     pub fn send_ulaw(&mut self, pcm: &[f32], timestamp_ms: u32) -> Result<(), DialError> {
-        let mut packet = [0_u8; 1500];
+        let mut payload = [0_u8; MAX_PACKET_SIZE - 12];
+        let length = G711Ulaw
+            .encode(pcm, &mut payload)
+            .map_err(|error| DialError::Encode(VoiceFrameEncodeError::Codec(error)))?;
+        match self.send_encoded_ulaw(&payload[..length], timestamp_ms)? {
+            MediaSend::Accepted => Ok(()),
+            MediaSend::WouldBlock => Err(DialError::Network(io::ErrorKind::WouldBlock.into())),
+        }
+    }
+
+    /// Submit caller-encoded ULAW at its source timestamp. A committed full frame
+    /// survives congestion; a blocked mini remains with the caller for expiry.
+    /// Empty payloads carry the end-of-burst marker under the same ordering rules.
+    pub fn send_prepared_ulaw(
+        &mut self,
+        payload: &[u8],
+        timestamp_ms: u32,
+    ) -> Result<MediaSend, DialError> {
+        self.send_encoded_ulaw(payload, timestamp_ms)
+    }
+
+    fn send_encoded_ulaw(
+        &mut self,
+        payload: &[u8],
+        timestamp_ms: u32,
+    ) -> Result<MediaSend, DialError> {
+        if payload.len() > MAX_PACKET_SIZE - 12 {
+            return Err(DialError::InvalidOptions);
+        }
+        // An epoch's full voice and earlier signaling must reach the socket first.
+        if self.pending_reliable.iter().any(|frame| !frame.sent) {
+            return Ok(MediaSend::WouldBlock);
+        }
         let epoch = timestamp_ms >> 16;
         if self.voice_epoch != Some(epoch) {
             self.ensure_reliable_capacity()?;
-            let length = G711Ulaw
-                .encode(pcm, &mut packet[12..])
-                .map_err(|error| DialError::Encode(VoiceFrameEncodeError::Codec(error)))?;
             let full = self
                 .setup
-                .send_ulaw_frame(&packet[12..12 + length], timestamp_ms)
+                .send_ulaw_frame(payload, timestamp_ms)
                 .map_err(DialError::Protocol)?;
             self.send_reliable(full)?;
             self.voice_epoch = Some(epoch);
-            return Ok(());
+            return Ok(MediaSend::Accepted);
         }
-        let length = encode_mini_voice_frame(
-            &G711Ulaw,
-            MiniFrameHeader {
-                source_call_number: self.local_call,
-                timestamp: timestamp_ms as u16,
-            },
-            pcm,
-            &mut packet,
+        let mut packet = [0_u8; MAX_PACKET_SIZE];
+        packet[..2].copy_from_slice(&self.local_call.to_be_bytes());
+        packet[2..4].copy_from_slice(&(timestamp_ms as u16).to_be_bytes());
+        packet[4..4 + payload.len()].copy_from_slice(payload);
+        send_media(
+            &self.endpoint,
+            &packet[..4 + payload.len()],
+            self.remote,
+            &self.send_stats,
         )
-        .map_err(DialError::Encode)?;
-        self.endpoint
-            .send_to(&packet[..length], self.remote)
-            .map(|_| ())
-            .map_err(DialError::Network)
     }
 
     /// Send one ASL text payload as a sequenced IAX full frame.
@@ -557,6 +690,7 @@ impl IaxPeer {
         text: &mut [u8],
     ) -> Result<IaxPeerEvent, DialError> {
         self.retry_reliable_frames()?;
+        self.flush_replies()?;
         // Admit the bounded receive batch before advancing packet time. Otherwise
         // executor batching would masquerade as network loss in already due media.
         for _ in 0..MAX_RELIABLE_WINDOW {
@@ -600,20 +734,31 @@ impl IaxPeer {
                 return Err(DialError::InvalidOptions);
             }
             if matches!(frame.header.frame_type, 1 | 4 | 6 | 7 | 10) {
+                // ACK credit is independent of the received frame's sequence.
+                // Validate identity first, and free sent slots before a reliable reply.
+                self.setup
+                    .validate_call_ids(&frame.header)
+                    .map_err(DialError::Protocol)?;
+                self.acknowledge_reliable_frames(frame.header.incoming_sequence);
+                // PING/LAGRQ replies consume a sequence. Leave the request for
+                // retransmission if the reliable window cannot retain that reply.
+                if frame.header.frame_type == 6
+                    && matches!(frame.header.subclass, 2 | 11)
+                    && self.ensure_reliable_capacity().is_err()
+                {
+                    return Ok(IaxPeerEvent::None);
+                }
                 let response = self
                     .setup
                     .receive_linked(bytes)
                     .map_err(DialError::Protocol)?;
-                self.acknowledge_reliable_frames(frame.header.incoming_sequence);
                 let reply = match response {
                     LinkedCallResponse::SendReliable(packet) => {
                         self.send_reliable(packet)?;
                         return Ok(IaxPeerEvent::None);
                     }
                     LinkedCallResponse::Send(packet) => {
-                        self.endpoint
-                            .send_to(&packet, self.remote)
-                            .map_err(DialError::Network)?;
+                        self.send_reply(packet)?;
                         return Ok(IaxPeerEvent::None);
                     }
                     LinkedCallResponse::PongAcknowledged {
@@ -624,18 +769,14 @@ impl IaxPeer {
                         acknowledgement
                     }
                     LinkedCallResponse::Ended { acknowledgement } => {
-                        self.endpoint
-                            .send_to(&acknowledgement, self.remote)
-                            .map_err(DialError::Network)?;
+                        self.send_reply(acknowledgement)?;
                         return Ok(IaxPeerEvent::Hangup);
                     }
                     LinkedCallResponse::Text {
                         text: received,
                         acknowledgement,
                     } => {
-                        self.endpoint
-                            .send_to(&acknowledgement, self.remote)
-                            .map_err(DialError::Network)?;
+                        self.send_reply(acknowledgement)?;
                         if received.len() > text.len() {
                             return Err(DialError::InvalidOptions);
                         }
@@ -646,15 +787,11 @@ impl IaxPeer {
                         digit,
                         acknowledgement,
                     } => {
-                        self.endpoint
-                            .send_to(&acknowledgement, self.remote)
-                            .map_err(DialError::Network)?;
+                        self.send_reply(acknowledgement)?;
                         return Ok(IaxPeerEvent::Digit(digit));
                     }
                     LinkedCallResponse::RadioKey { acknowledgement } => {
-                        self.endpoint
-                            .send_to(&acknowledgement, self.remote)
-                            .map_err(DialError::Network)?;
+                        self.send_reply(acknowledgement)?;
                         if let Some(playout) = &mut self.playout {
                             if !playout.key(frame.header.timestamp)? {
                                 return Ok(IaxPeerEvent::None);
@@ -663,9 +800,7 @@ impl IaxPeer {
                         return Ok(IaxPeerEvent::RadioKey);
                     }
                     LinkedCallResponse::RadioUnkey { acknowledgement } => {
-                        self.endpoint
-                            .send_to(&acknowledgement, self.remote)
-                            .map_err(DialError::Network)?;
+                        self.send_reply(acknowledgement)?;
                         if let Some(playout) = &mut self.playout {
                             playout.unkey();
                             return Ok(IaxPeerEvent::None);
@@ -674,9 +809,7 @@ impl IaxPeer {
                     }
                     LinkedCallResponse::NoAction => return Ok(IaxPeerEvent::None),
                 };
-                self.endpoint
-                    .send_to(&reply, self.remote)
-                    .map_err(DialError::Network)?;
+                self.send_reply(reply)?;
                 return Ok(IaxPeerEvent::None);
             }
         }
@@ -698,9 +831,7 @@ impl IaxPeer {
                 }
                 .map_err(DialError::Protocol)?;
                 self.acknowledge_reliable_frames(header.incoming_sequence);
-                self.endpoint
-                    .send_to(&acknowledgement, self.remote)
-                    .map_err(DialError::Network)?;
+                self.send_reply(acknowledgement)?;
                 if !deliver {
                     return Ok(IaxPeerEvent::None);
                 }
@@ -731,22 +862,46 @@ impl IaxPeer {
         }
     }
 
+    fn send_reply(&mut self, packet: Vec<u8>) -> Result<(), DialError> {
+        // These are cumulative ACKs or duplicate cached replies, never a newly
+        // committed sequence. Retain recent replies without letting an ACK flood
+        // grow memory or prevent ingress. Committed frames have their own window.
+        if self.pending_replies.len() == MAX_RELIABLE_WINDOW {
+            self.pending_replies.pop_front();
+        }
+        self.pending_replies.push_back(packet);
+        self.flush_replies()
+    }
+
+    fn flush_replies(&mut self) -> Result<(), DialError> {
+        while let Some(packet) = self.pending_replies.front() {
+            if send_media(&self.endpoint, packet, self.remote, &self.send_stats)?
+                == MediaSend::WouldBlock
+            {
+                break;
+            }
+            self.pending_replies.pop_front();
+        }
+        Ok(())
+    }
+
     fn send_reliable(&mut self, packet: Vec<u8>) -> Result<(), DialError> {
         self.ensure_reliable_capacity()?;
         let header = parse_full_frame_packet(&packet)
             .map_err(|_| DialError::Protocol(CallSetupError::InvalidFrame))?
             .header;
-        self.endpoint
-            .send_to(&packet, self.remote)
-            .map_err(DialError::Network)?;
+        let now = Instant::now();
+        // Retain bytes before touching UDP. Sequencing is already committed.
         self.pending_reliable.push_back(PendingReliableFrame {
             packet,
             outgoing_sequence: header.outgoing_sequence,
-            next_retry: Instant::now() + LINK_INITIAL_RETRY,
+            next_retry: now,
             retry_interval: LINK_INITIAL_RETRY,
             retries: 0,
+            sent: false,
+            expires_at: now + LINK_INITIAL_RETRY + MAX_RETRY * u32::from(MAX_RELIABLE_RETRIES),
         });
-        Ok(())
+        self.retry_reliable_frames()
     }
 
     fn acknowledge_reliable_frames(&mut self, next_sequence: u8) {
@@ -756,21 +911,39 @@ impl IaxPeer {
     fn retry_reliable_frames(&mut self) -> Result<(), DialError> {
         let now = Instant::now();
         for frame in &mut self.pending_reliable {
+            if now >= frame.expires_at {
+                return Err(DialError::Timeout);
+            }
             if now < frame.next_retry {
                 continue;
             }
             if frame.retries == MAX_RELIABLE_RETRIES {
                 return Err(DialError::Timeout);
             }
-            let packet = self
-                .setup
-                .retransmit(&frame.packet)
-                .map_err(DialError::Protocol)?;
-            self.endpoint
-                .send_to(&packet, self.remote)
-                .map_err(DialError::Network)?;
-            frame.retries += 1;
-            frame.retry_interval = (frame.retry_interval * 10).min(MAX_RETRY);
+            let retry;
+            let packet = if frame.sent {
+                retry = self
+                    .setup
+                    .retransmit(&frame.packet)
+                    .map_err(DialError::Protocol)?;
+                &retry
+            } else {
+                &frame.packet
+            };
+            if send_media(&self.endpoint, packet, self.remote, &self.send_stats)?
+                == MediaSend::WouldBlock
+            {
+                break; // Still process inbound ACKs and control while the socket is full.
+            }
+            if frame.sent {
+                self.send_stats.retries = self.send_stats.retries.saturating_add(1);
+                frame.retries += 1;
+                frame.retry_interval = (frame.retry_interval * 10).min(MAX_RETRY);
+            } else {
+                frame.sent = true;
+                frame.expires_at =
+                    now + LINK_INITIAL_RETRY + MAX_RETRY * u32::from(MAX_RELIABLE_RETRIES);
+            }
             frame.next_retry = now + frame.retry_interval;
         }
         Ok(())
@@ -800,8 +973,30 @@ fn acknowledge_reliable_frames(pending: &mut VecDeque<PendingReliableFrame>, nex
         return;
     };
     let acknowledged = usize::from(next_sequence.wrapping_sub(first.outgoing_sequence));
-    if acknowledged <= pending.len() {
+    if acknowledged <= pending.len() && pending.iter().take(acknowledged).all(|frame| frame.sent) {
         pending.drain(..acknowledged);
+    }
+}
+
+fn send_media(
+    endpoint: &PeerEndpoint,
+    packet: &[u8],
+    remote: SocketAddr,
+    stats: &SendStatistics,
+) -> Result<MediaSend, DialError> {
+    match endpoint.send_to(packet, remote) {
+        Ok(_) => {
+            stats.datagrams.set(stats.datagrams.get().saturating_add(1));
+            Ok(MediaSend::Accepted)
+        }
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+            stats.blocked.set(true);
+            stats
+                .would_block
+                .set(stats.would_block.get().saturating_add(1));
+            Ok(MediaSend::WouldBlock)
+        }
+        Err(error) => Err(DialError::Network(error)),
     }
 }
 
@@ -940,12 +1135,15 @@ pub fn dial_ulaw(options: DialOptions<'_>) -> Result<IaxPeer, DialError> {
                     connected_at: Instant::now(),
                     setup,
                     pending_reliable: VecDeque::new(),
+                    pending_replies: VecDeque::new(),
                     pending_events: VecDeque::new(),
                     answered: false,
                     voice_epoch: None,
                     voice_clock: None,
                     release_on_drop: None,
                     async_attached: false,
+                    product_deadline: None,
+                    send_stats: SendStatistics::default(),
                     playout: None,
                 };
                 peer.wait_answer(deadline)?;

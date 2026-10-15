@@ -41,6 +41,10 @@ pub struct AsyncDescriptor {
     pub server_enable: unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32,
     /// Copy diagnostics on the exclusive peer owner, never concurrently with media operations.
     pub peer_observe: unsafe extern "C" fn(*mut c_void, *mut IaxPeerObservation) -> i32,
+    /// Signal-only wake; caller keeps the registration alive until return.
+    pub peer_wake: unsafe extern "C" fn(*mut c_void),
+    /// Owner-only relative deadline; u64::MAX clears, zero makes the next turn due.
+    pub peer_set_deadline: unsafe extern "C" fn(*mut c_void, u64) -> i32,
 }
 
 static API: AsyncDescriptor = AsyncDescriptor {
@@ -55,6 +59,8 @@ static API: AsyncDescriptor = AsyncDescriptor {
     peer_configure_jitter,
     server_enable,
     peer_observe,
+    peer_wake,
+    peer_set_deadline,
 };
 
 /// Return the immutable optional table. Retain this DSO through every detach.
@@ -146,9 +152,16 @@ unsafe extern "C" fn peer_attach(
         )
     };
     let context = context as usize;
+    let peer = peer as usize;
     let driver = PeerDriver::attach(runtime.handle(), wake, move || {
         // The host promises stable context and one registered owner through detach.
-        unsafe { step(context as *mut c_void) >= 0 }
+        // End each peer borrow before calling product code, which re-enters its API.
+        unsafe { (*(peer as *const IaxPeer)).begin_turn() };
+        if unsafe { step(context as *mut c_void) } < 0 {
+            None
+        } else {
+            Some(unsafe { (*(peer as *const IaxPeer)).wait_state() })
+        }
     });
     *output = Box::into_raw(Box::new(Registration {
         driver,
@@ -163,6 +176,19 @@ unsafe extern "C" fn peer_stop(registration: *mut c_void) {
     if let Some(registration) = unsafe { registration.cast::<Registration>().as_ref() } {
         registration.stop();
     }
+}
+
+unsafe extern "C" fn peer_wake(registration: *mut c_void) {
+    if let Some(registration) = unsafe { registration.cast::<Registration>().as_ref() } {
+        registration.driver.wake();
+    }
+}
+
+unsafe extern "C" fn peer_set_deadline(peer: *mut c_void, wake_after_ns: u64) -> i32 {
+    let Some(peer) = (unsafe { peer.cast::<IaxPeer>().as_mut() }) else {
+        return -1;
+    };
+    peer.set_product_deadline(wake_after_ns).map_or(-1, |_| 0)
 }
 
 unsafe extern "C" fn peer_detach(registration: *mut c_void) {
@@ -195,9 +221,9 @@ unsafe extern "C" fn server_enable(runtime: *mut c_void, server: *mut c_void) ->
 }
 
 unsafe extern "C" fn peer_observe(peer: *mut c_void, output: *mut IaxPeerObservation) -> i32 {
-    // Validate only the advertised prefix before constructing/writing a full record.
+    // The ABI-1 prefix stays valid; write no bytes beyond the caller's declared record.
     if output.is_null()
-        || unsafe { output.cast::<u32>().read() } < size_of::<IaxPeerObservation>() as u32
+        || unsafe { output.cast::<u32>().read() } < 112
         || unsafe { output.cast::<u32>().add(1).read() } != 1
     {
         return -1;
@@ -206,9 +232,16 @@ unsafe extern "C" fn peer_observe(peer: *mut c_void, output: *mut IaxPeerObserva
         return -1;
     };
     match peer.observe() {
-        Ok(observation) => {
+        Ok(mut observation) => {
+            let writable = (unsafe { output.cast::<u32>().read() } as usize)
+                .min(size_of::<IaxPeerObservation>());
+            observation.struct_size = writable as u32;
             unsafe {
-                output.write(observation);
+                ptr::copy_nonoverlapping(
+                    ptr::from_ref(&observation).cast::<u8>(),
+                    output.cast(),
+                    writable,
+                );
             }
             0
         }

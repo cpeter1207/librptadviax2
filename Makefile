@@ -138,6 +138,10 @@ package-check:
 	test -L build/package-stage/usr/lib/$(DEBIAN_MULTIARCH)/$(notdir $(LIBRARY_LINK))
 	test -f build/package-stage/usr/include/rptadv_iax2/$(notdir $(HEADER))
 	$(READELF) -d build/package-stage/usr/lib/$(DEBIAN_MULTIARCH)/$(notdir $(LIBRARY_VERSIONED)) | grep -F '$(LIBRARY_BASENAME).so.$(SOVERSION)'
+	$(CC) -std=c11 -Wall -Wextra -Werror -Ibuild/package-stage/usr/include/rptadv_iax2 $(SMOKE_SOURCE) \
+		-Lbuild/package-stage/usr/lib/$(DEBIAN_MULTIARCH) -l$(CRATE) \
+		-Wl,-rpath,$(CURDIR)/build/package-stage/usr/lib/$(DEBIAN_MULTIARCH) -o build/package-stage/abi-header-smoke
+	build/package-stage/abi-header-smoke
 	rm -rf build/package-source
 
 debian-package-check: package-check

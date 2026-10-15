@@ -37,6 +37,11 @@ struct rptadv_iax2_peer_observation_v1 {
     uint64_t ingress_overflow_drops; /**< Shared/dedicated mailbox full-queue drops. */
     uint32_t ingress_queued_packets; /**< Current mailbox occupancy. */
     uint32_t ingress_capacity_packets; /**< Maximum retained mailbox packets. */
+    uint64_t egress_datagrams; /**< Datagrams accepted by the local socket, not remote delivery. */
+    uint64_t egress_would_block; /**< Actual socket WouldBlock results. */
+    uint64_t egress_reliable_retries; /**< Successfully resent reliable frames. */
+    uint32_t egress_reliable_pending; /**< Current committed reliable window occupancy. */
+    uint32_t egress_reply_pending; /**< Current bounded best-effort reply queue occupancy. */
 };
 
 /** Optional readiness executor, independent of the unchanged client/server ABI.
@@ -82,6 +87,13 @@ struct rptadv_iax2_async_descriptor_v1 {
      * unchanged (including when jitter or async ingress is not configured).
      */
     int32_t (*peer_observe)(void *peer, struct rptadv_iax2_peer_observation_v1 *output);
+    /** Signal a retained peer owner without blocking. Keep registration alive
+     * through this call; quiesce all callers before peer_detach returns. */
+    void (*peer_wake)(void *registration);
+    /** Set the owner's next product turn relative to this call, in nanoseconds.
+     * UINT64_MAX clears the deadline; zero is due now. Call only on the peer
+     * owner. Protocol and jitter deadlines remain independently scheduled. */
+    int32_t (*peer_set_deadline)(void *peer, uint64_t wake_after_ns);
 };
 
 /** Obtain optional async ABI 1; existing synchronous clients need not use it. */
@@ -142,6 +154,16 @@ struct rptadv_iax2_client_descriptor_v1 {
     void (*destroy)(void *peer);
     /** Send one completed DTMF digit (0-9, A-D, *, or #). */
     int32_t (*send_digit)(void *peer, uint8_t digit);
+    /** Encode mono F32 with the negotiated ULAW codec, one byte per sample.
+     * Insufficient storage leaves output unchanged. Zero succeeds; negative fails. */
+    int32_t (*prepare_ulaw)(const float *samples, size_t count, uint8_t *output, size_t capacity);
+    /** Send already encoded ULAW at its source timestamp. Zero means sent or
+     * reliably retained; one means uncommitted WouldBlock (caller keeps payload
+     * and expiry); negative means terminal error. A zero count submits the
+     * source-timed idle marker under the same congestion contract. */
+    int32_t (*send_prepared_ulaw)(void *peer, const uint8_t *bytes, size_t count, uint32_t timestamp_ms);
+    /** Read the call clock on the exclusive peer owner; NULL returns zero. */
+    uint32_t (*elapsed_ms)(const void *peer);
 };
 
 /**

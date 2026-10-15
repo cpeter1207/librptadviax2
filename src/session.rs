@@ -851,7 +851,7 @@ impl OutboundCallSetup {
         Ok(())
     }
 
-    fn validate_call_ids(&self, header: &FullFrameHeader) -> Result<(), CallSetupError> {
+    pub(crate) fn validate_call_ids(&self, header: &FullFrameHeader) -> Result<(), CallSetupError> {
         if header.destination_call_number != self.local_call {
             return Err(CallSetupError::WrongDestinationCall {
                 actual: header.destination_call_number,

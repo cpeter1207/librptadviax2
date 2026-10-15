@@ -36,16 +36,14 @@ pub enum IngressPushError {
 /// Why a bounded network-owner ingress route could not be used.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PeerIngressRouterError {
-    /// A router must be configured to admit at least one peer.
-    ZeroPeerLimit,
     /// The per-peer queue configuration is invalid.
     Ingress(IngressError),
     /// A peer address already has a route.
     DuplicatePeer,
     /// A call route contains a zero or out-of-range 15-bit call number.
     InvalidCallNumbers,
-    /// The configured peer limit has been reached.
-    PeerLimit,
+    /// Bookkeeping could not be reserved; existing routes are unchanged.
+    Allocation,
     /// No route is registered for this packet source.
     UnknownPeer,
     /// A mini frame matches more than one call for this UDP endpoint.
@@ -231,22 +229,21 @@ enum PeerRouteKey {
 /// looks up the source and attempts admission without waiting for queue space.
 pub struct PeerIngressRouter {
     routes: HashMap<PeerRouteKey, PeerRoute>,
-    peer_limit: usize,
     queue_capacity: NonZeroUsize,
+    #[cfg(test)]
+    pub(crate) fail_next_reserve: bool,
 }
 
 impl PeerIngressRouter {
-    /// Create a router with fixed peer and per-peer packet limits.
-    pub fn new(peer_limit: usize, queue_capacity: usize) -> Result<Self, PeerIngressRouterError> {
-        if peer_limit == 0 {
-            return Err(PeerIngressRouterError::ZeroPeerLimit);
-        }
+    /// Create a resource-scaled router with a fixed per-peer packet limit.
+    pub fn new(queue_capacity: usize) -> Result<Self, PeerIngressRouterError> {
         let queue_capacity = NonZeroUsize::new(queue_capacity)
             .ok_or(PeerIngressRouterError::Ingress(IngressError::ZeroCapacity))?;
         Ok(Self {
-            routes: HashMap::with_capacity(peer_limit),
-            peer_limit,
+            routes: HashMap::new(),
             queue_capacity,
+            #[cfg(test)]
+            fail_next_reserve: false,
         })
     }
 
@@ -306,8 +303,11 @@ impl PeerIngressRouter {
         if self.routes.contains_key(&key) {
             return Err(PeerIngressRouterError::DuplicatePeer);
         }
-        if self.routes.len() == self.peer_limit {
-            return Err(PeerIngressRouterError::PeerLimit);
+        let reserved = self.routes.try_reserve(1).is_ok();
+        #[cfg(test)]
+        let reserved = reserved && !std::mem::take(&mut self.fail_next_reserve);
+        if !reserved {
+            return Err(PeerIngressRouterError::Allocation);
         }
         let (producer, consumer) = new_ingress(self.queue_capacity, generation);
         self.routes.insert(

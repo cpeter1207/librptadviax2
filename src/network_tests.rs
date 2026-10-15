@@ -22,6 +22,31 @@ fn binds_nonblocking_loopback_endpoints() {
 }
 
 #[test]
+fn egress_shares_one_readiness_registration_with_listener_and_peers() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let endpoint = UdpEndpoint::bind(loopback()).unwrap();
+    let shared = endpoint.shared_socket();
+    let first = shared.register(runtime.handle()).unwrap();
+    let second = shared.register(runtime.handle()).unwrap();
+    assert!(std::sync::Arc::ptr_eq(&first, &second));
+    let receiver = UdpSocket::bind(loopback()).unwrap();
+    receiver
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    runtime.block_on(first.writable()).unwrap();
+    assert_eq!(
+        endpoint
+            .send_to(&[7], receiver.local_addr().unwrap())
+            .unwrap(),
+        1
+    );
+    assert_eq!(receiver.recv_from(&mut [0; 2]).unwrap().0, 1);
+}
+
+#[test]
 fn propagates_bind_and_nonblocking_configuration_errors() {
     let unassigned = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 0);
     assert!(UdpEndpoint::bind(unassigned).is_err());
@@ -56,7 +81,7 @@ fn propagates_send_and_non_would_block_receive_errors() {
 
 #[test]
 fn routed_receive_preserves_socket_errors() {
-    let mut router = PeerIngressRouter::new(1, 1).unwrap();
+    let mut router = PeerIngressRouter::new(1).unwrap();
     let error = Error::new(ErrorKind::PermissionDenied, "injected receive error");
     assert!(matches!(
         route_received(Err(error), &mut router, &[0; 1500]),
@@ -93,7 +118,7 @@ fn sends_and_receives_one_unmodified_datagram() {
 fn endpoint_routes_received_datagrams_to_peer_owner_queue() {
     let sender = UdpEndpoint::bind(loopback()).unwrap();
     let endpoint = UdpEndpoint::bind(loopback()).unwrap();
-    let mut router = PeerIngressRouter::new(1, 2).unwrap();
+    let mut router = PeerIngressRouter::new(2).unwrap();
     let mut owner = router.register(sender.local_addr().unwrap(), 42).unwrap();
     let destination = endpoint.local_addr().unwrap();
     let mut buffer = [0; 1500];
@@ -126,7 +151,7 @@ fn endpoint_demultiplexes_full_and_mini_frames_by_call() {
     let sender = UdpEndpoint::bind(loopback()).unwrap();
     let endpoint = UdpEndpoint::bind(loopback()).unwrap();
     let remote = sender.local_addr().unwrap();
-    let mut router = PeerIngressRouter::new(2, 2).unwrap();
+    let mut router = PeerIngressRouter::new(2).unwrap();
     let mut first = router.register_call(remote, 100, 200, 11).unwrap();
     let mut second = router.register_call(remote, 101, 201, 22).unwrap();
     let destination = endpoint.local_addr().unwrap();
@@ -176,7 +201,7 @@ fn endpoint_rejects_malformed_and_unknown_call_frames() {
     let sender = UdpEndpoint::bind(loopback()).unwrap();
     let endpoint = UdpEndpoint::bind(loopback()).unwrap();
     let remote = sender.local_addr().unwrap();
-    let mut router = PeerIngressRouter::new(1, 1).unwrap();
+    let mut router = PeerIngressRouter::new(1).unwrap();
     let mut owner = router.register_call(remote, 100, 200, 1).unwrap();
     let destination = endpoint.local_addr().unwrap();
     let mut buffer = [0; 1500];
@@ -232,7 +257,7 @@ fn endpoint_rejects_malformed_and_unknown_call_frames() {
 fn endpoint_returns_unknown_full_frame_length_for_inbound_admission() {
     let sender = UdpEndpoint::bind(loopback()).unwrap();
     let endpoint = UdpEndpoint::bind(loopback()).unwrap();
-    let mut router = PeerIngressRouter::new(1, 1).unwrap();
+    let mut router = PeerIngressRouter::new(1).unwrap();
     let destination = endpoint.local_addr().unwrap();
     let packet = serialize_full_frame(
         &FullFrameHeader {
@@ -266,7 +291,7 @@ fn endpoint_keeps_address_only_routes_for_existing_callers() {
     let sender = UdpEndpoint::bind(loopback()).unwrap();
     let endpoint = UdpEndpoint::bind(loopback()).unwrap();
     let remote = sender.local_addr().unwrap();
-    let mut router = PeerIngressRouter::new(1, 1).unwrap();
+    let mut router = PeerIngressRouter::new(1).unwrap();
     let mut owner = router.register(remote, 9).unwrap();
     let destination = endpoint.local_addr().unwrap();
     let frame = serialize_full_frame(
@@ -298,7 +323,7 @@ fn endpoint_keeps_address_only_routes_for_existing_callers() {
 fn endpoint_surfaces_unknown_peer_and_full_queue_route_errors() {
     let sender = UdpEndpoint::bind(loopback()).unwrap();
     let endpoint = UdpEndpoint::bind(loopback()).unwrap();
-    let mut router = PeerIngressRouter::new(1, 1).unwrap();
+    let mut router = PeerIngressRouter::new(1).unwrap();
     let mut owner = router
         .register(SocketAddr::from(([127, 0, 0, 1], 9)), 7)
         .unwrap();

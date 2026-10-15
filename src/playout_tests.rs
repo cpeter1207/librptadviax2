@@ -47,12 +47,20 @@ fn packet_is_decoded_only_when_due_and_keeps_original_receive_time() {
     );
     assert_eq!(pcm, [9.0; 160]);
     assert_eq!(
+        playout.deadline(origin),
+        Some(origin + Duration::from_millis(60))
+    );
+    assert_eq!(
         playout
             .poll(origin + Duration::from_millis(60), &mut pcm)
             .unwrap(),
         IaxPeerEvent::Audio(2)
     );
     assert_eq!(&pcm[..2], &[32124.0 / 32768.0, -32124.0 / 32768.0]);
+    assert_eq!(
+        playout.deadline(origin),
+        Some(origin + Duration::from_millis(120))
+    );
     assert_eq!(
         fixture.puts(),
         vec![((0x1_0000_0000 + 1000) * 8, 2, 3_000_000, vec![0x80, 0x00])]
@@ -116,6 +124,7 @@ fn signed_partial_offsets_deliver_prefix_gap_before_audio_and_skip_overlap() {
     let mut pcm = [9.0; 160];
     let now = origin + Duration::from_millis(60);
     assert_eq!(playout.poll(now, &mut pcm).unwrap(), IaxPeerEvent::Gap(40));
+    assert_eq!(playout.deadline(now), Some(now));
     assert_eq!(pcm, [9.0; 160]);
     assert!(fixture.advances().is_empty());
     assert_eq!(playout.poll(now, &mut pcm).unwrap(), IaxPeerEvent::Audio(2));
@@ -127,6 +136,41 @@ fn signed_partial_offsets_deliver_prefix_gap_before_audio_and_skip_overlap() {
     );
     assert_eq!(pcm[0], -32124.0 / 32768.0);
     assert_eq!(fixture.advances().len(), 2);
+}
+
+#[test]
+fn egress_unkey_deadline_drains_accepted_tail_before_releasing_control() {
+    for with_tail in [false, true] {
+        let fixture = Fixture::new();
+        let origin = Instant::now();
+        let mut playout = Playout::new(
+            unsafe { Jitter::new(fixture.descriptor()) }.unwrap(),
+            origin,
+        );
+        if with_tail {
+            playout.put(1000, false, origin, &[0x80; 160]).unwrap();
+            fixture.packet(60_000_000, (0x1_0000_0000 + 1000) * 8, &[0x80; 160], 0);
+            assert_eq!(
+                playout.poll(origin, &mut [0.0; 160]).unwrap(),
+                IaxPeerEvent::None
+            );
+        }
+        playout.unkey();
+        let due = origin + Duration::from_millis(60);
+        if with_tail {
+            assert_eq!(playout.deadline(origin), Some(due));
+            assert_eq!(
+                playout.poll(due, &mut [0.0; 160]).unwrap(),
+                IaxPeerEvent::Audio(160)
+            );
+        }
+        assert_eq!(playout.deadline(due), Some(due));
+        assert_eq!(
+            playout.poll(due, &mut []).unwrap(),
+            IaxPeerEvent::RadioUnkey
+        );
+        assert_eq!(playout.deadline(due), None);
+    }
 }
 
 #[test]

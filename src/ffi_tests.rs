@@ -869,3 +869,34 @@ fn c_peer_api_rejects_dtmf_without_text_storage() {
     assert_eq!((event, length), (RPTADV_IAX2_EVENT_NONE, 0));
     unsafe { destroy(peer) };
 }
+#[test]
+fn egress_descriptor_tail_and_prepared_codec() {
+    use std::{ffi::c_void, mem::size_of, ptr};
+    type Prepare = unsafe extern "C" fn(*const f32, usize, *mut u8, usize) -> i32;
+    type Send = unsafe extern "C" fn(*mut c_void, *const u8, usize, u32) -> i32;
+    type Elapsed = unsafe extern "C" fn(*const c_void) -> u32;
+    let api = super::rptadv_iax2_client_descriptor_v1();
+    // Read only the stable prefix until its declared size admits the new tail.
+    assert!(unsafe { (*api).struct_size } as usize >= 24 + 11 * size_of::<usize>());
+    assert_eq!(unsafe { (*api).abi_version }, 1);
+    let tail = unsafe { api.cast::<u8>().add(24 + size_of::<[usize; 8]>()) };
+    let prepare = unsafe { tail.cast::<Prepare>().read() };
+    let send = unsafe { tail.add(size_of::<usize>()).cast::<Send>().read() };
+    let elapsed = unsafe { tail.add(2 * size_of::<usize>()).cast::<Elapsed>().read() };
+    let pcm = [-1.0, 0.0, 1.0];
+    let mut encoded = [42; 5];
+    unsafe {
+        assert_eq!(
+            prepare(pcm.as_ptr(), pcm.len(), encoded.as_mut_ptr(), 2),
+            -1
+        );
+        assert_eq!(encoded, [42; 5]);
+        assert_eq!(prepare(ptr::null(), 1, encoded.as_mut_ptr(), 5), -1);
+        assert_eq!(prepare(pcm.as_ptr(), pcm.len(), ptr::null_mut(), 5), -1);
+        assert_eq!(prepare(ptr::null(), 0, ptr::null_mut(), 0), 0);
+        assert_eq!(prepare(pcm.as_ptr(), pcm.len(), encoded.as_mut_ptr(), 5), 0);
+        assert_eq!(encoded, [0x00, 0xff, 0x80, 42, 42]);
+        assert_eq!(send(ptr::null_mut(), encoded.as_ptr(), 3, 1000), -1);
+        assert_eq!(elapsed(ptr::null()), 0);
+    }
+}
