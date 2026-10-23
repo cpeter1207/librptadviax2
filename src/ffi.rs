@@ -597,10 +597,18 @@ fn report_poll_error(peer: &mut IaxPeer, error: &DialError) {
         peer.remote_addr(),
         peer.elapsed_ms(),
     );
+    log_poll_error(&message);
+}
+
+/// Emit one already sanitized diagnostic on the serialized network owner.
+fn log_poll_error(message: &str) {
     #[cfg(test)]
-    tests::record_error(3, &message);
+    tests::record_error(3, message);
     #[cfg(unix)]
-    if let Ok(message) = std::ffi::CString::new(message) {
+    {
+        // Typed enums, numeric protocol fields, and SocketAddr contain no NUL.
+        let message =
+            std::ffi::CString::new(message).expect("sanitized IAX2 diagnostic contains no NUL");
         unsafe extern "C" {
             fn syslog(priority: std::ffi::c_int, format: *const std::ffi::c_char, ...);
         }
