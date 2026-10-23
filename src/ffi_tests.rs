@@ -142,40 +142,40 @@ fn remote_hangup_is_logged_but_requested_close_is_not() {
         ERROR_LOGS.with_borrow_mut(Vec::clear);
         if requested {
             assert_eq!(unsafe { hangup(peer) }, 0);
-        } else {
-            let packet = serialize_full_frame(
-                &FullFrameHeader {
-                    source_call_number: REMOTE_CALL,
-                    destination_call_number: LOCAL_CALL,
-                    retransmission: false,
-                    timestamp: 20,
-                    outgoing_sequence: 2,
-                    incoming_sequence: 1,
-                    frame_type: 6,
-                    subclass: 5,
-                    subclass_is_log: false,
-                },
-                &[],
-            )
-            .unwrap();
-            server.send_to(&packet, client).unwrap();
-            let (mut event, mut length) = (0, 0);
-            assert_eq!(
-                unsafe {
-                    poll(
-                        peer,
-                        ptr::null_mut(),
-                        0,
-                        ptr::null_mut(),
-                        0,
-                        &mut event,
-                        &mut length,
-                    )
-                },
-                0
-            );
-            assert_eq!(event, RPTADV_IAX2_EVENT_HANGUP);
         }
+        let packet = serialize_full_frame(
+            &FullFrameHeader {
+                source_call_number: REMOTE_CALL,
+                destination_call_number: LOCAL_CALL,
+                retransmission: false,
+                timestamp: 20,
+                outgoing_sequence: 2,
+                // A local HANGUP consumes our next reliable sequence position.
+                incoming_sequence: if requested { 2 } else { 1 },
+                frame_type: 6,
+                subclass: 5,
+                subclass_is_log: false,
+            },
+            &[],
+        )
+        .unwrap();
+        server.send_to(&packet, client).unwrap();
+        let (mut event, mut length) = (0, 0);
+        assert_eq!(
+            unsafe {
+                poll(
+                    peer,
+                    ptr::null_mut(),
+                    0,
+                    ptr::null_mut(),
+                    0,
+                    &mut event,
+                    &mut length,
+                )
+            },
+            0
+        );
+        assert_eq!(event, RPTADV_IAX2_EVENT_HANGUP);
         unsafe { destroy(peer) };
         let logs = ERROR_LOGS.with_borrow(|logs| logs.clone());
         assert_eq!(logs.len(), usize::from(!requested));

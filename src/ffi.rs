@@ -576,7 +576,7 @@ unsafe extern "C" fn poll(
     })
 }
 
-/// Log the first terminal cause before the C boundary reduces it to a status.
+/// Log the first terminal cause unless local hangup already suppressed it.
 /// Typed protocol details and OS error codes exclude packet bodies, audio and credentials.
 fn report_poll_error(peer: &mut IaxPeer, error: &DialError) {
     if std::mem::replace(&mut peer.poll_failure_reported, true) {
@@ -617,6 +617,7 @@ unsafe extern "C" fn hangup(peer: *mut c_void) -> i32 {
         let Some(peer) = (unsafe { peer.cast::<IaxPeer>().as_mut() }) else {
             return -1;
         };
+        peer.poll_failure_reported = true;
         peer.hangup().map_or_else(|_| -1, |_| 0)
     })
 }

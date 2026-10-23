@@ -128,7 +128,7 @@ pub struct IaxPeer {
     product_deadline: Option<Option<Instant>>,
     send_stats: SendStatistics,
     playout: Option<Playout>,
-    // The serialized owner reports only the first terminal polling cause.
+    // First terminal polling cause reported, or explicitly suppressed by local hangup.
     pub(crate) poll_failure_reported: bool,
 }
 
