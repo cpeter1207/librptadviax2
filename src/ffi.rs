@@ -556,6 +556,7 @@ unsafe extern "C" fn poll(
                 0
             }
             Ok(IaxPeerEvent::Hangup) => {
+                report_poll_error(peer, &DialError::Hangup);
                 *event_kind = RPTADV_IAX2_EVENT_HANGUP;
                 0
             }
@@ -567,9 +568,48 @@ unsafe extern "C" fn poll(
                 *event_kind = RPTADV_IAX2_EVENT_RADIO_UNKEY;
                 0
             }
-            Err(_) => -1,
+            Err(error) => {
+                report_poll_error(peer, &error);
+                -1
+            }
         }
     })
+}
+
+/// Log the first terminal cause before the C boundary reduces it to a status.
+/// Typed protocol details and OS error codes exclude packet bodies, audio and credentials.
+fn report_poll_error(peer: &mut IaxPeer, error: &DialError) {
+    if std::mem::replace(&mut peer.poll_failure_reported, true) {
+        return;
+    }
+    let detail = match error {
+        DialError::Network(error) => format!(
+            "Network {{ kind: {:?}, os_error: {:?} }}",
+            error.kind(),
+            error.raw_os_error()
+        ),
+        _ => format!("{error:?}"),
+    };
+    let message = format!(
+        "rpt-advanced IAX2 unexpected termination: local_call={} remote_call={} remote={} elapsed_ms={} poll_error={detail}",
+        peer.local_call_number(),
+        peer.remote_call_number(),
+        peer.remote_addr(),
+        peer.elapsed_ms(),
+    );
+    #[cfg(test)]
+    tests::record_error(3, &message);
+    #[cfg(unix)]
+    if let Ok(message) = std::ffi::CString::new(message) {
+        unsafe extern "C" {
+            fn syslog(priority: std::ffi::c_int, format: *const std::ffi::c_char, ...);
+        }
+        // SAFETY: constant format and a live NUL-terminated string match the C contract.
+        // LOG_ERR is 3; this runs only on the serialized network owner, never radio audio.
+        unsafe { syslog(3, c"%s".as_ptr(), message.as_ptr()) };
+    }
+    #[cfg(not(unix))]
+    eprintln!("ERROR: {message}");
 }
 
 unsafe extern "C" fn hangup(peer: *mut c_void) -> i32 {

@@ -128,6 +128,8 @@ pub struct IaxPeer {
     product_deadline: Option<Option<Instant>>,
     send_stats: SendStatistics,
     playout: Option<Playout>,
+    // The serialized owner reports only the first terminal polling cause.
+    pub(crate) poll_failure_reported: bool,
 }
 
 /// Exclusive peer-owner counters; send helpers borrow only the cell-backed fields.
@@ -468,6 +470,7 @@ impl IaxPeer {
             product_deadline: None,
             send_stats: SendStatistics::default(),
             playout: None,
+            poll_failure_reported: false,
         };
         Ok((peer, released))
     }
@@ -633,6 +636,8 @@ impl IaxPeer {
     ///
     /// This also advances retries for established reliable frames and applies cumulative ACKs
     /// from received full frames. Text/control acknowledgements are emitted internally.
+    /// Valid header-only voice frames retain their ACK/sequence semantics but deliver no
+    /// audio, jitter-buffer input, or receive-activity change.
     pub fn poll_event(
         &mut self,
         pcm: &mut [f32],
@@ -844,6 +849,11 @@ impl IaxPeer {
             }
             _ => return Err(DialError::Voice(VoiceFrameError::NotVoiceFrame)),
         };
+        // Header-only voice marks idle media. Full-frame sequence/ACK handling
+        // above still applies, but no samples or jitter time may be published.
+        if payload.is_empty() {
+            return Ok(IaxPeerEvent::None);
+        }
         if let Some(playout) = &mut self.playout {
             playout.put(timestamp, mini, arrived_at, payload)?;
             return Ok(IaxPeerEvent::None);
@@ -1145,6 +1155,7 @@ pub fn dial_ulaw(options: DialOptions<'_>) -> Result<IaxPeer, DialError> {
                     product_deadline: None,
                     send_stats: SendStatistics::default(),
                     playout: None,
+                    poll_failure_reported: false,
                 };
                 peer.wait_answer(deadline)?;
                 return Ok(peer);
