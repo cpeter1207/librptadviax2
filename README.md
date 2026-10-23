@@ -65,6 +65,11 @@ Packet-jitter buffering starts at 180 ms, with a 160 ms minimum and a 500 ms
 maximum. Valid voice resumes playout after a radio-unkey event even when the
 peer does not send another radio-key event.
 
+Validated empty voice packets do not enter audio playout. Unexpected peer
+termination writes one error with the local/remote call identifiers and protocol
+sequence state. Explicit local hangup and peer destruction do not log that error.
+Packet contents and authentication material are not included.
+
 The optional async table composes a host-supplied packet-jitter descriptor; the
 host retains that descriptor's dynamic library until peer destruction. Peers
 configured this way may emit event `RPTADV_IAX2_EVENT_GAP` (7), whose length is an

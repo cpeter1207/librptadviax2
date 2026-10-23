@@ -463,6 +463,7 @@ fn linked_peer(remote: SocketAddr) -> IaxPeer {
         product_deadline: None,
         send_stats: super::SendStatistics::default(),
         playout: None,
+        poll_failure_reported: false,
     }
 }
 
@@ -480,6 +481,128 @@ fn shared_peer(remote: SocketAddr) -> (IaxPeer, crate::ingress::IngressProducer)
     )
     .unwrap();
     (peer, producer)
+}
+
+#[test]
+fn empty_voice_preserves_sequence_without_entering_media_playout() {
+    use super::IaxPeerEvent;
+    use crate::protocol::{MiniFrameHeader, parse_full_frame_packet, serialize_mini_frame};
+
+    for jitter in [true, false] {
+        for full in [true, false] {
+            let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
+            remote.set_nonblocking(true).unwrap();
+            let mut peer = linked_peer(remote.local_addr().unwrap());
+            let fixture = crate::jitter::fixture::Fixture::new();
+            let origin = Instant::now();
+            let mut pcm = [42.0; 160];
+            let mut text = [42; 32];
+            let timestamp = (0x1_0000_0000 + 1000) * 8;
+            if jitter {
+                unsafe { peer.configure_jitter(fixture.descriptor()) }.unwrap();
+                let playout = peer.playout.as_mut().unwrap();
+                playout.unkey();
+                assert_eq!(
+                    playout.poll(origin, &mut pcm).unwrap(),
+                    IaxPeerEvent::RadioUnkey
+                );
+                fixture.packet(0, timestamp, &[0x80; 160], 0);
+                // The real jitter provider rejects zero-span packets.
+                fixture.admission(-1);
+            }
+            let mut header = FullFrameHeader {
+                source_call_number: 5678,
+                destination_call_number: 1234,
+                retransmission: false,
+                timestamp: 0xffff_0000,
+                outgoing_sequence: 1,
+                incoming_sequence: 1,
+                frame_type: 2,
+                subclass: 4,
+                subclass_is_log: false,
+            };
+            let marker = if full {
+                serialize_full_frame(&header, &[]).unwrap()
+            } else {
+                serialize_mini_frame(
+                    &MiniFrameHeader {
+                        source_call_number: 5678,
+                        timestamp: 0xffff,
+                    },
+                    &[],
+                )
+                .unwrap()
+            };
+            assert_eq!(
+                peer.receive_event(&marker, origin, &mut pcm, &mut text)
+                    .unwrap(),
+                IaxPeerEvent::None,
+                "empty voice is not media: jitter={jitter} full={full}"
+            );
+            assert_eq!(pcm, [42.0; 160]);
+            assert_eq!(text, [42; 32]);
+            assert!(fixture.puts().is_empty());
+            assert_eq!(
+                peer.poll_event(&mut pcm, &mut text).unwrap(),
+                IaxPeerEvent::None
+            );
+            assert!(
+                fixture.advances().is_empty(),
+                "idle marker must not reactivate playout"
+            );
+
+            let mut reply = [0; 1500];
+            let next = if full {
+                let length = remote.recv_from(&mut reply).unwrap().0;
+                let ack = parse_full_frame_packet(&reply[..length]).unwrap();
+                assert_eq!(
+                    (
+                        ack.header.frame_type,
+                        ack.header.subclass,
+                        ack.header.incoming_sequence
+                    ),
+                    (6, 4, 2)
+                );
+                2
+            } else {
+                assert_eq!(
+                    remote.recv_from(&mut reply).unwrap_err().kind(),
+                    std::io::ErrorKind::WouldBlock
+                );
+                1
+            };
+            fixture.admission(0);
+            header.timestamp = 1000;
+            header.outgoing_sequence = next;
+            let voice = serialize_full_frame(&header, &[0x80; 160]).unwrap();
+            let event = peer
+                .receive_event(&voice, origin, &mut pcm, &mut text)
+                .unwrap();
+            if jitter {
+                assert_eq!(event, IaxPeerEvent::None);
+                assert_eq!(
+                    peer.poll_event(&mut pcm, &mut text).unwrap(),
+                    IaxPeerEvent::Audio(160)
+                );
+                let puts = fixture.puts();
+                assert_eq!(puts.len(), 1);
+                assert_eq!((puts[0].0, puts[0].1), (timestamp, 160));
+            } else {
+                assert_eq!(event, IaxPeerEvent::Audio(160));
+            }
+            assert!(pcm.iter().all(|value| *value > 0.9));
+            header.outgoing_sequence += 1;
+            header.frame_type = 7;
+            header.subclass = 0;
+            let control = serialize_full_frame(&header, b"L").unwrap();
+            assert_eq!(
+                peer.receive_event(&control, origin, &mut pcm, &mut text)
+                    .unwrap(),
+                IaxPeerEvent::Text(1)
+            );
+            assert_eq!(text[0], b'L');
+        }
+    }
 }
 
 #[test]

@@ -1,3 +1,11 @@
+librptadviax2 (0.1.0~alpha8) unstable; urgency=medium
+
+  * Ignore validated empty voice packets without interrupting linked audio.
+  * Log the first unexpected peer termination with protocol sequence details.
+  * Preserve the existing client, async, and packet-jitter ABIs.
+
+ -- Chris Peterson <cpeter1207@users.noreply.github.com>  Fri, 23 Oct 2026 16:15:00 -0500
+
 librptadviax2 (0.1.0~alpha7) unstable; urgency=medium
 
   * Add prepared-media submission, readiness wake, and owner deadlines.
