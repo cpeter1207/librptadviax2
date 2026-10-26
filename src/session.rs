@@ -625,6 +625,10 @@ impl OutboundCallSetup {
         &mut self,
         header: &FullFrameHeader,
     ) -> Result<(bool, Vec<u8>), CallSetupError> {
+        self.validate_call_ids(header)?;
+        if self.is_old_frame(header) {
+            return Ok((false, self.acknowledgement(header, self.next_incoming)?));
+        }
         self.validate_peer_acknowledgement(header)?;
         if header.outgoing_sequence != self.next_incoming {
             return Ok((false, self.out_of_order_reply(header)?));
@@ -640,7 +644,11 @@ impl OutboundCallSetup {
         &mut self,
         header: &FullFrameHeader,
     ) -> Result<(bool, Vec<u8>), CallSetupError> {
-        // Validate identity and cumulative ACK independently from media arrival order.
+        // Old packets carry old ACKs too; do not validate or apply that credit.
+        self.validate_call_ids(header)?;
+        if self.is_old_frame(header) {
+            return Ok((false, self.acknowledgement(header, self.next_incoming)?));
+        }
         self.validate_peer_acknowledgement(header)?;
         let distance = header.outgoing_sequence.wrapping_sub(self.next_incoming);
         if distance >= 64 {
@@ -815,6 +823,11 @@ impl OutboundCallSetup {
             IaxCommand::Reject => self.reject(&frame.header, frame.payload),
             _ => Err(CallSetupError::UnexpectedCommand { command }),
         }
+    }
+
+    /// Whether a full frame belongs to the consumed modular half-range.
+    pub(crate) fn is_old_frame(&self, header: &FullFrameHeader) -> bool {
+        (1..128).contains(&self.next_incoming.wrapping_sub(header.outgoing_sequence))
     }
 
     /// Validate call identity and cumulative ACK without requiring arrival order.
@@ -1064,17 +1077,20 @@ impl OutboundCallSetup {
         payload: &[u8],
     ) -> Result<Option<Vec<u8>>, CallSetupError> {
         if self.state == State::Linked {
+            self.validate_call_ids(header)?;
             if command == Some(IaxCommand::Ack) {
                 return Ok(None);
             }
-            self.validate_peer_acknowledgement(header)?;
-            if header.outgoing_sequence == self.next_incoming {
-                // A fresh packet can reuse a cached sequence after wraparound.
-                return Ok(None);
-            }
-            if !header.retransmission
-                || self.next_incoming.wrapping_sub(header.outgoing_sequence) >= 128
-            {
+            if self.is_old_frame(header) {
+                if !header.retransmission {
+                    return self.out_of_order_reply(header).map(Some);
+                }
+            } else {
+                self.validate_peer_acknowledgement(header)?;
+                if header.outgoing_sequence == self.next_incoming {
+                    // A fresh packet can reuse a cached sequence after wraparound.
+                    return Ok(None);
+                }
                 return self.out_of_order_reply(header).map(Some);
             }
         } else if !header.retransmission {
@@ -1098,11 +1114,13 @@ impl OutboundCallSetup {
         Ok(None)
     }
 
-    /// Recover a non-current sequence after identity and ACK validation.
+    /// Recover a non-current sequence after validating its call identity.
     ///
     /// Use IAX's modular half-range to distinguish consumed packets from gaps.
     /// ACK old frames, or VNAK the first missing position; neither consumes a
-    /// sequence or delivers an event. The ambiguous half-range requests recovery.
+    /// sequence or delivers an event. Only future frames need current ACK
+    /// validation; old frames also carry obsolete ACKs. The ambiguous half-range
+    /// requests recovery.
     fn out_of_order_reply(&self, header: &FullFrameHeader) -> Result<Vec<u8>, CallSetupError> {
         if self.next_incoming.wrapping_sub(header.outgoing_sequence) < 128 {
             return self.acknowledgement(header, self.next_incoming);

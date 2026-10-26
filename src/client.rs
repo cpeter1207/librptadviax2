@@ -773,10 +773,16 @@ impl IaxPeer {
                     }
                     return Ok(IaxPeerEvent::None);
                 }
-                self.acknowledge_reliable_frames(frame.header.incoming_sequence);
+                // ACK itself is unsequenced; its OSeq never classifies its credit as old.
+                let old = decode_iax_command(&frame.header) != Ok(Some(IaxCommand::Ack))
+                    && self.setup.is_old_frame(&frame.header);
+                if !old {
+                    self.acknowledge_reliable_frames(frame.header.incoming_sequence);
+                }
                 // PING/LAGRQ replies consume a sequence. Leave the request for
                 // retransmission if the reliable window cannot retain that reply.
-                if frame.header.frame_type == 6
+                if !old
+                    && frame.header.frame_type == 6
                     && matches!(frame.header.subclass, 2 | 11)
                     && self.ensure_reliable_capacity().is_err()
                 {
@@ -858,13 +864,16 @@ impl IaxPeer {
                 && header.destination_call_number == self.local_call
                 && format == self.format =>
             {
+                let old = self.setup.is_old_frame(&header);
                 let (deliver, acknowledgement) = if self.playout.is_some() {
                     self.setup.receive_media_reordered(&header)
                 } else {
                     self.setup.receive_media(&header)
                 }
                 .map_err(DialError::Protocol)?;
-                self.acknowledge_reliable_frames(header.incoming_sequence);
+                if !old {
+                    self.acknowledge_reliable_frames(header.incoming_sequence);
+                }
                 self.send_reply(acknowledgement)?;
                 if !deliver {
                     return Ok(IaxPeerEvent::None);

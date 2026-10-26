@@ -110,6 +110,50 @@ fn interop_future_radio_control_requests_retransmission_and_preserves_event_orde
 }
 
 #[test]
+fn interop_old_frames_cannot_retire_sent_frames_or_be_blocked_by_the_send_window() {
+    let (mut peer, server) = interop_peer(false);
+    let client = std::net::SocketAddr::from(([127, 0, 0, 1], peer.local_addr().unwrap().port()));
+    let mut bytes = [0; 1500];
+    for _ in 0..64 {
+        peer.send_text(b"retained").unwrap();
+        server.recv_from(&mut bytes).unwrap();
+    }
+    for acknowledgement in [0, 65] {
+        for (frame_type, subclass) in [(6, 2), (2, 4), (10, 0)] {
+            // Consumed PING, voice and CNG have obsolete or impossible ACK
+            // fields. None can retire newer sends or be blocked by the full window.
+            let mut packet = frame(
+                REMOTE_CALL,
+                LOCAL_CALL,
+                1,
+                acknowledgement,
+                IaxCommand::Ping,
+                &[],
+            );
+            packet[10] = frame_type;
+            packet[11] = subclass;
+            server.send_to(&packet, client).unwrap();
+            thread::sleep(Duration::from_millis(10));
+            assert_eq!(
+                peer.poll_event(&mut [0.0; 160], &mut [0; 16]).unwrap(),
+                IaxPeerEvent::None
+            );
+            let (length, _) = server.recv_from(&mut bytes).unwrap();
+            let response = parse_full_frame_packet(&bytes[..length]).unwrap();
+            assert_eq!(
+                decode_iax_command(&response.header),
+                Ok(Some(IaxCommand::Ack))
+            );
+            assert_eq!(response.header.incoming_sequence, 2);
+            assert!(matches!(
+                peer.send_text(b"must stay full"),
+                Err(DialError::ReliableWindowFull)
+            ));
+        }
+    }
+}
+
+#[test]
 fn interop_vnak_retransmits_retained_frames_without_consuming_sequence_or_retry_budget() {
     let (mut peer, server) = interop_peer(false);
     let client = std::net::SocketAddr::from(([127, 0, 0, 1], peer.local_addr().unwrap().port()));

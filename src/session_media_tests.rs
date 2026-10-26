@@ -84,6 +84,48 @@ fn late_linked_control_is_acked_without_replaying_events_or_closing_the_call() {
 }
 
 #[test]
+fn old_frames_ignore_acknowledgements_outside_the_current_send_window() {
+    for incoming_sequence in [35, 101] {
+        for kind in 0..3 {
+            let mut session = OutboundCallSetup::for_inbound_call(1234, 5678).unwrap();
+            session.next_incoming = 12;
+            session.next_outgoing = 100;
+            let mut header = media(9);
+            header.incoming_sequence = incoming_sequence;
+            let acknowledgement = if kind == 0 {
+                header.frame_type = 4;
+                header.subclass = 13;
+                let response = session
+                    .receive_linked(&serialize_full_frame(&header, &[]).unwrap())
+                    .unwrap();
+                let LinkedCallResponse::Send(acknowledgement) = response else {
+                    panic!("consumed control must not deliver its event again");
+                };
+                acknowledgement
+            } else {
+                let (deliver, acknowledgement) = if kind == 1 {
+                    session.receive_media(&header)
+                } else {
+                    session.receive_media_reordered(&header)
+                }
+                .unwrap();
+                assert!(!deliver);
+                acknowledgement
+            };
+            let acknowledgement = parse_full_frame_packet(&acknowledgement).unwrap();
+            assert_eq!(
+                decode_iax_command(&acknowledgement.header),
+                Ok(Some(IaxCommand::Ack))
+            );
+            assert_eq!(acknowledgement.header.incoming_sequence, 12);
+            assert_eq!(session.next_incoming, 12);
+            assert_eq!(session.next_outgoing, 100);
+            assert_eq!(session.state, State::Linked);
+        }
+    }
+}
+
+#[test]
 fn future_linked_control_requests_the_missing_sequence_without_delivering_or_advancing() {
     for next in [248_u8, 198, 255, 0] {
         for distance in [1, 63, 64, 127, 128] {
@@ -144,11 +186,12 @@ fn out_of_order_control_still_validates_call_identity_and_acknowledgement() {
                 retransmission: true,
                 ..media(sequence)
             };
-            assert!(
-                session
-                    .receive_linked(&serialize_full_frame(&header, &[]).unwrap())
-                    .is_err()
-            );
+            let result = session.receive_linked(&serialize_full_frame(&header, &[]).unwrap());
+            if sequence == 9 && source == 5678 && destination == 1234 {
+                assert!(matches!(result, Ok(LinkedCallResponse::Send(_))));
+            } else {
+                assert!(result.is_err());
+            }
             assert_eq!(session.next_incoming, 12);
             assert_eq!(session.state, State::Linked);
         }

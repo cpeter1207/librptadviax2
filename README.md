@@ -70,7 +70,8 @@ termination writes one error with the local/remote call identifiers and protocol
 sequence state. Explicit local hangup and peer destruction do not log that error.
 Packet contents and authentication material are not included.
 
-Late full packets are acknowledged without repeating their events. A sequence
+Late full packets are acknowledged without repeating their events or applying
+their obsolete acknowledgement credit to newer sends. A sequence
 gap requests the missing frames with VNAK while the call stays connected.
 Incoming VNAK requests replay retained, sent frames without changing their
 normal retry limit or deadline. Call identity and acknowledgement checks still

@@ -200,12 +200,28 @@ fn too_many_events_before_answer_fails_with_a_bounded_queue() {
 }
 
 #[test]
-fn unsequenced_answer_never_returns_a_peer() {
+fn out_of_order_answer_waits_for_missing_frame_and_retransmission() {
     let (server, client, result) = dialing(Duration::from_secs(1));
     send_acked(&server, client, &accept());
     server.send_to(&packet(2, 4, 4, &[]), client).unwrap();
-    assert!(matches!(
-        result.recv_timeout(Duration::from_secs(1)).unwrap(),
-        Err(DialError::Timeout)
-    ));
+    let mut bytes = [0; 1500];
+    let (length, _) = server.recv_from(&mut bytes).unwrap();
+    let request = parse_full_frame_packet(&bytes[..length]).unwrap();
+    assert_eq!(
+        request.header.subclass,
+        IaxCommand::Vnak.subclass_value() as u8
+    );
+    assert_eq!(request.header.incoming_sequence, 1);
+    assert!(matches!(result.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    send_acked(&server, client, &packet(1, 7, 0, b"missing"));
+    send_acked(&server, client, &packet(2, 4, 4, &[]));
+    let mut peer = result
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        peer.poll_event(&mut [], &mut bytes).unwrap(),
+        IaxPeerEvent::Text(7)
+    );
+    assert_eq!(&bytes[..7], b"missing");
 }
