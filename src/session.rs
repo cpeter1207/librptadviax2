@@ -625,13 +625,10 @@ impl OutboundCallSetup {
         &mut self,
         header: &FullFrameHeader,
     ) -> Result<(bool, Vec<u8>), CallSetupError> {
-        self.validate_call_ids(header)?;
-        // The bounded reliable window makes older sequence positions unambiguous,
-        // even after an intervening control frame replaced the reply cache.
-        if (1..=64).contains(&self.next_incoming.wrapping_sub(header.outgoing_sequence)) {
-            return Ok((false, self.acknowledgement(header, self.next_incoming)?));
+        self.validate_peer_acknowledgement(header)?;
+        if header.outgoing_sequence != self.next_incoming {
+            return Ok((false, self.out_of_order_reply(header)?));
         }
-        self.validate_peer_header(header)?;
         let next_incoming = self.next_incoming.wrapping_add(1);
         let acknowledgement = self.acknowledgement(header, next_incoming)?;
         self.consume_incoming(next_incoming);
@@ -644,21 +641,10 @@ impl OutboundCallSetup {
         header: &FullFrameHeader,
     ) -> Result<(bool, Vec<u8>), CallSetupError> {
         // Validate identity and cumulative ACK independently from media arrival order.
-        self.validate_peer_header(&FullFrameHeader {
-            outgoing_sequence: self.next_incoming,
-            ..*header
-        })?;
-        if (1..=64).contains(&self.next_incoming.wrapping_sub(header.outgoing_sequence)) {
-            return Ok((false, self.acknowledgement(header, self.next_incoming)?));
-        }
+        self.validate_peer_acknowledgement(header)?;
         let distance = header.outgoing_sequence.wrapping_sub(self.next_incoming);
         if distance >= 64 {
-            return Err(CallSetupError::SequenceMismatch {
-                expected_outgoing: self.next_incoming,
-                actual_outgoing: header.outgoing_sequence,
-                expected_incoming: self.next_outgoing,
-                actual_incoming: header.incoming_sequence,
-            });
+            return Ok((false, self.out_of_order_reply(header)?));
         }
         let bit = 1u64 << distance;
         let deliver = self.received_media & bit == 0;
@@ -831,7 +817,11 @@ impl OutboundCallSetup {
         }
     }
 
-    fn validate_peer_header(&self, header: &FullFrameHeader) -> Result<(), CallSetupError> {
+    /// Validate call identity and cumulative ACK without requiring arrival order.
+    pub(crate) fn validate_peer_acknowledgement(
+        &self,
+        header: &FullFrameHeader,
+    ) -> Result<(), CallSetupError> {
         self.validate_call_ids(header)?;
         let valid_ack = if self.state == State::Linked {
             // ACK datagrams may overtake earlier voice/control. Accept bounded
@@ -840,15 +830,28 @@ impl OutboundCallSetup {
         } else {
             header.incoming_sequence == self.next_outgoing
         };
-        if header.outgoing_sequence != self.next_incoming || !valid_ack {
-            return Err(CallSetupError::SequenceMismatch {
-                expected_outgoing: self.next_incoming,
-                actual_outgoing: header.outgoing_sequence,
-                expected_incoming: self.next_outgoing,
-                actual_incoming: header.incoming_sequence,
-            });
+        if !valid_ack {
+            return Err(self.sequence_mismatch(header));
         }
         Ok(())
+    }
+
+    fn validate_peer_header(&self, header: &FullFrameHeader) -> Result<(), CallSetupError> {
+        self.validate_peer_acknowledgement(header)?;
+        if header.outgoing_sequence != self.next_incoming {
+            return Err(self.sequence_mismatch(header));
+        }
+        Ok(())
+    }
+
+    /// Preserve the actual received header in terminal sequence diagnostics.
+    fn sequence_mismatch(&self, header: &FullFrameHeader) -> CallSetupError {
+        CallSetupError::SequenceMismatch {
+            expected_outgoing: self.next_incoming,
+            actual_outgoing: header.outgoing_sequence,
+            expected_incoming: self.next_outgoing,
+            actual_incoming: header.incoming_sequence,
+        }
     }
 
     pub(crate) fn validate_call_ids(&self, header: &FullFrameHeader) -> Result<(), CallSetupError> {
@@ -1049,17 +1052,32 @@ impl OutboundCallSetup {
         })
     }
 
-    /// Replay the cached reply, or cumulatively ACK an older linked retry.
+    /// Replay a setup/reliable reply or recover linked sequence reordering.
     ///
     /// Intervening frames replace the one-entry reply cache, but do not make
-    /// an already consumed sequence new again. Never redeliver its event.
+    /// an already consumed sequence new again. Unmarked old packets are also
+    /// ACKed; future control requests retransmission without advancing state.
     fn duplicate_response(
         &self,
         header: &FullFrameHeader,
         command: Option<IaxCommand>,
         payload: &[u8],
     ) -> Result<Option<Vec<u8>>, CallSetupError> {
-        if !header.retransmission {
+        if self.state == State::Linked {
+            if command == Some(IaxCommand::Ack) {
+                return Ok(None);
+            }
+            self.validate_peer_acknowledgement(header)?;
+            if header.outgoing_sequence == self.next_incoming {
+                // A fresh packet can reuse a cached sequence after wraparound.
+                return Ok(None);
+            }
+            if !header.retransmission
+                || self.next_incoming.wrapping_sub(header.outgoing_sequence) >= 128
+            {
+                return self.out_of_order_reply(header).map(Some);
+            }
+        } else if !header.retransmission {
             return Ok(None);
         }
         if let Some(last) = self.last_reliable_response.as_ref().filter(|last| {
@@ -1074,14 +1092,30 @@ impl OutboundCallSetup {
             // Setup replies and PONG/LAGRP must retain their original sequence.
             return Ok(Some(last.response.clone()));
         }
-        if self.state == State::Linked
-            && command != Some(IaxCommand::Ack)
-            && (1..=64).contains(&self.next_incoming.wrapping_sub(header.outgoing_sequence))
-        {
-            self.validate_call_ids(header)?;
-            return self.acknowledgement(header, self.next_incoming).map(Some);
+        if self.state == State::Linked {
+            return self.out_of_order_reply(header).map(Some);
         }
         Ok(None)
+    }
+
+    /// Recover a non-current sequence after identity and ACK validation.
+    ///
+    /// Use IAX's modular half-range to distinguish consumed packets from gaps.
+    /// ACK old frames, or VNAK the first missing position; neither consumes a
+    /// sequence or delivers an event. The ambiguous half-range requests recovery.
+    fn out_of_order_reply(&self, header: &FullFrameHeader) -> Result<Vec<u8>, CallSetupError> {
+        if self.next_incoming.wrapping_sub(header.outgoing_sequence) < 128 {
+            return self.acknowledgement(header, self.next_incoming);
+        }
+        let mut reply = self.outgoing_header(
+            header.source_call_number,
+            header.timestamp,
+            self.next_incoming,
+            IaxCommand::Vnak.subclass_value() as u8,
+        );
+        // ASL3/Asterisk's unsequenced VNAK carries the missing position in both fields.
+        reply.outgoing_sequence = self.next_incoming;
+        serialize_full_frame(&reply, &[]).map_err(CallSetupError::Frame)
     }
 
     fn remember_response(

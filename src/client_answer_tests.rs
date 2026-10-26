@@ -206,8 +206,6 @@ fn unsequenced_answer_never_returns_a_peer() {
     server.send_to(&packet(2, 4, 4, &[]), client).unwrap();
     assert!(matches!(
         result.recv_timeout(Duration::from_secs(1)).unwrap(),
-        Err(DialError::Protocol(
-            crate::session::CallSetupError::SequenceMismatch { .. }
-        ))
+        Err(DialError::Timeout)
     ));
 }

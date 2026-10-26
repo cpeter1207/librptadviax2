@@ -68,6 +68,109 @@ fn interop_setup_ack_waits_for_accept_without_retrying_new() {
 }
 
 #[test]
+fn interop_future_radio_control_requests_retransmission_and_preserves_event_order() {
+    let (mut peer, server) = interop_peer(false);
+    let client = std::net::SocketAddr::from(([127, 0, 0, 1], peer.local_addr().unwrap().port()));
+    let mut bytes = [0; 1500];
+    let mut samples = [0.0; 160];
+    let mut text = [0; 16];
+    // The UNKEY overtakes KEY: request the missing sequence without delivering
+    // either an early unkey or a synthetic hangup to the controller.
+    for (sequence, subclass, retry, expected, reply, next_sequence) in [
+        (3, 13, false, IaxPeerEvent::None, IaxCommand::Vnak, 2),
+        (2, 12, false, IaxPeerEvent::RadioKey, IaxCommand::Ack, 3),
+        (3, 13, true, IaxPeerEvent::RadioUnkey, IaxCommand::Ack, 4),
+    ] {
+        let mut control = frame(REMOTE_CALL, LOCAL_CALL, sequence, 1, IaxCommand::Ack, &[]);
+        control[10] = 4;
+        control[11] = subclass;
+        if retry {
+            control[2] |= 0x80;
+        }
+        server.send_to(&control, client).unwrap();
+        thread::sleep(Duration::from_millis(10));
+        assert_eq!(peer.poll_event(&mut samples, &mut text).unwrap(), expected);
+        let (length, _) = server.recv_from(&mut bytes).unwrap();
+        let response = parse_full_frame_packet(&bytes[..length]).unwrap();
+        assert_eq!(decode_iax_command(&response.header).unwrap(), Some(reply));
+        assert_eq!(response.header.incoming_sequence, next_sequence);
+        if reply == IaxCommand::Vnak {
+            assert_eq!(response.header.outgoing_sequence, 2);
+            assert!(!response.header.retransmission);
+        }
+    }
+    peer.send_text(b"still linked").unwrap();
+    let (length, _) = server.recv_from(&mut bytes).unwrap();
+    let sent = parse_full_frame_packet(&bytes[..length]).unwrap();
+    assert_eq!(
+        (sent.header.outgoing_sequence, sent.header.incoming_sequence),
+        (1, 4)
+    );
+    assert_eq!(sent.payload, b"still linked");
+}
+
+#[test]
+fn interop_vnak_retransmits_retained_frames_without_consuming_sequence_or_retry_budget() {
+    let (mut peer, server) = interop_peer(false);
+    let client = std::net::SocketAddr::from(([127, 0, 0, 1], peer.local_addr().unwrap().port()));
+    let mut bytes = [0; 1500];
+    let mut samples = [0.0; 160];
+    let mut text = [0; 16];
+    for payload in [b"first".as_slice(), b"second", b"third"] {
+        peer.send_text(payload).unwrap();
+        server.recv_from(&mut bytes).unwrap();
+    }
+    peer.set_product_deadline(u64::MAX).unwrap();
+    // Retire only the first retained frame before recording the real protocol
+    // deadline. An ACK's outgoing sequence is intentionally unsequenced.
+    server
+        .send_to(
+            &frame(REMOTE_CALL, LOCAL_CALL, 199, 2, IaxCommand::Ack, &[]),
+            client,
+        )
+        .unwrap();
+    thread::sleep(Duration::from_millis(10));
+    assert_eq!(
+        peer.poll_event(&mut samples, &mut text).unwrap(),
+        IaxPeerEvent::None
+    );
+    let retry_deadline = peer.wait_state().deadline;
+    assert!(retry_deadline.is_some());
+    // More requests than the normal retry limit must not consume that budget.
+    // VNAK requests sequence 2 inclusively and never retransmits retired 1.
+    for outgoing in [200, 2, 255, 0, 127, 128] {
+        server
+            .send_to(
+                &frame(REMOTE_CALL, LOCAL_CALL, outgoing, 2, IaxCommand::Vnak, &[]),
+                client,
+            )
+            .unwrap();
+        thread::sleep(Duration::from_millis(10));
+        assert_eq!(
+            peer.poll_event(&mut samples, &mut text).unwrap(),
+            IaxPeerEvent::None
+        );
+        for (sequence, payload) in [(2, b"second".as_slice()), (3, b"third".as_slice())] {
+            let (length, _) = server.recv_from(&mut bytes).unwrap();
+            let resent = parse_full_frame_packet(&bytes[..length]).unwrap();
+            assert_eq!(resent.header.outgoing_sequence, sequence);
+            assert_eq!(resent.header.incoming_sequence, 2);
+            assert!(resent.header.retransmission);
+            assert_eq!(resent.payload, payload);
+        }
+        assert_eq!(peer.wait_state().deadline, retry_deadline);
+    }
+    peer.send_text(b"fourth").unwrap();
+    let (length, _) = server.recv_from(&mut bytes).unwrap();
+    let sent = parse_full_frame_packet(&bytes[..length]).unwrap();
+    assert_eq!(
+        (sent.header.outgoing_sequence, sent.header.incoming_sequence),
+        (4, 2)
+    );
+    assert_eq!(sent.payload, b"fourth");
+}
+
+#[test]
 fn interop_lag_probe_echoes_timestamp_and_preserves_following_voice() {
     let (mut peer, server) = interop_peer(false);
     let destination =

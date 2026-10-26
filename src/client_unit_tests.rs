@@ -443,6 +443,149 @@ fn egress_blocked_send_has_a_bounded_unchanging_failure_deadline() {
     ));
 }
 
+#[test]
+fn vnak_rejects_invalid_identity_ack_or_payload_before_retiring_frames() {
+    for (source, destination, acknowledgement, payload, error) in [
+        (5679, 1234_u16, 2, &b""[..], 0),
+        (5678, 1235, 2, &b""[..], 1),
+        (5678, 1234, 3, &b""[..], 2),
+        (5678, 1234, 193, &b""[..], 2),
+        (5678, 1234, 2, &b"invalid"[..], 3),
+    ] {
+        let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut peer = linked_peer(remote.local_addr().unwrap());
+        peer.send_text(b"retained").unwrap();
+        remote.recv_from(&mut [0; 1500]).unwrap();
+        let original = &peer.pending_reliable[0];
+        let state = (original.next_retry, original.expires_at, original.retries);
+        let mut request = vnak_packet(acknowledgement);
+        request[..2].copy_from_slice(&(0x8000_u16 | source).to_be_bytes());
+        request[2..4].copy_from_slice(&destination.to_be_bytes());
+        request.extend_from_slice(payload);
+        let Err(DialError::Protocol(actual)) =
+            peer.receive_event(&request, Instant::now(), &mut [], &mut [])
+        else {
+            panic!("invalid VNAK must be rejected before changing the send window");
+        };
+        use crate::session::CallSetupError;
+        assert!(matches!(
+            (error, actual),
+            (0, CallSetupError::WrongSourceCall { .. })
+                | (1, CallSetupError::WrongDestinationCall { .. })
+                | (2, CallSetupError::SequenceMismatch { .. })
+                | (3, CallSetupError::InvalidFrame)
+        ));
+        assert_eq!(peer.pending_reliable.len(), 1);
+        let retained = &peer.pending_reliable[0];
+        assert_eq!(
+            (retained.next_retry, retained.expires_at, retained.retries),
+            state
+        );
+        assert!(peer.pending_replies.is_empty());
+    }
+}
+
+#[test]
+fn vnak_backpressure_bounds_replay_copies_without_changing_reliable_state() {
+    let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
+    remote
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    let address = remote.local_addr().unwrap();
+    let mut peer = linked_peer(address);
+    let mut bytes = [0; 1500];
+    for payload in [b"first".as_slice(), b"second"] {
+        peer.send_text(payload).unwrap();
+        remote.recv_from(&mut bytes).unwrap();
+    }
+    for pending in &mut peer.pending_reliable {
+        pending.next_retry = Instant::now();
+    }
+    peer.retry_reliable_frames().unwrap();
+    for _ in 0..2 {
+        remote.recv_from(&mut bytes).unwrap();
+    }
+    let fault = SendFault::set(address, std::io::ErrorKind::WouldBlock);
+    peer.send_text(b"unsent third").unwrap();
+    let before: Vec<_> = peer
+        .pending_reliable
+        .iter()
+        .map(|frame| {
+            (
+                frame.next_retry,
+                frame.expires_at,
+                frame.retry_interval,
+                frame.retries,
+                frame.sent,
+            )
+        })
+        .collect();
+    // This valid-width but impossible ACK cannot retire the unsent third frame.
+    // Its request must also not replay the earlier, already-sent positions.
+    assert_eq!(
+        peer.receive_event(&vnak_packet(4), Instant::now(), &mut [], &mut [])
+            .unwrap(),
+        super::IaxPeerEvent::None
+    );
+    assert_eq!(peer.pending_reliable.len(), 3);
+    assert!(peer.pending_replies.is_empty());
+    for _ in 0..=super::MAX_RELIABLE_WINDOW {
+        assert_eq!(
+            peer.receive_event(&vnak_packet(2), Instant::now(), &mut [], &mut [])
+                .unwrap(),
+            super::IaxPeerEvent::None
+        );
+    }
+    assert_eq!(peer.pending_replies.len(), super::MAX_RELIABLE_WINDOW);
+    assert_eq!(peer.pending_reliable.len(), 2);
+    for (retained, original) in peer.pending_reliable.iter().zip(&before[1..]) {
+        assert_eq!(
+            (
+                retained.next_retry,
+                retained.expires_at,
+                retained.retry_interval,
+                retained.retries,
+                retained.sent
+            ),
+            *original
+        );
+    }
+    drop(fault);
+    peer.flush_replies().unwrap();
+    assert!(peer.pending_replies.is_empty());
+    for _ in 0..super::MAX_RELIABLE_WINDOW {
+        let length = remote.recv_from(&mut bytes).unwrap().0;
+        let packet = crate::protocol::parse_full_frame_packet(&bytes[..length]).unwrap();
+        assert_eq!(packet.header.outgoing_sequence, 2);
+        assert!(packet.header.retransmission);
+        assert_eq!(packet.payload, b"second");
+    }
+    peer.retry_reliable_frames().unwrap();
+    let length = remote.recv_from(&mut bytes).unwrap().0;
+    let packet = crate::protocol::parse_full_frame_packet(&bytes[..length]).unwrap();
+    assert_eq!(packet.header.outgoing_sequence, 3);
+    assert!(!packet.header.retransmission);
+    assert_eq!(packet.payload, b"unsent third");
+}
+
+fn vnak_packet(incoming_sequence: u8) -> Vec<u8> {
+    serialize_full_frame(
+        &FullFrameHeader {
+            source_call_number: 5678,
+            retransmission: false,
+            destination_call_number: 1234,
+            timestamp: 100,
+            outgoing_sequence: 42,
+            incoming_sequence,
+            frame_type: 6,
+            subclass: 18,
+            subclass_is_log: false,
+        },
+        &[],
+    )
+    .unwrap()
+}
+
 fn linked_peer(remote: SocketAddr) -> IaxPeer {
     IaxPeer {
         endpoint: PeerEndpoint::Dedicated(UdpEndpoint::bind(wildcard_for(remote.ip())).unwrap()),

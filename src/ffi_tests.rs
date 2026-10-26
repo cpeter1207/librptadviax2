@@ -36,7 +36,7 @@ fn unexpected_poll_failure_logs_the_actual_sequence_error_without_payloads() {
             destination_call_number: LOCAL_CALL,
             timestamp: 20,
             outgoing_sequence: 17,
-            incoming_sequence: 1,
+            incoming_sequence: 2,
             frame_type: 7,
             subclass: 0,
             subclass_is_log: false,

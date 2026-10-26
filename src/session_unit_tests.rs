@@ -417,18 +417,10 @@ fn delayed_retry_window_preserves_validation_and_never_acknowledges_ack() {
             .incoming_sequence,
         65
     );
-    for (source, destination, sequence, retry) in [
-        (78, 1, 1, true),
-        (77, 2, 1, true),
-        (77, 1, 0, true),
-        (77, 1, 66, true),
-        (77, 1, 1, false),
-    ] {
+    for (source, destination) in [(78, 1), (77, 2)] {
         let invalid = FullFrameHeader {
             source_call_number: source,
             destination_call_number: destination,
-            outgoing_sequence: sequence,
-            retransmission: retry,
             ..header
         };
         assert!(

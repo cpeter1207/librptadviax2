@@ -7,7 +7,7 @@ use crate::{
     media::{VoiceFrame, VoiceFrameEncodeError, VoiceFrameError, parse_voice_frame},
     network::{SharedSocket, UdpEndpoint},
     playout::Playout,
-    protocol::parse_full_frame_packet,
+    protocol::{IaxCommand, decode_iax_command, parse_full_frame_packet},
     session::{CallSetupError, LinkedCallResponse, OutboundCallSetup, OutboundSetupResponse},
 };
 use std::{
@@ -637,7 +637,8 @@ impl IaxPeer {
     /// This also advances retries for established reliable frames and applies cumulative ACKs
     /// from received full frames. Text/control acknowledgements are emitted internally.
     /// Valid header-only voice frames retain their ACK/sequence semantics but deliver no
-    /// audio, jitter-buffer input, or receive-activity change.
+    /// audio, jitter-buffer input, or receive-activity change. Old full frames
+    /// are acknowledged without delivery; sequence gaps request retransmission.
     pub fn poll_event(
         &mut self,
         pcm: &mut [f32],
@@ -744,6 +745,34 @@ impl IaxPeer {
                 self.setup
                     .validate_call_ids(&frame.header)
                     .map_err(DialError::Protocol)?;
+                if decode_iax_command(&frame.header) == Ok(Some(IaxCommand::Vnak)) {
+                    self.setup
+                        .validate_peer_acknowledgement(&frame.header)
+                        .map_err(DialError::Protocol)?;
+                    if !frame.payload.is_empty() {
+                        return Err(DialError::Protocol(CallSetupError::InvalidFrame));
+                    }
+                    self.acknowledge_reliable_frames(frame.header.incoming_sequence);
+                    // VNAK is unsequenced. Replay only already-sent retained
+                    // frames, without spending/resetting their timed retry budget.
+                    let packets = self
+                        .pending_reliable
+                        .iter()
+                        .filter(|pending| {
+                            pending.sent
+                                && pending
+                                    .outgoing_sequence
+                                    .wrapping_sub(frame.header.incoming_sequence)
+                                    < 128
+                        })
+                        .map(|pending| self.setup.retransmit(&pending.packet))
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(DialError::Protocol)?;
+                    for packet in packets {
+                        self.send_reply(packet)?;
+                    }
+                    return Ok(IaxPeerEvent::None);
+                }
                 self.acknowledge_reliable_frames(frame.header.incoming_sequence);
                 // PING/LAGRQ replies consume a sequence. Leave the request for
                 // retransmission if the reliable window cannot retain that reply.

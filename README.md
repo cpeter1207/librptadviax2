@@ -70,6 +70,12 @@ termination writes one error with the local/remote call identifiers and protocol
 sequence state. Explicit local hangup and peer destruction do not log that error.
 Packet contents and authentication material are not included.
 
+Late full packets are acknowledged without repeating their events. A sequence
+gap requests the missing frames with VNAK while the call stays connected.
+Incoming VNAK requests replay retained, sent frames without changing their
+normal retry limit or deadline. Call identity and acknowledgement checks still
+apply. This recovery does not change packet-jitter or PCM buffering settings.
+
 The optional async table composes a host-supplied packet-jitter descriptor; the
 host retains that descriptor's dynamic library until peer destruction. Peers
 configured this way may emit event `RPTADV_IAX2_EVENT_GAP` (7), whose length is an
