@@ -599,10 +599,15 @@ fn future_sequence_hangup_cannot_retire_an_unreleased_peer_route() {
     assert!(listener.route_existing(remote, &future));
     let packet = consumer.try_pop().unwrap();
     let mut protocol = OutboundCallSetup::for_inbound_call(22, 42).unwrap();
-    assert!(matches!(
-        protocol.receive_linked(packet.payload()),
-        Err(crate::session::CallSetupError::SequenceMismatch { .. })
-    ));
+    let crate::session::LinkedCallResponse::Send(reply) =
+        protocol.receive_linked(packet.payload()).unwrap()
+    else {
+        panic!("future hangup must request recovery, not terminate")
+    };
+    assert_eq!(
+        decode_iax_command(&parse_full_frame_packet(&reply).unwrap().header),
+        Ok(Some(IaxCommand::Vnak))
+    );
     listener.reap_released_routes().unwrap();
     assert_eq!(listener.ingress_stats().active_routes, 1);
     assert_eq!(listener.routes.len(), 1);

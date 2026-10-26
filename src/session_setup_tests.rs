@@ -889,10 +889,26 @@ fn validates_each_peer_sequence_field_and_duplicate_identity() {
 #[test]
 fn validates_both_incoming_and_outgoing_sequence_numbers() {
     let mut setup = OutboundCallSetup::new(LOCAL_CALL, 0, &initial_elements()).unwrap();
-    assert!(matches!(
-        setup.receive(&incoming(IaxCommand::Accept, 0, 0, &[]), 1, "secret"),
-        Err(CallSetupError::SequenceMismatch { .. })
-    ));
+    for (outgoing_sequence, incoming_sequence) in [(0, 0), (1, 1)] {
+        assert_eq!(
+            setup.receive(
+                &incoming(
+                    IaxCommand::Accept,
+                    outgoing_sequence,
+                    incoming_sequence,
+                    &[]
+                ),
+                1,
+                "secret"
+            ),
+            Err(CallSetupError::SequenceMismatch {
+                expected_outgoing: 0,
+                actual_outgoing: outgoing_sequence,
+                expected_incoming: 1,
+                actual_incoming: incoming_sequence,
+            })
+        );
+    }
 }
 
 #[test]
