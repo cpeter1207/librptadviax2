@@ -124,8 +124,6 @@ pub struct IaxPeer {
     pending_events: VecDeque<PendingEvent>,
     answered: bool,
     voice_epoch: Option<u32>,
-    // Last automatic send time and next 8 kHz sample position within its burst.
-    voice_clock: Option<(u32, u64)>,
     release_on_drop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     async_attached: bool,
     // None preserves polling for callers that never supply scheduling deadlines.
@@ -474,7 +472,6 @@ impl IaxPeer {
             pending_events: VecDeque::new(),
             answered: true,
             voice_epoch: None,
-            voice_clock: None,
             release_on_drop: Some(std::sync::Arc::clone(&released)),
             async_attached: false,
             product_deadline: None,
@@ -546,21 +543,6 @@ impl IaxPeer {
             .elapsed()
             .as_millis()
             .min(u128::from(u32::MAX)) as u32
-    }
-
-    /// Timestamp continuous PCM by sample count, not executor wakeup time.
-    /// Empty audio ends the burst. A gap over Asterisk's 160 ms timestamp-skew
-    /// allowance also reanchors callers that do not send an explicit idle marker.
-    /// Only successful sends advance the clock; fractional milliseconds are retained.
-    pub(crate) fn send_audio(&mut self, pcm: &[f32]) -> Result<(), DialError> {
-        let now = self.elapsed_ms();
-        let sample = self
-            .voice_clock
-            .filter(|(sent, _)| now.wrapping_sub(*sent) <= 160)
-            .map_or(u64::from(now) * 8, |(_, next)| next);
-        self.send_ulaw(pcm, (sample / 8) as u32)?;
-        self.voice_clock = (!pcm.is_empty()).then_some((now, sample + pcm.len() as u64));
-        Ok(())
     }
 
     /// Establish codec and timestamp epoch with full voice; use mini frames within that epoch.
@@ -1331,7 +1313,6 @@ fn dial_composed(
                     pending_events: VecDeque::new(),
                     answered: false,
                     voice_epoch: None,
-                    voice_clock: None,
                     release_on_drop: None,
                     async_attached: false,
                     product_deadline: None,

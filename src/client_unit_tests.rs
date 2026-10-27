@@ -166,6 +166,74 @@ fn egress_ack_cannot_retire_unsent_frame() {
 }
 
 #[test]
+fn egress_abi2_encoder_retains_partial_input_and_preserves_a_short_g711_tail() {
+    use crate::codec::providers::EncodeResultRaw;
+    let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let mut peer = linked_peer(remote.local_addr().unwrap());
+    let api = unsafe { &*crate::ffi::rptadv_iax2_client_descriptor_v2() };
+    let handle = (&mut peer as *mut IaxPeer).cast();
+    let mut encoded = [0x55; 160];
+    let mut result = EncodeResultRaw {
+        struct_size: std::mem::size_of::<EncodeResultRaw>() as u32,
+        ..Default::default()
+    };
+    for (input, capacity, flush, status, consumed, bytes, start, real) in [
+        (37, 160, 0, 1, 37, 0, 0, 0),
+        (123, 159, 0, 2, 0, 0, 0, 0),
+        (123, 160, 0, 0, 123, 160, 0, 160),
+        (3, 160, 0, 1, 3, 0, 0, 0),
+        (0, 160, 1, 0, 0, 3, 160, 3),
+    ] {
+        let pcm = vec![0.25; input];
+        assert_eq!(
+            unsafe {
+                api.prepare_audio.unwrap()(
+                    handle,
+                    pcm.as_ptr(),
+                    pcm.len(),
+                    encoded.as_mut_ptr(),
+                    capacity,
+                    flush,
+                    &mut result,
+                )
+            },
+            status
+        );
+        assert_eq!(result.status, status as u32);
+        assert_eq!(
+            (result.consumed_frames, result.encoded_bytes),
+            (consumed, bytes)
+        );
+        if bytes != 0 {
+            assert_eq!(
+                (
+                    result.source_start_frames,
+                    result.source_frames,
+                    result.packet_frames
+                ),
+                (start, real, bytes as u32)
+            );
+        }
+    }
+    assert_eq!(unsafe { api.reset_encoder.unwrap()(handle) }, 0);
+    assert_eq!(
+        unsafe {
+            api.prepare_audio.unwrap()(
+                handle,
+                [0.25; 160].as_ptr(),
+                160,
+                encoded.as_mut_ptr(),
+                160,
+                0,
+                &mut result,
+            )
+        },
+        0
+    );
+    assert_eq!(result.source_start_frames, 0);
+}
+
+#[test]
 fn egress_idle_marker_waits_for_full_voice_and_socket_recovery() {
     let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
     remote
@@ -173,16 +241,16 @@ fn egress_idle_marker_waits_for_full_voice_and_socket_recovery() {
         .unwrap();
     let address = remote.local_addr().unwrap();
     let mut peer = linked_peer(address);
-    let api = unsafe { &*crate::ffi::rptadv_iax2_client_descriptor_v1() };
-    let send = api.send_prepared_ulaw.unwrap();
+    let api = unsafe { &*crate::ffi::rptadv_iax2_client_descriptor_v2() };
+    let send = api.send_prepared_audio.unwrap();
     let handle = (&mut peer as *mut IaxPeer).cast();
     let payload = [0xff; 160];
     let fault = SendFault::set(address, std::io::ErrorKind::WouldBlock);
     assert_eq!(
-        unsafe { send(handle, payload.as_ptr(), payload.len(), 100) },
+        unsafe { send(handle, payload.as_ptr(), payload.len(), 160, 100) },
         0
     );
-    assert_eq!(unsafe { send(handle, payload.as_ptr(), 0, 120) }, 1);
+    assert_eq!(unsafe { send(handle, payload.as_ptr(), 0, 0, 120) }, 1);
     assert_eq!(peer.pending_reliable.len(), 1);
 
     let healthy = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -205,9 +273,9 @@ fn egress_idle_marker_waits_for_full_voice_and_socket_recovery() {
         payload
     );
     let fault = SendFault::set(address, std::io::ErrorKind::WouldBlock);
-    assert_eq!(unsafe { send(handle, payload.as_ptr(), 0, 120) }, 1);
+    assert_eq!(unsafe { send(handle, payload.as_ptr(), 0, 0, 120) }, 1);
     drop(fault);
-    assert_eq!(unsafe { send(handle, payload.as_ptr(), 0, 120) }, 0);
+    assert_eq!(unsafe { send(handle, payload.as_ptr(), 0, 0, 120) }, 0);
     let count = remote.recv_from(&mut bytes).unwrap().0;
     assert_eq!(&bytes[..count], &[4, 210, 0, 120]);
 }
@@ -354,14 +422,15 @@ fn egress_prepared_oversize_is_rejected_before_committing_protocol_state() {
     let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
     remote.set_nonblocking(true).unwrap();
     let mut peer = linked_peer(remote.local_addr().unwrap());
-    let api = unsafe { &*crate::ffi::rptadv_iax2_client_descriptor_v1() };
+    let api = unsafe { &*crate::ffi::rptadv_iax2_client_descriptor_v2() };
     let payload = vec![0xff; super::MAX_PACKET_SIZE];
     assert_eq!(
         unsafe {
-            api.send_prepared_ulaw.unwrap()(
+            api.send_prepared_audio.unwrap()(
                 (&mut peer as *mut IaxPeer).cast(),
                 payload.as_ptr(),
                 payload.len(),
+                payload.len() as u32,
                 100,
             )
         },
@@ -587,7 +656,7 @@ fn vnak_packet(incoming_sequence: u8) -> Vec<u8> {
 }
 
 fn linked_peer(remote: SocketAddr) -> IaxPeer {
-    IaxPeer {
+    let mut peer = IaxPeer {
         endpoint: PeerEndpoint::Dedicated(UdpEndpoint::bind(wildcard_for(remote.ip())).unwrap()),
         remote,
         local_call: 1234,
@@ -601,14 +670,15 @@ fn linked_peer(remote: SocketAddr) -> IaxPeer {
         pending_events: VecDeque::new(),
         answered: true,
         voice_epoch: None,
-        voice_clock: None,
         release_on_drop: None,
         async_attached: false,
         product_deadline: None,
         send_stats: super::SendStatistics::default(),
         playout: None,
         poll_failure_reported: false,
-    }
+    };
+    peer.compose_codec(crate::ffi::test_peer_catalog()).unwrap();
+    peer
 }
 
 fn shared_peer(remote: SocketAddr) -> (IaxPeer, crate::ingress::IngressProducer) {
@@ -862,7 +932,7 @@ fn ffi_gap_is_a_sample_count_without_pcm_or_text_writes() {
     let fixture = crate::jitter::fixture::Fixture::new();
     unsafe { peer.configure_jitter(fixture.descriptor()) }.unwrap();
     fixture.packet(0, 1000, &[0x80; 80], 20);
-    let descriptor = unsafe { &*crate::ffi::rptadv_iax2_client_descriptor_v1() };
+    let descriptor = unsafe { &*crate::ffi::rptadv_iax2_client_descriptor_v2() };
     let mut pcm = [42.0; 160];
     let mut text = [42; 32];
     let mut kind = u32::MAX;
@@ -1031,170 +1101,6 @@ fn jitter_composition_is_once_before_attach_and_requires_gap_aware_polling() {
         Err(DialError::InvalidOptions)
     ));
     assert!(attached.playout.is_none());
-}
-
-#[test]
-fn interop_ffi_contiguous_audio_keeps_sample_timestamps_during_send_jitter() {
-    let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
-    remote
-        .set_read_timeout(Some(Duration::from_secs(1)))
-        .unwrap();
-    let mut peer = linked_peer(remote.local_addr().unwrap());
-    let descriptor = unsafe { &*crate::ffi::rptadv_iax2_client_descriptor_v1() };
-    let samples = [0.25; 160];
-    let mut packet = [0; 1500];
-    let mut timestamps = Vec::new();
-    // One delayed owner turn drains three consecutive 20 ms media blocks.
-    for elapsed in [1000, 1070, 1070, 1070] {
-        peer.connected_at = Instant::now() - Duration::from_millis(elapsed);
-        assert_eq!(
-            unsafe {
-                descriptor.send_audio.unwrap()(
-                    (&mut peer as *mut IaxPeer).cast(),
-                    samples.as_ptr(),
-                    samples.len(),
-                )
-            },
-            0
-        );
-        let (length, _) = remote.recv_from(&mut packet).unwrap();
-        let (timestamp, payload) =
-            match crate::media::parse_voice_frame(&packet[..length], IAX_FORMAT_ULAW).unwrap() {
-                crate::media::VoiceFrame::Full {
-                    header, payload, ..
-                } => (header.timestamp, payload),
-                crate::media::VoiceFrame::Mini {
-                    header, payload, ..
-                } => (u32::from(header.timestamp), payload),
-            };
-        assert_eq!(payload.len(), 160);
-        timestamps.push(timestamp);
-    }
-    let first = timestamps[0];
-    assert_eq!(timestamps, [first, first + 20, first + 40, first + 60]);
-}
-
-#[test]
-fn interop_ffi_sample_clock_preserves_fractional_samples_bursts_wrap_and_failures() {
-    for (name, next_sample, steps) in [
-        (
-            "fractional samples",
-            None,
-            &[
-                (3, 0, 0, true),
-                (3, 0, 0, false),
-                (3, 0, 0, false),
-                (3, 0, 1, false),
-            ][..],
-        ),
-        (
-            "mini timestamp epoch",
-            Some(65_530 * 8),
-            &[
-                (80, 0, 65_530, true),
-                (80, 0, 65_540, true),
-                (80, 0, 14, false),
-            ][..],
-        ),
-        (
-            "failed send",
-            None,
-            &[
-                (super::MAX_PACKET_SIZE, -1, 0, false),
-                (160, 0, 0, true),
-                (super::MAX_PACKET_SIZE, -1, 0, false),
-                (160, 0, 20, false),
-            ][..],
-        ),
-        (
-            "empty burst marker",
-            Some(1000 * 8),
-            &[
-                (160, 0, 1000, true),
-                (0, 0, 1020, false),
-                (160, 0, 0, false),
-            ][..],
-        ),
-    ] {
-        let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
-        remote
-            .set_read_timeout(Some(Duration::from_secs(1)))
-            .unwrap();
-        let mut peer = linked_peer(remote.local_addr().unwrap());
-        // Pin elapsed call time at zero while exercising nonzero media positions.
-        peer.connected_at = Instant::now() + Duration::from_secs(3600);
-        peer.voice_clock = next_sample.map(|sample| (0, sample));
-        let descriptor = unsafe { &*crate::ffi::rptadv_iax2_client_descriptor_v1() };
-        let samples = vec![0.25; super::MAX_PACKET_SIZE];
-        let mut packet = [0; super::MAX_PACKET_SIZE];
-        for &(count, result, expected_timestamp, expected_full) in steps {
-            assert_eq!(
-                unsafe {
-                    descriptor.send_audio.unwrap()(
-                        (&mut peer as *mut IaxPeer).cast(),
-                        samples.as_ptr(),
-                        count,
-                    )
-                },
-                result,
-                "{name}"
-            );
-            if result != 0 {
-                continue;
-            }
-            let (length, _) = remote.recv_from(&mut packet).unwrap();
-            let (timestamp, payload, full) = match crate::media::parse_voice_frame(
-                &packet[..length],
-                IAX_FORMAT_ULAW,
-            )
-            .unwrap()
-            {
-                crate::media::VoiceFrame::Full {
-                    header, payload, ..
-                } => (header.timestamp, payload, true),
-                crate::media::VoiceFrame::Mini {
-                    header, payload, ..
-                } => (u32::from(header.timestamp), payload, false),
-            };
-            assert_eq!(
-                (timestamp, full, payload.len()),
-                (expected_timestamp, expected_full, count),
-                "{name}"
-            );
-        }
-    }
-}
-
-#[test]
-fn interop_ffi_preserves_delayed_first_voice_and_silent_gap_timestamp_epochs() {
-    let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
-    remote
-        .set_read_timeout(Some(Duration::from_secs(1)))
-        .unwrap();
-    let mut peer = linked_peer(remote.local_addr().unwrap());
-    let descriptor = unsafe { &*crate::ffi::rptadv_iax2_client_descriptor_v1() };
-    let samples = [0.0; 160];
-    let mut packet = [0; 1500];
-    for elapsed in [70020, 140040] {
-        peer.connected_at = Instant::now() - Duration::from_millis(elapsed);
-        assert_eq!(
-            unsafe {
-                descriptor.send_audio.unwrap()(
-                    (&mut peer as *mut IaxPeer).cast(),
-                    samples.as_ptr(),
-                    samples.len(),
-                )
-            },
-            0
-        );
-        let (length, _) = remote.recv_from(&mut packet).unwrap();
-        let voice = crate::protocol::parse_full_frame_packet(&packet[..length])
-            .expect("new epoch requires full voice");
-        assert!(
-            (elapsed..elapsed + 1000).contains(&u64::from(voice.header.timestamp)),
-            "full voice must retain elapsed epoch"
-        );
-    }
 }
 
 #[test]

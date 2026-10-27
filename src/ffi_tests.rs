@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
     call_token::retry_new_call_with_token,
-    codec::{CodecError, IAX_FORMAT_ULAW},
+    codec::CodecError,
     information_elements::InformationElement,
     media::{VoiceFrameEncodeError, VoiceFrameError},
     protocol::{FullFrameHeader, encode_subclass, serialize_full_frame, serialize_mini_frame},
@@ -202,9 +202,9 @@ fn options<'a>(
     local: &'a [u8],
     destination: &'a [u8],
     secret: &'a [u8],
-) -> rptadv_iax2_dial_options_v1 {
-    rptadv_iax2_dial_options_v1 {
-        struct_size: size_of::<rptadv_iax2_dial_options_v1>() as u32,
+) -> rptadv_iax2_dial_options_v2 {
+    rptadv_iax2_dial_options_v2 {
+        struct_size: size_of::<rptadv_iax2_dial_options_v2>() as u32,
         abi_version: RPTADV_IAX2_CLIENT_ABI_VERSION,
         remote_address: remote.as_ptr(),
         remote_address_length: remote.len(),
@@ -217,17 +217,19 @@ fn options<'a>(
         secret: secret.as_ptr(),
         secret_length: secret.len(),
         timeout_ms: 100,
+        catalog: test_catalog(),
     }
 }
 
-fn server_options<'a>(address: &'a [u8], local_nodes: &'a [u8]) -> rptadv_iax2_server_options_v1 {
-    rptadv_iax2_server_options_v1 {
-        struct_size: size_of::<rptadv_iax2_server_options_v1>() as u32,
+fn server_options<'a>(address: &'a [u8], local_nodes: &'a [u8]) -> rptadv_iax2_server_options_v2 {
+    rptadv_iax2_server_options_v2 {
+        struct_size: size_of::<rptadv_iax2_server_options_v2>() as u32,
         abi_version: RPTADV_IAX2_SERVER_ABI_VERSION,
         bind_address: address.as_ptr(),
         bind_address_length: address.len(),
         local_nodes: local_nodes.as_ptr(),
         local_nodes_length: local_nodes.len(),
+        catalog: test_catalog(),
     }
 }
 
@@ -262,6 +264,10 @@ fn inbound_setup(local_call: u16) -> OutboundCallSetup {
 }
 
 fn establish() -> (*mut c_void, UdpSocket, SocketAddr) {
+    establish_profile(ProfileId::G711Mu)
+}
+
+fn establish_profile(profile: ProfileId) -> (*mut c_void, UdpSocket, SocketAddr) {
     let server = UdpSocket::bind("127.0.0.1:0").unwrap();
     server
         .set_read_timeout(Some(Duration::from_secs(1)))
@@ -271,6 +277,12 @@ fn establish() -> (*mut c_void, UdpSocket, SocketAddr) {
         let mut packet = [0; 1500];
         let (length, client) = server.recv_from(&mut packet).unwrap();
         assert!(length > 12);
+        let mut formats = Vec::new();
+        crate::formats::append_formats(
+            &mut formats,
+            crate::formats::IaxFormat::for_profile(profile).0,
+            None,
+        );
         let accept = serialize_full_frame(
             &FullFrameHeader {
                 source_call_number: REMOTE_CALL,
@@ -284,7 +296,7 @@ fn establish() -> (*mut c_void, UdpSocket, SocketAddr) {
                     .unwrap(),
                 subclass_is_log: false,
             },
-            &[9, 4, 0, 0, 0, IAX_FORMAT_ULAW as u8],
+            &formats,
         )
         .unwrap();
         server.send_to(&accept, client).unwrap();
@@ -302,7 +314,27 @@ fn establish() -> (*mut c_void, UdpSocket, SocketAddr) {
     let local = b"524950";
     let destination = b"506315";
     let secret = b"";
-    let dial_options = options(remote.as_bytes(), local, destination, secret);
+    let directory = PathBuf::from(std::env::var_os("RPTADV_CODEC_DIR").unwrap_or_default());
+    let backend = if profile == ProfileId::Opus {
+        "opus"
+    } else {
+        "g711"
+    };
+    let catalog = Arc::new(
+        FormatCatalog::new(
+            Arc::new(
+                CodecCatalog::load(&[ProviderSelection {
+                    path: directory.join(format!("librptadv_codec_{backend}.so.1")),
+                    profiles: vec![profile],
+                }])
+                .unwrap(),
+            ),
+            &[profile],
+        )
+        .unwrap(),
+    );
+    let mut dial_options = options(remote.as_bytes(), local, destination, secret);
+    dial_options.catalog = ptr::from_ref(&catalog).cast();
     let mut peer = ptr::null_mut();
     assert_eq!(unsafe { dial(&dial_options, &mut peer) }, 0);
     let (server, client) = responder.join().unwrap();
@@ -364,13 +396,14 @@ unsafe extern "C" fn accept_and_destroy(
 fn inbound_product_callbacks_receive_source_ip_without_udp_port() {
     let bind_address = b"127.0.0.1:0";
     let local_nodes = b"524950";
-    let options = rptadv_iax2_server_options_v1 {
-        struct_size: size_of::<rptadv_iax2_server_options_v1>() as u32,
+    let options = rptadv_iax2_server_options_v2 {
+        struct_size: size_of::<rptadv_iax2_server_options_v2>() as u32,
         abi_version: RPTADV_IAX2_SERVER_ABI_VERSION,
         bind_address: bind_address.as_ptr(),
         bind_address_length: bind_address.len(),
         local_nodes: local_nodes.as_ptr(),
         local_nodes_length: local_nodes.len(),
+        catalog: test_catalog(),
     };
     let mut handle = ptr::null_mut();
     assert_eq!(unsafe { server_bind(&options, &mut handle) }, 0);
@@ -487,10 +520,10 @@ fn inbound_product_callbacks_receive_source_ip_without_udp_port() {
 
 #[test]
 fn descriptor_and_null_handles_have_stable_results() {
-    let descriptor = unsafe { &*rptadv_iax2_client_descriptor_v1() };
+    let descriptor = unsafe { &*rptadv_iax2_client_descriptor_v2() };
     assert_eq!(descriptor.abi_version, RPTADV_IAX2_CLIENT_ABI_VERSION);
     assert_eq!(descriptor.capability, RPTADV_IAX2_CLIENT_CAPABILITY);
-    let server_descriptor = unsafe { &*rptadv_iax2_server_descriptor_v1() };
+    let server_descriptor = unsafe { &*rptadv_iax2_server_descriptor_v2() };
     assert_eq!(
         server_descriptor.abi_version,
         RPTADV_IAX2_SERVER_ABI_VERSION
@@ -501,7 +534,7 @@ fn descriptor_and_null_handles_have_stable_results() {
     assert!(server_descriptor.set_local_nodes.is_some());
     assert!(server_descriptor.destroy.is_some());
     assert_eq!(unsafe { sample_rate_hz(ptr::null()) }, 0);
-    assert_eq!(unsafe { send_audio(ptr::null_mut(), ptr::null(), 0) }, -1);
+    assert_eq!(unsafe { reset_encoder(ptr::null_mut()) }, -1);
     assert_eq!(unsafe { send_text(ptr::null_mut(), ptr::null(), 0) }, -1);
     assert_eq!(unsafe { send_digit(ptr::null_mut(), b'7') }, -1);
     assert_eq!(unsafe { hangup(ptr::null_mut()) }, -1);
@@ -743,10 +776,21 @@ fn dial_error_codes_and_slice_boundaries_are_explicit() {
 fn c_peer_api_reports_events_and_rejects_invalid_buffers() {
     let (peer, server, client) = establish();
     assert_eq!(unsafe { sample_rate_hz(peer) }, 8_000);
-    assert_eq!(unsafe { send_audio(peer, ptr::null(), 1) }, -1);
-    let oversized_pcm = vec![0.0_f32; crate::ingress::MAX_DATAGRAM_SIZE + 1];
     assert_eq!(
-        unsafe { send_audio(peer, oversized_pcm.as_ptr(), oversized_pcm.len()) },
+        unsafe { send_prepared_audio(peer, ptr::null(), 1, 1, 0) },
+        -1
+    );
+    let oversized_pcm = vec![0xff; crate::ingress::MAX_DATAGRAM_SIZE + 1];
+    assert_eq!(
+        unsafe {
+            send_prepared_audio(
+                peer,
+                oversized_pcm.as_ptr(),
+                oversized_pcm.len(),
+                oversized_pcm.len() as u32,
+                0,
+            )
+        },
         -1
     );
     assert_eq!(unsafe { send_text(peer, ptr::null(), 1) }, -1);
@@ -1039,33 +1083,134 @@ fn c_peer_api_rejects_dtmf_without_text_storage() {
     unsafe { destroy(peer) };
 }
 #[test]
-fn egress_descriptor_tail_and_prepared_codec() {
-    use std::{ffi::c_void, mem::size_of, ptr};
-    type Prepare = unsafe extern "C" fn(*const f32, usize, *mut u8, usize) -> i32;
-    type Send = unsafe extern "C" fn(*mut c_void, *const u8, usize, u32) -> i32;
-    type Elapsed = unsafe extern "C" fn(*const c_void) -> u32;
-    let api = super::rptadv_iax2_client_descriptor_v1();
-    // Read only the stable prefix until its declared size admits the new tail.
-    assert!(unsafe { (*api).struct_size } as usize >= 24 + 11 * size_of::<usize>());
-    assert_eq!(unsafe { (*api).abi_version }, 1);
-    let tail = unsafe { api.cast::<u8>().add(24 + size_of::<[usize; 8]>()) };
-    let prepare = unsafe { tail.cast::<Prepare>().read() };
-    let send = unsafe { tail.add(size_of::<usize>()).cast::<Send>().read() };
-    let elapsed = unsafe { tail.add(2 * size_of::<usize>()).cast::<Elapsed>().read() };
-    let pcm = [-1.0, 0.0, 1.0];
-    let mut encoded = [42; 5];
+fn native_plc_output_capacity_is_retryable_not_a_peer_failure() {
+    let (handle, _server, _) = establish_profile(ProfileId::Opus);
+    let peer = unsafe { &mut *handle.cast::<IaxPeer>() };
+    let fixture = crate::jitter::fixture::Fixture::new();
+    fixture.gap(0, 48000, 960, false);
+    unsafe { peer.configure_jitter(fixture.descriptor()) }.unwrap();
+    let (mut event, mut length) = (99, 99);
+    let mut pcm = [0.75; 960];
+    ERROR_LOGS.with_borrow_mut(Vec::clear);
     unsafe {
         assert_eq!(
-            prepare(pcm.as_ptr(), pcm.len(), encoded.as_mut_ptr(), 2),
+            poll(
+                handle,
+                pcm.as_mut_ptr(),
+                959,
+                ptr::null_mut(),
+                0,
+                &mut event,
+                &mut length
+            ),
+            1
+        );
+        assert_eq!((event, length), (RPTADV_IAX2_EVENT_NONE, 960));
+        assert_eq!(pcm, [0.75; 960]);
+        assert!(fixture.advances().is_empty());
+        assert_eq!(
+            poll(
+                handle,
+                pcm.as_mut_ptr(),
+                960,
+                ptr::null_mut(),
+                0,
+                &mut event,
+                &mut length
+            ),
+            0
+        );
+        assert_eq!((event, length), (RPTADV_IAX2_EVENT_AUDIO, 960));
+        assert_eq!(fixture.advances().len(), 1);
+        assert!(ERROR_LOGS.with_borrow(|logs| logs.is_empty()));
+        destroy(handle);
+    }
+}
+
+#[test]
+fn egress_abi2_layout_and_prepared_codec() {
+    let api = unsafe { &*super::rptadv_iax2_client_descriptor_v2() };
+    assert_eq!(api.struct_size as usize, 24 + 13 * size_of::<usize>());
+    assert_eq!(api.abi_version, 2);
+    let (peer, _server, _) = establish();
+    let prepare = api.prepare_audio.unwrap();
+    let pcm = [-1.0, 0.0, 1.0];
+    let mut encoded = [42; 5];
+    let mut result = EncodeResultRaw {
+        struct_size: size_of::<EncodeResultRaw>() as u32,
+        ..Default::default()
+    };
+    unsafe {
+        assert_eq!(
+            prepare(
+                peer,
+                pcm.as_ptr(),
+                3,
+                encoded.as_mut_ptr(),
+                2,
+                1,
+                &mut result
+            ),
+            2
+        );
+        assert_eq!(result.required_capacity, 3);
+        assert_eq!(result.consumed_frames, 0);
+        assert_eq!(encoded, [42; 5]);
+        assert_eq!(
+            prepare(
+                peer,
+                ptr::null(),
+                1,
+                encoded.as_mut_ptr(),
+                5,
+                1,
+                &mut result
+            ),
             -1
         );
-        assert_eq!(encoded, [42; 5]);
-        assert_eq!(prepare(ptr::null(), 1, encoded.as_mut_ptr(), 5), -1);
-        assert_eq!(prepare(pcm.as_ptr(), pcm.len(), ptr::null_mut(), 5), -1);
-        assert_eq!(prepare(ptr::null(), 0, ptr::null_mut(), 0), 0);
-        assert_eq!(prepare(pcm.as_ptr(), pcm.len(), encoded.as_mut_ptr(), 5), 0);
+        assert_eq!(
+            prepare(peer, pcm.as_ptr(), 3, ptr::null_mut(), 5, 1, &mut result),
+            -1
+        );
+        assert_eq!(
+            prepare(
+                peer,
+                pcm.as_ptr(),
+                3,
+                encoded.as_mut_ptr(),
+                5,
+                1,
+                ptr::null_mut()
+            ),
+            -1
+        );
+        assert_eq!(
+            prepare(
+                peer,
+                pcm.as_ptr(),
+                3,
+                encoded.as_mut_ptr(),
+                5,
+                1,
+                &mut result
+            ),
+            0
+        );
         assert_eq!(encoded, [0x00, 0xff, 0x80, 42, 42]);
-        assert_eq!(send(ptr::null_mut(), encoded.as_ptr(), 3, 1000), -1);
-        assert_eq!(elapsed(ptr::null()), 0);
+        assert_eq!(
+            (
+                result.source_start_frames,
+                result.source_frames,
+                result.packet_frames
+            ),
+            (0, 3, 3)
+        );
+        assert_eq!(
+            prepare(peer, ptr::null(), 0, ptr::null_mut(), 0, 1, &mut result),
+            0
+        );
+        assert_eq!(result.encoded_bytes, 0);
+        assert_eq!(api.elapsed_ms.unwrap()(ptr::null()), 0);
+        destroy(peer);
     }
 }

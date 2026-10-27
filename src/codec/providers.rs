@@ -21,7 +21,9 @@ type RawProfile = abi::rptadv_codec_profile_v1;
 type RawMode = abi::rptadv_codec_mode_v1;
 type RawConfig = abi::rptadv_codec_config_v1;
 type RawPacket = abi::rptadv_codec_packet_info_v1;
-type RawEncoded = abi::rptadv_codec_encode_result_v1;
+/// Installed neutral result layout shared with the external IAX client table.
+pub use abi::rptadv_codec_encode_result_v1 as EncodeResultRaw;
+type RawEncoded = EncodeResultRaw;
 
 /// Stable neutral identity, independent of any protocol format bit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -112,6 +114,17 @@ pub enum Status {
     Failed,
 }
 impl Status {
+    /// Common provider ABI status, not a protocol-specific error code.
+    pub fn as_raw(self) -> u32 {
+        match self {
+            Self::Complete => 0,
+            Self::NeedInput => 1,
+            Self::OutputFull => 2,
+            Self::Malformed => 3,
+            Self::Unsupported => 4,
+            Self::Failed => 5,
+        }
+    }
     fn from_raw(value: i32) -> Self {
         match value {
             0 => Self::Complete,

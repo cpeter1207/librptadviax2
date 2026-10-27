@@ -3,7 +3,7 @@ use crate::{
     codec::{CodecAdapter, G711Ulaw, IAX_FORMAT_ULAW, ULAW_SAMPLE_RATE_HZ},
     ffi::{
         RPTADV_IAX2_CLIENT_ABI_VERSION, RPTADV_IAX2_EVENT_AUDIO, RPTADV_IAX2_EVENT_NONE,
-        RPTADV_IAX2_EVENT_TEXT, rptadv_iax2_client_descriptor_v1, rptadv_iax2_dial_options_v1,
+        RPTADV_IAX2_EVENT_TEXT, rptadv_iax2_client_descriptor_v2, rptadv_iax2_dial_options_v2,
     },
     information_elements::{InformationElement, serialize_information_elements},
     media::{VoiceFrame, parse_voice_frame},
@@ -974,8 +974,8 @@ fn dials_an_8khz_ulaw_call_through_calltoken_and_md5_authentication() {
     let local_node = b"524950";
     let remote_node = b"506315";
     let secret = b"test-secret";
-    let options = rptadv_iax2_dial_options_v1 {
-        struct_size: std::mem::size_of::<rptadv_iax2_dial_options_v1>() as u32,
+    let options = rptadv_iax2_dial_options_v2 {
+        struct_size: std::mem::size_of::<rptadv_iax2_dial_options_v2>() as u32,
         abi_version: RPTADV_IAX2_CLIENT_ABI_VERSION,
         remote_address: remote_address.as_ptr(),
         remote_address_length: remote_address.len(),
@@ -988,16 +988,45 @@ fn dials_an_8khz_ulaw_call_through_calltoken_and_md5_authentication() {
         secret: secret.as_ptr(),
         secret_length: secret.len(),
         timeout_ms: 1000,
+        catalog: crate::ffi::test_catalog(),
     };
-    let descriptor = unsafe { &*rptadv_iax2_client_descriptor_v1() };
+    let descriptor = unsafe { &*rptadv_iax2_client_descriptor_v2() };
     let mut peer: *mut c_void = ptr::null_mut();
     assert_eq!(unsafe { descriptor.dial.unwrap()(&options, &mut peer) }, 0);
     assert!(!peer.is_null());
     assert_eq!(unsafe { descriptor.sample_rate_hz.unwrap()(peer) }, 8_000);
 
     let outbound = [0.25_f32; 160];
+    let mut encoded = [0; 160];
+    let mut result = crate::codec::providers::EncodeResultRaw {
+        struct_size: std::mem::size_of::<crate::codec::providers::EncodeResultRaw>() as u32,
+        ..Default::default()
+    };
     assert_eq!(
-        unsafe { descriptor.send_audio.unwrap()(peer, outbound.as_ptr(), outbound.len()) },
+        unsafe {
+            descriptor.prepare_audio.unwrap()(
+                peer,
+                outbound.as_ptr(),
+                outbound.len(),
+                encoded.as_mut_ptr(),
+                encoded.len(),
+                0,
+                &mut result,
+            )
+        },
+        0
+    );
+    assert_eq!(result.consumed_frames, outbound.len());
+    assert_eq!(
+        unsafe {
+            descriptor.send_prepared_audio.unwrap()(
+                peer,
+                encoded.as_ptr(),
+                result.encoded_bytes,
+                result.packet_frames,
+                0,
+            )
+        },
         0
     );
     let mut received = [0.0; 160];

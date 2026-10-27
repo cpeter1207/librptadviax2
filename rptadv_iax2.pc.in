@@ -6,5 +6,6 @@ Name: rptadv-iax2-client
 Description: Versioned standalone IAX2 client ABI
 Version: @VERSION@
 Libs: -L${libdir} -lrptadviax2
+Requires: rptadv_codec
 Cflags: -I${includedir}
 abi_version=@ABI_VERSION@

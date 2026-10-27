@@ -19,6 +19,6 @@ fn main() {
         .write_to_file(PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("codec_abi.rs"))
         .expect("write neutral codec ABI bindings");
     if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
-        println!("cargo:rustc-cdylib-link-arg=-Wl,-soname,librptadviax2.so.1");
+        println!("cargo:rustc-cdylib-link-arg=-Wl,-soname,librptadviax2.so.2");
     }
 }
