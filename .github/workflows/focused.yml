@@ -1,0 +1,18 @@
+name: Focused IAX verification
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact IAX feature commit to measure
+        required: true
+        type: string
+permissions:
+  contents: read
+  packages: read
+jobs:
+  coverage:
+    uses: cpeter1207/rptadv-shared-library-workflows/.github/workflows/codec-focused.yml@ci/codec-provider-image
+    with:
+      repository: librptadviax2
+      source_sha: ${{ inputs.source_sha }}
+      target: coverage
