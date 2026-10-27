@@ -37,8 +37,37 @@ const MAX_EARLY_EVENTS: usize = 64;
 
 struct PendingEvent {
     event: IaxPeerEvent,
-    pcm: Vec<f32>,
+    pcm: PacketPcm,
     text: Vec<u8>,
+}
+
+/// One wholly decoded packet, released in caller-sized chunks without decoding twice.
+#[derive(Default)]
+struct PacketPcm {
+    samples: Vec<f32>,
+    position: usize,
+}
+impl PacketPcm {
+    fn remaining(&self) -> usize {
+        self.samples.len() - self.position
+    }
+
+    fn render(&mut self, output: &mut [f32]) -> Result<Option<usize>, DialError> {
+        if self.remaining() == 0 {
+            return Ok(None);
+        }
+        if output.is_empty() {
+            return Err(DialError::Provider(crate::codec::providers::Error {
+                status: crate::codec::providers::Status::OutputFull,
+                required_capacity: 1,
+                operation: "pending packet PCM",
+            }));
+        }
+        let count = self.remaining().min(output.len());
+        output[..count].copy_from_slice(&self.samples[self.position..self.position + count]);
+        self.position += count;
+        Ok(Some(count))
+    }
 }
 
 struct PendingReliableFrame {
@@ -122,6 +151,7 @@ pub struct IaxPeer {
     pending_reliable: VecDeque<PendingReliableFrame>,
     pending_replies: VecDeque<Vec<u8>>,
     pending_events: VecDeque<PendingEvent>,
+    direct_pcm: PacketPcm,
     answered: bool,
     voice_epoch: Option<u32>,
     release_on_drop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
@@ -470,6 +500,7 @@ impl IaxPeer {
             pending_reliable: VecDeque::new(),
             pending_replies: VecDeque::new(),
             pending_events: VecDeque::new(),
+            direct_pcm: PacketPcm::default(),
             answered: true,
             voice_epoch: None,
             release_on_drop: Some(std::sync::Arc::clone(&released)),
@@ -709,14 +740,18 @@ impl IaxPeer {
         pcm: &mut [f32],
         text: &mut [u8],
     ) -> Result<IaxPeerEvent, DialError> {
-        if let Some(pending) = self.pending_events.front() {
-            if pending.pcm.len() > pcm.len()
-                || pending.text.len() > text.len()
+        if let Some(pending) = self.pending_events.front_mut() {
+            if let Some(count) = pending.pcm.render(pcm)? {
+                if pending.pcm.remaining() == 0 {
+                    self.pending_events.pop_front();
+                }
+                return Ok(IaxPeerEvent::Audio(count));
+            }
+            if pending.text.len() > text.len()
                 || (matches!(pending.event, IaxPeerEvent::Digit(_)) && text.is_empty())
             {
                 return Err(DialError::InvalidOptions);
             }
-            pcm[..pending.pcm.len()].copy_from_slice(&pending.pcm);
             text[..pending.text.len()].copy_from_slice(&pending.text);
             return Ok(self.pending_events.pop_front().expect("front exists").event);
         }
@@ -740,9 +775,12 @@ impl IaxPeer {
                     }
                     self.pending_events.push_back(PendingEvent {
                         event,
-                        pcm: match event {
-                            IaxPeerEvent::Audio(count) => pcm[..count].to_vec(),
-                            _ => Vec::new(),
+                        pcm: PacketPcm {
+                            samples: match event {
+                                IaxPeerEvent::Audio(count) => pcm[..count].to_vec(),
+                                _ => Vec::new(),
+                            },
+                            position: 0,
                         },
                         text: match event {
                             IaxPeerEvent::Text(count) => text[..count].to_vec(),
@@ -762,6 +800,9 @@ impl IaxPeer {
     ) -> Result<IaxPeerEvent, DialError> {
         self.retry_reliable_frames()?;
         self.flush_replies()?;
+        if let Some(count) = self.direct_pcm.render(pcm)? {
+            return Ok(IaxPeerEvent::Audio(count));
+        }
         // Admit the bounded receive batch before advancing packet time. Otherwise
         // executor batching would masquerade as network loss in already due media.
         for _ in 0..MAX_RELIABLE_WINDOW {
@@ -977,14 +1018,25 @@ impl IaxPeer {
                     Ok(IaxPeerEvent::None)
                 }
                 Err(error) => Err(DialError::Provider(error)),
-                Ok(info) => match codecs
-                    .decoder
-                    .decode_recovering(payload, pcm)
-                    .map_err(DialError::Provider)?
-                {
-                    0 => Ok(IaxPeerEvent::Gap(info.frames as usize)),
-                    frames => Ok(IaxPeerEvent::Audio(frames)),
-                },
+                Ok(info) => {
+                    let required = info.frames as usize;
+                    self.direct_pcm
+                        .samples
+                        .try_reserve(required.saturating_sub(self.direct_pcm.samples.len()))
+                        .map_err(|_| DialError::InvalidOptions)?;
+                    self.direct_pcm.samples.resize(required, 0.0);
+                    self.direct_pcm.position = required;
+                    let frames = codecs
+                        .decoder
+                        .decode_recovering(payload, &mut self.direct_pcm.samples)
+                        .map_err(DialError::Provider)?;
+                    self.direct_pcm.samples.truncate(frames);
+                    self.direct_pcm.position = 0;
+                    match self.direct_pcm.render(pcm)? {
+                        Some(count) => Ok(IaxPeerEvent::Audio(count)),
+                        None => Ok(IaxPeerEvent::Gap(required)),
+                    }
+                }
             },
             None => G711Ulaw
                 .decode(payload, pcm)
@@ -1311,6 +1363,7 @@ fn dial_composed(
                     pending_reliable: VecDeque::new(),
                     pending_replies: VecDeque::new(),
                     pending_events: VecDeque::new(),
+                    direct_pcm: PacketPcm::default(),
                     answered: false,
                     voice_epoch: None,
                     release_on_drop: None,

@@ -668,6 +668,7 @@ fn linked_peer(remote: SocketAddr) -> IaxPeer {
         pending_reliable: VecDeque::new(),
         pending_replies: VecDeque::new(),
         pending_events: VecDeque::new(),
+        direct_pcm: super::PacketPcm::default(),
         answered: true,
         voice_epoch: None,
         release_on_drop: None,
@@ -695,6 +696,65 @@ fn shared_peer(remote: SocketAddr) -> (IaxPeer, crate::ingress::IngressProducer)
     )
     .unwrap();
     (peer, producer)
+}
+
+#[test]
+fn ingress_large_direct_codec_packet_is_decoded_once_and_drained_in_caller_chunks() {
+    use super::IaxPeerEvent;
+    let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let mut peer = linked_peer(remote.local_addr().unwrap());
+    let voice = crate::protocol::serialize_mini_frame(
+        &crate::protocol::MiniFrameHeader {
+            source_call_number: 5678,
+            timestamp: 20,
+        },
+        &[0x80; 2000],
+    )
+    .unwrap();
+    let mut pcm = [0.0; 160];
+    assert_eq!(
+        peer.receive_event(&voice, Instant::now(), &mut pcm, &mut [])
+            .unwrap(),
+        IaxPeerEvent::Audio(160)
+    );
+    let mut total = 160;
+    while let IaxPeerEvent::Audio(count) = peer.poll_event(&mut pcm, &mut []).unwrap() {
+        assert!(count <= pcm.len());
+        assert!(pcm[..count].iter().all(|sample| *sample > 0.9));
+        total += count;
+    }
+    assert_eq!(total, 2000);
+}
+
+#[test]
+fn ingress_pending_early_audio_can_be_read_with_smaller_buffers() {
+    let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let mut peer = linked_peer(remote.local_addr().unwrap());
+    peer.pending_events.push_back(super::PendingEvent {
+        event: super::IaxPeerEvent::Audio(480),
+        pcm: super::PacketPcm {
+            samples: vec![0.25; 480],
+            position: 0,
+        },
+        text: Vec::new(),
+    });
+    assert!(
+        matches!(peer.poll_event(&mut [], &mut []), Err(DialError::Provider(error)) if error.required_capacity == 1)
+    );
+    assert_eq!(peer.pending_events.len(), 1);
+    for _ in 0..3 {
+        let mut pcm = [0.0; 160];
+        assert_eq!(
+            peer.poll_event(&mut pcm, &mut []).unwrap(),
+            super::IaxPeerEvent::Audio(160)
+        );
+        assert_eq!(pcm, [0.25; 160]);
+    }
+    assert!(peer.pending_events.is_empty());
+    assert_eq!(
+        peer.poll_event(&mut [0.0; 160], &mut []).unwrap(),
+        super::IaxPeerEvent::None
+    );
 }
 
 #[test]
