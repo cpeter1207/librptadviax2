@@ -2,7 +2,7 @@ Source: librptadviax2
 Section: libs
 Priority: optional
 Maintainer: Chris Peterson <cpeter1207@users.noreply.github.com>
-Build-Depends: cargo (>= 1.85), debhelper-compat (= 13), pkg-config, rustc (>= 1.85)
+Build-Depends: cargo (>= 1.85), debhelper-compat (= 13), pkg-config, rustc (>= 1.85), libclang-dev, librptadv-codec-dev
 Standards-Version: 4.7.2
 Homepage: https://github.com/cpeter1207/librptadviax2
 Rules-Requires-Root: no

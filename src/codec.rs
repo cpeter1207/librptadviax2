@@ -1,5 +1,7 @@
 //! Released codec adapters for IAX2-negotiated media formats.
 
+pub mod providers;
+
 use audio_codec_algorithms::{decode_ulaw as decode_sample, encode_ulaw as encode_sample};
 
 /// IAX format bit for G.711 μ-law (RFC 5456, §8.7).
