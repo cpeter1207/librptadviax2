@@ -646,7 +646,7 @@ fn dial_error_code(error: DialError) -> i32 {
         DialError::Network(_) => -2,
         DialError::Timeout => -3,
         DialError::Rejected => -4,
-        DialError::UnsupportedFormat(_) => -5,
+        DialError::UnsupportedFormat(_) | DialError::Provider(_) => -5,
         DialError::Hangup
         | DialError::EarlyEventsFull
         | DialError::ReliableWindowFull

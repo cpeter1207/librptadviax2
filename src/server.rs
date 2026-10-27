@@ -38,7 +38,7 @@ pub struct InboundPeer {
     /// Remote nonzero 15-bit call number from the initial NEW.
     pub remote_call: u16,
     /// Negotiated IAX codec-format bit.
-    pub format: u32,
+    pub format: u64,
     peer: IaxPeer,
 }
 

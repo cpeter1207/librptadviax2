@@ -10,8 +10,10 @@ const CAPABILITY: [u8; 16] = *b"rptadv.jitter\0\0\0";
 /// Maximum opaque datagram payload accepted by the composed jitter capability.
 pub(crate) const MAX_PAYLOAD: usize = 1500;
 /// Source clock used by the negotiated ULAW media stream.
+#[cfg(test)]
 pub(crate) const CLOCK_RATE_HZ: u32 = 8000;
 /// Smallest missing/insertion span emitted by the composed jitter capability.
+#[cfg(test)]
 pub(crate) const CONCEALMENT_SPAN: u32 = 80;
 
 #[repr(C)]
@@ -139,7 +141,22 @@ impl Jitter {
     /// # Safety
     /// `descriptor` must be readable for its declared size, and its implementing
     /// DSO must remain loaded until this context is dropped. Functions must obey ABI1.
+    #[cfg(test)]
     pub(crate) unsafe fn new(descriptor: *const c_void) -> Result<Self, Error> {
+        unsafe { Self::new_at_rate(descriptor, CLOCK_RATE_HZ, CONCEALMENT_SPAN) }
+    }
+    /// Compose the same millisecond delay policy at the selected source clock.
+    /// # Safety
+    /// The descriptor must be readable for its declared size and its DSO must
+    /// remain loaded until this exclusive context is destroyed.
+    pub(crate) unsafe fn new_at_rate(
+        descriptor: *const c_void,
+        rate: u32,
+        loss_unit: u32,
+    ) -> Result<Self, Error> {
+        if !matches!(rate, 8000 | 16000 | 48000) || loss_unit == 0 || loss_unit > rate / 2 {
+            return Err(Error::InvalidDescriptor);
+        }
         if descriptor.is_null() {
             return Err(Error::InvalidDescriptor);
         }
@@ -167,12 +184,12 @@ impl Jitter {
         let options = Config {
             struct_size: size_of::<Config>() as u32,
             abi_version: 1,
-            clock_rate_hz: CLOCK_RATE_HZ,
-            minimum_delay: 1280,
-            initial_delay: 1440,
-            maximum_delay: 4000,
-            adjustment_step: CONCEALMENT_SPAN,
-            concealment_span: CONCEALMENT_SPAN,
+            clock_rate_hz: rate,
+            minimum_delay: rate * 160 / 1000,
+            initial_delay: rate * 180 / 1000,
+            maximum_delay: rate / 2,
+            adjustment_step: rate / 100,
+            concealment_span: loss_unit,
             maximum_packets: 64,
             maximum_payload_bytes: MAX_PAYLOAD as u32,
         };

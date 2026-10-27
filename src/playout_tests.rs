@@ -2,6 +2,150 @@ use super::*;
 use crate::jitter::fixture::Fixture;
 use std::time::Duration;
 
+fn provider_decoder(
+    backend: &str,
+    id: crate::codec::providers::ProfileId,
+) -> crate::codec::stream::Stream {
+    use crate::codec::providers::{CodecCatalog, ProviderSelection};
+    let directory =
+        std::path::PathBuf::from(std::env::var_os("RPTADV_CODEC_DIR").unwrap_or_default());
+    let catalog = CodecCatalog::load(&[ProviderSelection {
+        path: directory.join(format!("librptadv_codec_{backend}.so.1")),
+        profiles: vec![id],
+    }])
+    .unwrap();
+    crate::codec::stream::Stream::open(&catalog, id).unwrap()
+}
+
+#[test]
+fn playout_codec_native_plc_precedes_ring_fallback_and_never_double_conceals() {
+    let mut stream = provider_decoder("speex", crate::codec::providers::ProfileId::Speex);
+    let mut encoded = [0; 1024];
+    let result = stream
+        .encoder
+        .encode(&[0.1; 160], &mut encoded, false)
+        .unwrap();
+    let payload = &encoded[..result.encoded_bytes];
+    let fixture = Fixture::new();
+    let origin = Instant::now();
+    let timestamp = (0x1_0000_0000 + 1000) * 8;
+    fixture.packet(60_000_000, timestamp, payload, 0);
+    fixture.last_packet_span(160);
+    fixture.gap(80_000_000, timestamp + 160, 160, false);
+    fixture.gap(100_000_000, timestamp + 320, 160, true);
+    let mut playout = Playout::new(
+        unsafe { Jitter::new(fixture.descriptor()) }.unwrap(),
+        origin,
+    );
+    playout
+        .put_with_codec(1000, false, origin, payload, Some(&stream.decoder))
+        .unwrap();
+    playout
+        .put_with_codec(1040, false, origin, payload, Some(&stream.decoder))
+        .unwrap();
+    assert_eq!(fixture.puts()[0].1, 160);
+    let mut pcm = [0.75; 160];
+    for millis in [60, 80] {
+        assert_eq!(
+            playout
+                .poll_with_codec(
+                    origin + Duration::from_millis(millis),
+                    &mut pcm,
+                    Some(&mut stream.decoder)
+                )
+                .unwrap(),
+            IaxPeerEvent::Audio(160)
+        );
+        assert_ne!(pcm, [0.75; 160]);
+        pcm.fill(0.75);
+    }
+    assert_eq!(
+        playout
+            .poll_with_codec(
+                origin + Duration::from_millis(100),
+                &mut pcm,
+                Some(&mut stream.decoder)
+            )
+            .unwrap(),
+        IaxPeerEvent::Gap(160)
+    );
+    assert_eq!(pcm, [0.75; 160]);
+}
+
+#[test]
+fn playout_compressed_overlap_is_trimmed_only_after_whole_decode() {
+    let mut stream = provider_decoder("gsm", crate::codec::providers::ProfileId::GsmFr);
+    let mut encoded = [0; 33];
+    stream
+        .encoder
+        .encode(&[0.1; 160], &mut encoded, false)
+        .unwrap();
+    let mut reference = provider_decoder("gsm", crate::codec::providers::ProfileId::GsmFr);
+    let mut expected = [0.0; 160];
+    reference.decoder.decode(&encoded, &mut expected).unwrap();
+    let fixture = Fixture::new();
+    fixture.packet(0, 8000, &encoded, -80);
+    fixture.last_packet_span(160);
+    let origin = Instant::now();
+    let mut playout = Playout::new(
+        unsafe { Jitter::new(fixture.descriptor()) }.unwrap(),
+        origin,
+    );
+    let mut pcm = [0.0; 160];
+    assert_eq!(
+        playout
+            .poll_with_codec(origin, &mut pcm, Some(&mut stream.decoder))
+            .unwrap(),
+        IaxPeerEvent::Audio(80)
+    );
+    assert_eq!(pcm[..80], expected[80..]);
+}
+
+#[test]
+fn playout_source_clock_and_native_gap_retry_preserve_the_prefix() {
+    let mut stream = provider_decoder("opus", crate::codec::providers::ProfileId::Opus);
+    let mut encoded = [0; 4000];
+    let result = stream
+        .encoder
+        .encode(&[0.1; 960], &mut encoded, false)
+        .unwrap();
+    let payload = &encoded[..result.encoded_bytes];
+    let fixture = Fixture::new();
+    let origin = Instant::now();
+    let timestamp = (0x1_0000_0000 + 1000) * 48;
+    fixture.packet(0, timestamp, payload, 960);
+    fixture.last_packet_span(960);
+    let mut playout = Playout::new_at_rate(
+        unsafe { Jitter::new_at_rate(fixture.descriptor(), 48000, 480) }.unwrap(),
+        origin,
+        48000,
+    );
+    playout
+        .put_with_codec(1000, false, origin, payload, Some(&stream.decoder))
+        .unwrap();
+    assert_eq!((fixture.puts()[0].0, fixture.puts()[0].1), (timestamp, 960));
+    assert!(matches!(
+        playout.poll_with_codec(origin, &mut [0.75; 959], Some(&mut stream.decoder)),
+        Err(DialError::Provider(_))
+    ));
+    assert!(fixture.advances().is_empty());
+    let mut pcm = [0.75; 960];
+    assert_eq!(
+        playout
+            .poll_with_codec(origin, &mut pcm, Some(&mut stream.decoder))
+            .unwrap(),
+        IaxPeerEvent::Audio(960)
+    );
+    assert!(fixture.advances().is_empty());
+    assert_eq!(
+        playout
+            .poll_with_codec(origin, &mut pcm, Some(&mut stream.decoder))
+            .unwrap(),
+        IaxPeerEvent::Audio(960)
+    );
+    assert_eq!(fixture.advances().len(), 1);
+}
+
 #[test]
 fn key_does_not_discard_voice_that_arrived_ahead_of_its_control_sequence() {
     let fixture = Fixture::new();

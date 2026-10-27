@@ -593,6 +593,7 @@ fn linked_peer(remote: SocketAddr) -> IaxPeer {
         local_call: 1234,
         remote_call: 5678,
         format: IAX_FORMAT_ULAW,
+        codecs: None,
         connected_at: Instant::now(),
         setup: OutboundCallSetup::for_inbound_call(1234, 5678).unwrap(),
         pending_reliable: VecDeque::new(),

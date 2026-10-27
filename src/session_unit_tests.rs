@@ -3,7 +3,7 @@ use crate::codec::IAX_FORMAT_ULAW;
 use crate::information_elements::serialize_information_elements;
 
 fn setup() -> OutboundCallSetup {
-    let format = IAX_FORMAT_ULAW.to_be_bytes();
+    let format = (IAX_FORMAT_ULAW as u32).to_be_bytes();
     OutboundCallSetup::new(
         1,
         0,

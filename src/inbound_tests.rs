@@ -12,7 +12,7 @@ const CALLING_NUMBER: u8 = 2;
 const CAPABILITY: u8 = 8;
 const FORMAT: u8 = 9;
 
-fn incoming_new(local: &str, remote: &str, format: u32, capability: u32) -> Vec<u8> {
+fn incoming_new(local: &str, remote: &str, format: u64, capability: u64) -> Vec<u8> {
     incoming_new_with_username(b"radio", local, remote, format, capability)
 }
 
@@ -20,11 +20,11 @@ fn incoming_new_with_username(
     username: &[u8],
     local: &str,
     remote: &str,
-    format: u32,
-    capability: u32,
+    format: u64,
+    capability: u64,
 ) -> Vec<u8> {
-    let format_bytes = format.to_be_bytes();
-    let capability_bytes = capability.to_be_bytes();
+    let format_bytes = (format as u32).to_be_bytes();
+    let capability_bytes = (capability as u32).to_be_bytes();
     let payload = serialize_information_elements(&[
         InformationElement {
             kind: USERNAME,
@@ -112,9 +112,9 @@ fn rejects_unexpected_identity_target_call_numbers_and_codec() {
 }
 
 #[test]
-fn rejects_format_and_capability_information_elements_with_wrong_lengths() {
-    let format = IAX_FORMAT_ULAW.to_be_bytes();
-    let capability = IAX_FORMAT_ULAW.to_be_bytes();
+fn ignores_wrong_length_format_ies_when_the_other_offer_remains_usable() {
+    let format = (IAX_FORMAT_ULAW as u32).to_be_bytes();
+    let capability = (IAX_FORMAT_ULAW as u32).to_be_bytes();
     let payload = serialize_information_elements(&[
         InformationElement {
             kind: USERNAME,
@@ -154,8 +154,10 @@ fn rejects_format_and_capability_information_elements_with_wrong_lengths() {
     )
     .unwrap();
     assert_eq!(
-        crate::session::accept_inbound_ulaw_new(&malformed_format, "524950", 42),
-        Err(crate::session::InboundNewError::InvalidInformationElements)
+        crate::session::accept_inbound_ulaw_new(&malformed_format, "524950", 42)
+            .unwrap()
+            .format,
+        IAX_FORMAT_ULAW
     );
 
     let payload = serialize_information_elements(&[
@@ -197,8 +199,10 @@ fn rejects_format_and_capability_information_elements_with_wrong_lengths() {
     )
     .unwrap();
     assert_eq!(
-        crate::session::accept_inbound_ulaw_new(&malformed_capability, "524950", 42),
-        Err(crate::session::InboundNewError::InvalidInformationElements)
+        crate::session::accept_inbound_ulaw_new(&malformed_capability, "524950", 42)
+            .unwrap()
+            .format,
+        IAX_FORMAT_ULAW
     );
 }
 
@@ -239,11 +243,13 @@ fn rejects_non_initial_and_malformed_new_frames() {
 
     let mut duplicate_capability = valid.clone();
     duplicate_capability.extend_from_slice(&[CAPABILITY, 4, 0, 0, 0, 4]);
-    assert!(crate::session::accept_inbound_ulaw_new(&duplicate_capability, "524950", 42).is_err());
+    // Asterisk retains the first nonzero legacy capability, ignoring this repeat.
+    assert!(crate::session::accept_inbound_ulaw_new(&duplicate_capability, "524950", 42).is_ok());
 
     let mut missing_capability = valid.clone();
     missing_capability.truncate(missing_capability.len() - 6);
-    assert!(crate::session::accept_inbound_ulaw_new(&missing_capability, "524950", 42).is_err());
+    // Missing capability falls back to the nonzero preferred FORMAT.
+    assert!(crate::session::accept_inbound_ulaw_new(&missing_capability, "524950", 42).is_ok());
 
     let mut malformed_ie = valid.clone();
     malformed_ie.push(0xfe);

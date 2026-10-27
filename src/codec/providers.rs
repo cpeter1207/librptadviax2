@@ -133,7 +133,7 @@ pub struct Error {
     /// Stable operation/classification; no packet data or credentials.
     pub operation: &'static str,
 }
-fn error(operation: &'static str) -> Error {
+pub(super) fn error(operation: &'static str) -> Error {
     Error {
         status: Status::Failed,
         required_capacity: 0,
@@ -258,6 +258,24 @@ impl CodecCatalog {
                 }
             }
         }
+        // A bidirectional claim is not sufficient: both selected directions must
+        // initialize before this composition can advertise them. No media work.
+        for selected in catalog.selected.values() {
+            let profile = &selected.profile;
+            let mode = &profile.modes[0];
+            let _encoder = catalog.encoder(
+                profile.id,
+                mode.id,
+                mode.frame_samples,
+                profile.maximum_frame_bytes as usize,
+            )?;
+            let _decoder = catalog.decoder(
+                profile.id,
+                mode.id,
+                mode.frame_samples,
+                profile.maximum_frame_bytes as usize,
+            )?;
+        }
         Ok(catalog)
     }
     /// Only these verified bidirectional profiles may be advertised.
@@ -340,6 +358,7 @@ unsafe fn table(raw: *const RawDescriptor) -> Result<RawDescriptor, Error> {
         || api.decode.is_none()
         || api.reset.is_none()
         || api.destroy.is_none()
+        || api.conceal.is_none()
     {
         return Err(error("provider table contract"));
     }
@@ -484,6 +503,29 @@ impl Encoder {
 /// Independent, non-real-time decoder owner.
 pub struct Decoder(Context);
 impl Decoder {
+    /// Prefer the backend's native PLC for a supported missing source span.
+    /// Unsupported spans return zero samples and leave shared-ring fallback to
+    /// the caller; successful native output must not be concealed a second time.
+    pub fn conceal(&mut self, requested: u32, pcm: &mut [f32]) -> Result<usize, Error> {
+        let mut frames = 0;
+        let code = unsafe {
+            (self.0.provider.api.conceal.unwrap())(
+                self.0.raw.as_ptr(),
+                requested,
+                pcm.as_mut_ptr(),
+                pcm.len(),
+                &mut frames,
+            )
+        };
+        if code == 4 && frames == 0 {
+            return Ok(0);
+        }
+        completed(code, frames)?;
+        if frames != requested as usize || frames > pcm.len() {
+            return Err(error("provider conceal result"));
+        }
+        Ok(frames)
+    }
     /// Inspect framing without advancing decoder history or invoking PLC.
     pub fn inspect(&self, packet: &[u8]) -> Result<PacketInfo, Error> {
         let mut raw = RawPacket {

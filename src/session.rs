@@ -8,6 +8,7 @@ use crate::call_token::{
     InitialNewError, build_initial_new, retry_new_call_with_token,
 };
 use crate::codec::IAX_FORMAT_ULAW;
+use crate::formats::{FormatCatalog, FormatOffer, IaxFormat, append_formats};
 use crate::information_elements::{
     InformationElement, InformationElementError, parse_information_elements,
 };
@@ -22,8 +23,8 @@ const USERNAME_IE: u8 = 6;
 const CALLED_NUMBER_IE: u8 = 1;
 const CALLING_NUMBER_IE: u8 = 2;
 const CAPABILITY_IE: u8 = 8;
+#[cfg(test)]
 const FORMAT_IE: u8 = 9;
-const FORMAT2_IE: u8 = 56;
 const ACK_SUBCLASS: u8 = 4;
 
 /// Incoming call accepted after the listener has validated its call token and access policy.
@@ -32,7 +33,7 @@ pub struct InboundCallAccepted {
     /// Numeric node identifier supplied by the remote `CALLING_NUMBER` IE.
     pub remote_node: String,
     /// Negotiated codec format.
-    pub format: u32,
+    pub format: u64,
     /// IAX2 `ACCEPT` frame to send to the peer.
     pub packet: Vec<u8>,
 }
@@ -120,6 +121,33 @@ pub fn accept_inbound_ulaw_new(
     local_node: &str,
     local_call: u16,
 ) -> Result<InboundCallAccepted, InboundNewError> {
+    accept_inbound_selected(packet, local_node, local_call, |offer| {
+        (offer & IAX_FORMAT_ULAW != 0).then_some(IAX_FORMAT_ULAW)
+    })
+}
+
+/// Select an inbound format using the same verified catalog as outgoing offers.
+/// Token validation and authorization remain with the listener's admission path.
+pub fn accept_inbound_new(
+    packet: &[u8],
+    local_node: &str,
+    local_call: u16,
+    catalog: &FormatCatalog,
+) -> Result<InboundCallAccepted, InboundNewError> {
+    accept_inbound_selected(packet, local_node, local_call, |offer| {
+        catalog
+            .select(offer)
+            .ok()
+            .map(|id| IaxFormat::for_profile(id).0)
+    })
+}
+
+fn accept_inbound_selected(
+    packet: &[u8],
+    local_node: &str,
+    local_call: u16,
+    select: impl FnOnce(u64) -> Option<u64>,
+) -> Result<InboundCallAccepted, InboundNewError> {
     let request = parse_full_frame_packet(packet).map_err(|_| InboundNewError::InvalidFrame)?;
     if local_call == 0
         || request.header.source_call_number == 0
@@ -138,8 +166,6 @@ pub fn accept_inbound_ulaw_new(
     let username = unique_ie(&elements, USERNAME_IE)?;
     let called = unique_ie(&elements, CALLED_NUMBER_IE)?;
     let calling = unique_ie(&elements, CALLING_NUMBER_IE)?;
-    let format = unique_ie(&elements, FORMAT_IE)?;
-    let capability = unique_ie(&elements, CAPABILITY_IE)?;
     if username != b"radio"
         || called != local_node.as_bytes()
         || calling.is_empty()
@@ -147,24 +173,11 @@ pub fn accept_inbound_ulaw_new(
     {
         return Err(InboundNewError::InvalidIdentity);
     }
-    if format.len() != 4 || capability.len() != 4 {
-        return Err(InboundNewError::InvalidInformationElements);
-    }
-    let capability =
-        u32::from_be_bytes([capability[0], capability[1], capability[2], capability[3]]);
-    if capability & IAX_FORMAT_ULAW == 0 {
-        return Err(InboundNewError::UnsupportedFormat);
-    }
+    let capability = FormatOffer::parse(&elements).supported();
+    let format = select(capability).ok_or(InboundNewError::UnsupportedFormat)?;
 
-    let format_bytes = IAX_FORMAT_ULAW.to_be_bytes();
-    let format2_bytes = u64::from(IAX_FORMAT_ULAW).to_be_bytes();
-    let mut format2 = [0; 9];
-    format2[1..].copy_from_slice(&format2_bytes);
     let mut response_payload = Vec::with_capacity(17);
-    response_payload.extend_from_slice(&[FORMAT_IE, format_bytes.len() as u8]);
-    response_payload.extend_from_slice(&format_bytes);
-    response_payload.extend_from_slice(&[FORMAT2_IE, format2.len() as u8]);
-    response_payload.extend_from_slice(&format2);
+    append_formats(&mut response_payload, format, None);
     let response = serialize_full_frame(
         &FullFrameHeader {
             source_call_number: local_call,
@@ -184,7 +197,7 @@ pub fn accept_inbound_ulaw_new(
     let remote_node = calling.iter().map(|byte| char::from(*byte)).collect();
     Ok(InboundCallAccepted {
         remote_node,
-        format: IAX_FORMAT_ULAW,
+        format,
         packet: response,
     })
 }
@@ -239,7 +252,7 @@ pub enum CallSetupError {
     InvalidCallNumbers,
     /// The initial NEW packet or its fields are invalid.
     InitialNew(InitialNewError),
-    /// The initial NEW does not contain a usable legacy FORMAT IE.
+    /// The initial NEW does not contain a usable single preferred FORMAT.
     InitialFormat,
     /// The initial NEW has a malformed or empty CAPABILITY IE.
     InitialCapability,
@@ -286,12 +299,12 @@ pub enum CallSetupError {
     Authentication(AuthenticationRequestError),
     /// The ACCEPT payload has malformed information elements.
     InformationElements(InformationElementError),
-    /// ACCEPT omitted FORMAT or encoded it with the wrong size.
+    /// ACCEPT omitted a usable nonzero legacy/extended FORMAT.
     InvalidAcceptedFormat,
     /// The peer selected a format not offered by the initial NEW.
     UnacceptedFormat {
         /// Peer format bit field.
-        format: u32,
+        format: u64,
     },
     /// The outbound call is already terminal.
     CallFinished,
@@ -311,7 +324,7 @@ pub enum CallSetupResponse {
     /// The call is linked and the ACCEPT acknowledgement must be sent.
     Accepted {
         /// Codec format selected by the peer.
-        format: u32,
+        format: u64,
         /// IAX2 ACK packet for the peer's ACCEPT.
         acknowledgement: Vec<u8>,
     },
@@ -370,7 +383,7 @@ pub(crate) enum OutboundSetupResponse {
     Accepted {
         /// Remote call number from the already validated ACCEPT header.
         remote_call: u16,
-        format: u32,
+        format: u64,
         acknowledgement: Vec<u8>,
     },
     /// The peer rejected the call.
@@ -482,7 +495,7 @@ impl From<LinkedCallResponse> for CallSetupResponse {
 pub struct OutboundCallSetup {
     local_call: u16,
     remote_call: Option<u16>,
-    offered_formats: u32,
+    offered_formats: u64,
     next_outgoing: u8,
     next_incoming: u8,
     received_media: u64,
@@ -1160,7 +1173,7 @@ impl OutboundCallSetup {
         payload: &[u8],
     ) -> Result<OutboundSetupResponse, CallSetupError> {
         let format = accepted_format(payload)?;
-        if format == 0 || format & self.offered_formats == 0 {
+        if !format.is_power_of_two() || format & self.offered_formats == 0 {
             return Err(CallSetupError::UnacceptedFormat { format });
         }
 
@@ -1246,54 +1259,30 @@ impl OutboundCallSetup {
     }
 }
 
-fn offered_formats(elements: &[InformationElement<'_>]) -> Result<u32, CallSetupError> {
-    let Some(format) = elements
-        .iter()
-        .rev()
-        .find(|element| element.kind == FORMAT_IE)
-    else {
-        return Err(CallSetupError::InitialFormat);
-    };
-    if format.data.len() != 4 {
+fn offered_formats(elements: &[InformationElement<'_>]) -> Result<u64, CallSetupError> {
+    let offer = FormatOffer::parse(elements);
+    if !offer.format.is_power_of_two() {
         return Err(CallSetupError::InitialFormat);
     }
-    let preferred = u32::from_be_bytes(format.data.try_into().expect("length checked"));
-    if preferred == 0 {
-        return Err(CallSetupError::InitialFormat);
-    }
-
-    let Some(capability) = elements
-        .iter()
-        .rev()
-        .find(|element| element.kind == CAPABILITY_IE)
-    else {
-        return Ok(preferred);
-    };
-    if capability.data.len() != 4 {
+    // Local construction remains strict. Peer parsing uses Asterisk's fallback.
+    if offer.capability == 0
+        && elements
+            .iter()
+            .any(|element| matches!(element.kind, CAPABILITY_IE | 55))
+    {
         return Err(CallSetupError::InitialCapability);
     }
-    let capability = u32::from_be_bytes(capability.data.try_into().expect("length checked"));
-    if capability == 0 {
-        return Err(CallSetupError::InitialCapability);
-    }
-    Ok(capability)
+    Ok(offer.supported())
 }
 
-fn accepted_format(payload: &[u8]) -> Result<u32, CallSetupError> {
-    let mut format = None;
-    for element in
-        parse_information_elements(payload).map_err(CallSetupError::InformationElements)?
-    {
-        if element.kind == FORMAT_IE {
-            if element.data.len() != 4 {
-                return Err(CallSetupError::InvalidAcceptedFormat);
-            }
-            format = Some(u32::from_be_bytes(
-                element.data.try_into().expect("length checked"),
-            ));
-        }
+fn accepted_format(payload: &[u8]) -> Result<u64, CallSetupError> {
+    let elements =
+        parse_information_elements(payload).map_err(CallSetupError::InformationElements)?;
+    let format = FormatOffer::parse(&elements).format;
+    if format == 0 {
+        return Err(CallSetupError::InvalidAcceptedFormat);
     }
-    format.ok_or(CallSetupError::InvalidAcceptedFormat)
+    Ok(format)
 }
 
 #[cfg(test)]

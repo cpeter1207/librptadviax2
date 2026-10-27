@@ -17,9 +17,7 @@ use tokio::{
 };
 
 // Pending inbound PCM and clients without deadline support need bounded retries.
-pub(crate) const TIMER_INTERVAL: Duration = Duration::from_nanos(
-    1_000_000_000 * crate::jitter::CONCEALMENT_SPAN as u64 / crate::jitter::CLOCK_RATE_HZ as u64,
-);
+pub(crate) const TIMER_INTERVAL: Duration = Duration::from_millis(10);
 
 #[cfg(test)]
 static RECEIVE_FAILURES: Mutex<Vec<SocketAddr>> = Mutex::new(Vec::new());
