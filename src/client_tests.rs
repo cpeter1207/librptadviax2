@@ -96,13 +96,30 @@ fn formats_egress_codec_packet_timing_uses_retained_opus_provider() {
             result.source_frames,
             result.packet_frames
         ),
-        (923, 0, 960, 960)
+        (923, 0, 648, 960)
     );
     assert_ne!(result.encoded_bytes, result.packet_frames as usize);
     assert_eq!(
         peer.send_prepared_audio(&encoded[..result.encoded_bytes], result.packet_frames, 100)
             .unwrap(),
         crate::client::MediaSend::Accepted
+    );
+    let tail = peer.prepare_audio(&[], &mut encoded, true).unwrap();
+    assert_eq!(
+        (
+            tail.consumed_frames,
+            tail.source_start_frames,
+            tail.source_frames,
+            tail.packet_frames
+        ),
+        (0, 648, 312, 960)
+    );
+    assert!(tail.encoded_bytes != 0);
+    assert_eq!(
+        peer.prepare_audio(&[], &mut encoded, true)
+            .unwrap()
+            .encoded_bytes,
+        0
     );
     peer.reset_encoder().unwrap();
     let empty = peer.prepare_audio(&[], &mut encoded, true).unwrap();
