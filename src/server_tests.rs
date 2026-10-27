@@ -703,6 +703,28 @@ fn existing_routes_ignore_malformed_and_unknown_call_frames() {
 }
 
 #[test]
+fn listener_ignores_oversized_receive_without_losing_later_admission() {
+    let mut listener = InboundIaxListener::bind("127.0.0.1:0".parse().unwrap(), "524950").unwrap();
+    let server = listener.local_addr().unwrap();
+    crate::network::inject_receive(
+        server,
+        Ok((
+            crate::ingress::MAX_DATAGRAM_SIZE + 1,
+            "127.0.0.1:4568".parse().unwrap(),
+        )),
+    );
+    assert!(matches!(
+        listener.poll(0, |_| false).unwrap(),
+        ListenerEvent::Ignored
+    ));
+    let (client, initial) = initial_new("127.0.0.1:0".parse().unwrap(), server);
+    assert!(matches!(
+        finish_inbound_handshake(&mut listener, &client, &initial, server),
+        ListenerEvent::Accepted(_)
+    ));
+}
+
+#[test]
 fn existing_mini_frame_routes_only_unique_call_identity() {
     let remote: SocketAddr = "127.0.0.1:4568".parse().unwrap();
     let mut listener = InboundIaxListener::bind("127.0.0.1:0".parse().unwrap(), "524950").unwrap();

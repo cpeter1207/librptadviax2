@@ -226,6 +226,11 @@ fn playout_aggregated_packet_decodes_once_and_releases_bounded_pcm_chunks() {
         origin,
     );
     let mut pcm = [0.0; 160];
+    assert!(matches!(
+        playout.poll_with_codec(origin, &mut [], Some(&mut stream.decoder)),
+        Err(DialError::Decode(_))
+    ));
+    assert!(fixture.advances().is_empty());
     for part in expected.chunks_exact(160) {
         assert_eq!(
             playout

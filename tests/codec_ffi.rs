@@ -30,6 +30,15 @@ fn catalog_v2_lifetime_and_listener_reject_old_options() {
     let mut catalog = ptr::dangling_mut::<std::ffi::c_void>();
     unsafe {
         assert_eq!(
+            (client.open_catalog.unwrap())(ptr::null(), 0, ptr::null_mut()),
+            -1
+        );
+        assert_eq!(
+            (client.open_catalog.unwrap())(ptr::null(), 1, &mut catalog),
+            -1
+        );
+        assert!(catalog.is_null());
+        assert_eq!(
             (client.open_catalog.unwrap())(ptr::null(), 0, &mut catalog),
             -1
         );
@@ -41,6 +50,25 @@ fn catalog_v2_lifetime_and_listener_reject_old_options() {
         );
         assert!(catalog.is_null());
         selection.profile_id = 1;
+        let invalid_utf8 = CString::new(vec![0xff]).unwrap();
+        let missing = CString::new("/nonexistent/rptadv-codec-test.so").unwrap();
+        for (struct_size, provider_path) in [
+            (selection.struct_size - 1, path.as_ptr()),
+            (selection.struct_size, ptr::null()),
+            (selection.struct_size, invalid_utf8.as_ptr()),
+            (selection.struct_size, missing.as_ptr()),
+        ] {
+            let invalid = rptadv_iax2_codec_selection_v2 {
+                struct_size,
+                provider_path,
+                ..selection
+            };
+            assert_eq!(
+                (client.open_catalog.unwrap())(&invalid, 1, &mut catalog),
+                -1
+            );
+            assert!(catalog.is_null());
+        }
         assert_eq!(
             (client.open_catalog.unwrap())(&selection, 1, &mut catalog),
             0
@@ -62,6 +90,10 @@ fn catalog_v2_lifetime_and_listener_reject_old_options() {
         assert_eq!((server.bind.unwrap())(&options, &mut listener), -1);
         assert!(listener.is_null());
         options.abi_version = 2;
+        options.catalog = ptr::null();
+        assert_eq!((server.bind.unwrap())(&options, &mut listener), -1);
+        assert!(listener.is_null());
+        options.catalog = catalog;
         assert_eq!((server.bind.unwrap())(&options, &mut listener), 0);
         assert!(!listener.is_null());
         (client.close_catalog.unwrap())(catalog);

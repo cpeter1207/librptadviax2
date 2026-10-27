@@ -13,6 +13,17 @@ fn loopback() -> SocketAddr {
 }
 
 #[test]
+fn routed_receive_rejects_datagram_and_returned_storage_overflow() {
+    let mut router = PeerIngressRouter::new(1).unwrap();
+    for length in [MAX_DATAGRAM_SIZE + 1, 2] {
+        assert!(matches!(
+            route_received(Ok(Some((length, loopback()))), &mut router, &[0]),
+            Err(NetworkIngressError::MalformedPacket)
+        ));
+    }
+}
+
+#[test]
 fn ingress_datagram_bounds_preserve_maximum_ipv4_udp_payload() {
     let sender = UdpEndpoint::bind(loopback()).unwrap();
     let receiver = UdpEndpoint::bind(loopback()).unwrap();

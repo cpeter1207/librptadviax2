@@ -231,6 +231,44 @@ fn egress_abi2_encoder_retains_partial_input_and_preserves_a_short_g711_tail() {
         0
     );
     assert_eq!(result.source_start_frames, 0);
+    for (flush, struct_size) in [
+        (2, std::mem::size_of::<EncodeResultRaw>() as u32),
+        (1, std::mem::size_of::<EncodeResultRaw>() as u32 - 1),
+    ] {
+        result.struct_size = struct_size;
+        assert_eq!(
+            unsafe {
+                api.prepare_audio.unwrap()(
+                    handle,
+                    [].as_ptr(),
+                    0,
+                    encoded.as_mut_ptr(),
+                    160,
+                    flush,
+                    &mut result,
+                )
+            },
+            -1
+        );
+    }
+    result.struct_size = std::mem::size_of::<EncodeResultRaw>() as u32;
+    result.status = 99;
+    peer.codecs = None;
+    assert_eq!(
+        unsafe {
+            api.prepare_audio.unwrap()(
+                handle,
+                [].as_ptr(),
+                0,
+                encoded.as_mut_ptr(),
+                160,
+                1,
+                &mut result,
+            )
+        },
+        -1
+    );
+    assert_eq!(result.status, 99);
 }
 
 #[test]
@@ -1281,6 +1319,17 @@ fn reliable_capacity_and_text_size_are_bounded_before_sending() {
         peer.send_text(&vec![0; super::MAX_PACKET_SIZE]),
         Err(DialError::InvalidOptions)
     ));
+    assert!(matches!(
+        peer.send_prepared_audio(&[0xff], 2, 0),
+        Err(DialError::InvalidOptions)
+    ));
+    assert!(matches!(
+        peer.send_prepared_ulaw(&vec![0; 65_507 - 12 + 1], 0),
+        Err(DialError::InvalidOptions)
+    ));
+    assert_eq!(peer.maximum_datagram(), 65_507);
+    peer.remote = "[::1]:4569".parse().unwrap();
+    assert_eq!(peer.maximum_datagram(), crate::ingress::MAX_DATAGRAM_SIZE);
 
     let now = Instant::now();
     peer.pending_reliable = (0..super::MAX_RELIABLE_WINDOW)

@@ -1336,9 +1336,6 @@ fn dial_composed(
                 acknowledgement,
             } => {
                 send(&endpoint, &acknowledgement, options.remote)?;
-                if catalog.is_none() && format != IAX_FORMAT_ULAW {
-                    return Err(DialError::UnsupportedFormat(format));
-                }
                 let codecs = catalog
                     .as_ref()
                     .map(|catalog| {

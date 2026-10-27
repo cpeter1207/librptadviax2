@@ -86,7 +86,7 @@ lint:
 static-analysis:
 	$(CARGO) clippy --all-targets -- -D warnings
 	$(CPPCHECK) --force --enable=warning,style,performance,portability --error-exitcode=1 \
-		--std=c11 -Iinclude $(CPPFLAGS) $(SMOKE_SOURCE)
+		--std=c11 -Iinclude $(CPPFLAGS) $(wildcard tests/*.c)
 
 docs: rustdoc | build
 	$(DOXYGEN) Doxyfile

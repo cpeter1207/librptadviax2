@@ -20,9 +20,6 @@ use tokio::{
 pub(crate) const TIMER_INTERVAL: Duration = Duration::from_millis(10);
 
 #[cfg(test)]
-static RECEIVE_FAILURES: Mutex<Vec<SocketAddr>> = Mutex::new(Vec::new());
-
-#[cfg(test)]
 thread_local! {
     pub(crate) static WRITABLE_TEST_SIGNAL: std::cell::RefCell<Option<Arc<Notify>>> = const { std::cell::RefCell::new(None) };
 }
@@ -38,7 +35,10 @@ async fn writable(socket: &tokio::net::UdpSocket) -> io::Result<()> {
 
 #[cfg(test)]
 pub(crate) fn fail_next_receive(local: SocketAddr) {
-    RECEIVE_FAILURES.lock().unwrap().push(local);
+    crate::network::inject_receive(
+        local,
+        Err(io::Error::other("injected socket receive failure")),
+    );
 }
 
 /// Socket read boundary shared by dedicated and listener receive tasks.
@@ -47,13 +47,8 @@ pub(crate) async fn receive_datagram(
     bytes: &mut [u8],
 ) -> io::Result<(usize, SocketAddr)> {
     #[cfg(test)]
-    {
-        let local = socket.local_addr()?;
-        let mut failures = RECEIVE_FAILURES.lock().unwrap();
-        if let Some(index) = failures.iter().position(|address| *address == local) {
-            failures.swap_remove(index);
-            return Err(io::Error::other("injected socket receive failure"));
-        }
+    if let Some(result) = crate::network::injected_receive(socket.local_addr()?) {
+        return result;
     }
     socket.recv_from(bytes).await
 }

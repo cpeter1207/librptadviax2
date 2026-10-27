@@ -321,7 +321,7 @@ fn status(value: i32) -> Result<(), Error> {
 }
 
 #[cfg(test)]
-#[path = "jitter_fixture.rs"]
+#[path = "jitter_fixture_tests.rs"]
 pub(crate) mod fixture;
 
 #[cfg(test)]
@@ -331,6 +331,17 @@ mod tests {
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
+
+    #[test]
+    fn invalid_source_clock_and_loss_units_fail_before_context_creation() {
+        let descriptor = descriptor();
+        for (rate, loss_unit) in [(44100, 160), (8000, 0), (8000, 4001)] {
+            assert!(matches!(
+                unsafe { Jitter::new_at_rate(ptr::from_ref(&descriptor).cast(), rate, loss_unit) },
+                Err(Error::InvalidDescriptor)
+            ));
+        }
+    }
 
     struct State {
         config: Config,

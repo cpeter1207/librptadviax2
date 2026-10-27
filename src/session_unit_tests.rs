@@ -82,6 +82,17 @@ fn send_voice_frame_rejects_unlinked_calls() {
     );
 }
 
+#[test]
+fn linked_voice_rejects_unknown_formats_without_consuming_sequence() {
+    let mut session = OutboundCallSetup::for_inbound_call(42, 123).unwrap();
+    let sequence = session.next_outgoing;
+    assert_eq!(
+        session.send_voice_frame(&[0], 20, 1_u64 << 63),
+        Err(CallSetupError::InvalidAcceptedFormat)
+    );
+    assert_eq!(session.next_outgoing, sequence);
+}
+
 fn accept_packet() -> Vec<u8> {
     serialize_full_frame(
         &FullFrameHeader {

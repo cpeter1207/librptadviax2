@@ -1123,6 +1123,21 @@ fn native_plc_output_capacity_is_retryable_not_a_peer_failure() {
         assert_eq!((event, length), (RPTADV_IAX2_EVENT_AUDIO, 960));
         assert_eq!(fixture.advances().len(), 1);
         assert!(ERROR_LOGS.with_borrow(|logs| logs.is_empty()));
+        fixture.packet(0, 48000 + 960, &[0x03], 0);
+        fixture.last_packet_span(960);
+        assert_eq!(
+            poll(
+                handle,
+                pcm.as_mut_ptr(),
+                960,
+                ptr::null_mut(),
+                0,
+                &mut event,
+                &mut length
+            ),
+            -1
+        );
+        assert_eq!(ERROR_LOGS.with_borrow(Vec::len), 1);
         destroy(handle);
     }
 }

@@ -8,6 +8,31 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
+#[cfg(test)]
+struct InjectedReceive {
+    local: SocketAddr,
+    result: io::Result<(usize, SocketAddr)>,
+}
+#[cfg(test)]
+static RECEIVE_RESULTS: std::sync::Mutex<Vec<InjectedReceive>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(crate) fn inject_receive(local: SocketAddr, result: io::Result<(usize, SocketAddr)>) {
+    RECEIVE_RESULTS
+        .lock()
+        .unwrap()
+        .push(InjectedReceive { local, result });
+}
+
+#[cfg(test)]
+pub(crate) fn injected_receive(local: SocketAddr) -> Option<io::Result<(usize, SocketAddr)>> {
+    let mut results = RECEIVE_RESULTS.lock().unwrap();
+    results
+        .iter()
+        .position(|result| result.local == local)
+        .map(|index| results.swap_remove(index).result)
+}
+
 /// Failure while receiving a datagram for peer-owner dispatch.
 #[derive(Debug)]
 pub enum NetworkIngressError {
@@ -110,6 +135,10 @@ impl UdpEndpoint {
     /// Try to receive one datagram; `None` means the socket would block. Protocol
     /// parsers provide MAX_DATAGRAM_SIZE+1 bytes to distinguish guard overflow.
     pub fn try_receive(&self, buffer: &mut [u8]) -> io::Result<Option<(usize, SocketAddr)>> {
+        #[cfg(test)]
+        if let Some(result) = injected_receive(self.local_addr()?) {
+            return result.map(Some);
+        }
         receive_result(self.socket.socket.recv_from(buffer))
     }
 

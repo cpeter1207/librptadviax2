@@ -504,10 +504,7 @@ unsafe extern "C" fn dial(
         let Some(options) = (unsafe { sized_ref(options) }) else {
             return -1;
         };
-        if options.abi_version != RPTADV_IAX2_CLIENT_ABI_VERSION
-            || options.struct_size < size_of::<rptadv_iax2_dial_options_v2>() as u32
-            || options.reserved != 0
-        {
+        if options.abi_version != RPTADV_IAX2_CLIENT_ABI_VERSION || options.reserved != 0 {
             return -1;
         }
         let Some(catalog) = (unsafe { clone_catalog(options.catalog) }) else {
