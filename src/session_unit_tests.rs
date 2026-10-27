@@ -3,7 +3,7 @@ use crate::codec::IAX_FORMAT_ULAW;
 use crate::information_elements::serialize_information_elements;
 
 fn setup() -> OutboundCallSetup {
-    let format = IAX_FORMAT_ULAW.to_be_bytes();
+    let format = (IAX_FORMAT_ULAW as u32).to_be_bytes();
     OutboundCallSetup::new(
         1,
         0,
@@ -75,11 +75,22 @@ fn send_dtmf_rejects_invalid_digits_and_unlinked_calls() {
 }
 
 #[test]
-fn send_ulaw_frame_rejects_unlinked_calls() {
+fn send_voice_frame_rejects_unlinked_calls() {
     assert_eq!(
-        setup().send_ulaw_frame(&[0xff], 25),
+        setup().send_voice_frame(&[0xff], 25, IAX_FORMAT_ULAW),
         Err(CallSetupError::NotLinked)
     );
+}
+
+#[test]
+fn linked_voice_rejects_unknown_formats_without_consuming_sequence() {
+    let mut session = OutboundCallSetup::for_inbound_call(42, 123).unwrap();
+    let sequence = session.next_outgoing;
+    assert_eq!(
+        session.send_voice_frame(&[0], 20, 1_u64 << 63),
+        Err(CallSetupError::InvalidAcceptedFormat)
+    );
+    assert_eq!(session.next_outgoing, sequence);
 }
 
 fn accept_packet() -> Vec<u8> {

@@ -279,16 +279,17 @@ fn async_descriptor_enables_server_idempotently_and_retains_its_runtime() {
         offset_of!(AsyncDescriptor, server_enable),
         24 + 6 * size_of::<usize>()
     );
-    let server_api = unsafe { &*ffi::rptadv_iax2_server_descriptor_v1() };
+    let server_api = unsafe { &*ffi::rptadv_iax2_server_descriptor_v2() };
     let address = b"127.0.0.1:0";
     let nodes = b"524950";
-    let options = ffi::rptadv_iax2_server_options_v1 {
-        struct_size: size_of::<ffi::rptadv_iax2_server_options_v1>() as u32,
+    let options = ffi::rptadv_iax2_server_options_v2 {
+        struct_size: size_of::<ffi::rptadv_iax2_server_options_v2>() as u32,
         abi_version: ffi::RPTADV_IAX2_SERVER_ABI_VERSION,
         bind_address: address.as_ptr(),
         bind_address_length: address.len(),
         local_nodes: nodes.as_ptr(),
         local_nodes_length: nodes.len(),
+        catalog: ffi::test_catalog(),
     };
     let mut runtime = ptr::null_mut();
     let mut server = ptr::null_mut();

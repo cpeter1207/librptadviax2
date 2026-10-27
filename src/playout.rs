@@ -2,7 +2,10 @@
 
 use crate::{
     client::{DialError, IaxPeerEvent},
-    codec::{CodecAdapter, G711Ulaw},
+    codec::{
+        CodecAdapter, G711Ulaw,
+        providers::{Decoder, Status},
+    },
     jitter::{Admission, Decision, Jitter, Kind, MAX_PAYLOAD, Observation},
 };
 use std::time::Instant;
@@ -12,8 +15,14 @@ pub(crate) struct Playout {
     jitter: Jitter,
     origin: Instant,
     highest_ms: Option<u64>,
+    source_origin: Option<u64>,
     encoded: [u8; MAX_PAYLOAD],
     pending: Option<Decision>,
+    pending_prefix: u32,
+    rate: u32,
+    decoded: Vec<f32>,
+    decoded_position: usize,
+    decoded_count: usize,
     tail_end: Option<u64>,
     released_to: u64,
     skipped_span: u64,
@@ -58,13 +67,23 @@ impl Playout {
         Ok(current)
     }
 
+    #[cfg(test)]
     pub(crate) fn new(jitter: Jitter, origin: Instant) -> Self {
+        Self::new_at_rate(jitter, origin, 8000)
+    }
+    pub(crate) fn new_at_rate(jitter: Jitter, origin: Instant, rate: u32) -> Self {
         Self {
             jitter,
             origin,
             highest_ms: None,
+            source_origin: None,
             encoded: [0; MAX_PAYLOAD],
             pending: None,
+            pending_prefix: 0,
+            rate,
+            decoded: Vec::new(),
+            decoded_position: 0,
+            decoded_count: 0,
             tail_end: None,
             released_to: 0,
             skipped_span: 0,
@@ -76,6 +95,7 @@ impl Playout {
             release_deadline: None,
         }
     }
+    #[cfg(test)]
     pub(crate) fn put(
         &mut self,
         timestamp: u32,
@@ -83,37 +103,67 @@ impl Playout {
         arrived_at: Instant,
         payload: &[u8],
     ) -> Result<(), DialError> {
-        // ASL peers can send valid voice after UNKEY without another KEY. Media
-        // resumes playout; the controller still owns receive/PTT qualification.
+        self.put_with_codec(timestamp, mini, arrived_at, payload, None)
+    }
+    pub(crate) fn put_with_codec(
+        &mut self,
+        timestamp: u32,
+        mini: bool,
+        arrived_at: Instant,
+        payload: &[u8],
+        decoder: Option<&Decoder>,
+    ) -> Result<(), DialError> {
+        let span = match decoder {
+            Some(decoder) => match decoder.inspect(payload) {
+                Ok(info) => info.frames,
+                Err(error) if error.status == Status::Malformed => return Ok(()),
+                Err(error) => return Err(DialError::Provider(error)),
+            },
+            None => payload.len() as u32,
+        };
+        // Invalid framing must not revive a burst or move its timestamp epoch.
+        // Valid ASL voice may resume after UNKEY without another KEY; receive/PTT
+        // qualification remains the controller's responsibility.
         self.active = true;
         self.expire_quiet(arrived_at)?;
-        let timestamp = self.unwrap_ms(timestamp, mini) * 8;
+        let mut timestamp = self.unwrap_ms(timestamp, mini) * u64::from(self.rate) / 1000;
+        let quantum = self.jitter.release_span();
+        if quantum * 1000 % self.rate != 0 {
+            // IAX milliseconds cannot represent LPC10's 22.5 ms coding grid.
+            // Recover whole-unit positions instead of trimming four valid
+            // samples from alternating, otherwise contiguous packets.
+            let origin = *self.source_origin.get_or_insert(timestamp);
+            let offset = i128::from(timestamp) - i128::from(origin);
+            let unit = i128::from(quantum);
+            timestamp = (i128::from(origin) + (offset + unit / 2).div_euclid(unit) * unit)
+                .clamp(0, i128::from(u64::MAX)) as u64;
+        }
         let admission = self
             .jitter
-            .put(
-                timestamp,
-                payload.len() as u32,
-                self.ns(arrived_at),
-                payload,
-            )
+            .put(timestamp, span, self.ns(arrived_at), payload)
             .map_err(|_| DialError::Jitter)?;
         if admission == Admission::Accepted {
-            self.tail_end = Some(
-                self.tail_end
-                    .unwrap_or(0)
-                    .max(timestamp + payload.len() as u64),
-            );
+            self.tail_end = Some(self.tail_end.unwrap_or(0).max(timestamp + u64::from(span)));
         }
         Ok(())
     }
+    #[cfg(test)]
     pub(crate) fn poll(
         &mut self,
         now: Instant,
         pcm: &mut [f32],
     ) -> Result<IaxPeerEvent, DialError> {
+        self.poll_with_codec(now, pcm, None)
+    }
+    pub(crate) fn poll_with_codec(
+        &mut self,
+        now: Instant,
+        pcm: &mut [f32],
+        decoder: Option<&mut Decoder>,
+    ) -> Result<IaxPeerEvent, DialError> {
         self.release_deadline = None;
         if self.pending.is_some() {
-            return self.decode_pending(now, pcm);
+            return self.decode_pending(now, pcm, decoder);
         }
         if !self.active {
             return if let Some(timestamp) = self.next_key.take() {
@@ -134,7 +184,7 @@ impl Playout {
         }
         let decision = self
             .jitter
-            .get(self.ns(now), 160, &mut self.encoded)
+            .get(self.ns(now), self.jitter.release_span(), &mut self.encoded)
             .map_err(|_| DialError::Jitter)?;
         match decision.kind {
             Kind::NotDue => {
@@ -151,24 +201,28 @@ impl Playout {
                 }
             }
             Kind::Packet => {
-                if decision.span as usize != decision.length {
+                let frames = match &decoder {
+                    Some(decoder) => {
+                        decoder
+                            .inspect(&self.encoded[..decision.length])
+                            .map_err(DialError::Provider)?
+                            .frames
+                    }
+                    None => decision.length as u32,
+                };
+                if decision.span != frames {
                     return Err(DialError::Jitter);
                 }
-                let offset = decision.start_offset;
+                self.pending_prefix = decision.start_offset.max(0) as u32;
                 self.pending = Some(decision);
-                if offset > 0 {
-                    Ok(IaxPeerEvent::Gap(offset as usize))
-                } else {
-                    self.decode_pending(now, pcm)
-                }
+                self.decode_pending(now, pcm, decoder)
             }
             Kind::Missing | Kind::Insertion => {
                 if self.ending && self.tail_end.is_some_and(|end| decision.timestamp >= end) {
                     return self.finish();
                 }
-                let count = decision.span as usize;
-                self.commit(now, &decision)?;
-                Ok(IaxPeerEvent::Gap(count))
+                self.pending = Some(decision);
+                self.decode_pending(now, pcm, decoder)
             }
         }
     }
@@ -213,16 +267,97 @@ impl Playout {
         candidate
     }
 
-    fn decode_pending(&mut self, now: Instant, pcm: &mut [f32]) -> Result<IaxPeerEvent, DialError> {
+    fn decode_pending(
+        &mut self,
+        now: Instant,
+        pcm: &mut [f32],
+        decoder: Option<&mut Decoder>,
+    ) -> Result<IaxPeerEvent, DialError> {
+        if self.pending_prefix != 0 {
+            let event = Self::gap_event(self.pending_prefix, pcm, decoder)?;
+            self.pending_prefix = 0;
+            return Ok(event);
+        }
         let decision = self.pending.as_ref().expect("pending packet");
+        if decision.kind != Kind::Packet {
+            // An adaptive delay insertion is not missing source audio: do not
+            // advance codec history. Only actual loss requests native PLC.
+            let event = Self::gap_event(
+                decision.span,
+                pcm,
+                if decision.kind == Kind::Missing {
+                    decoder
+                } else {
+                    None
+                },
+            )?;
+            let decision = self.pending.take().expect("rendered gap");
+            self.commit(now, &decision)?;
+            return Ok(event);
+        }
         let skip = decision.start_offset.saturating_neg().max(0) as usize;
-        let count = G711Ulaw
-            .decode(&self.encoded[skip..decision.length], pcm)
-            .map_err(DialError::Decode)?;
+        let count = match decoder {
+            Some(decoder) => {
+                if pcm.is_empty() {
+                    return Err(DialError::Decode(crate::codec::CodecError {
+                        required: 1,
+                        available: 0,
+                    }));
+                }
+                if self.decoded_count == 0 {
+                    // One packet's source PCM, not another timing queue. Allocation
+                    // and the whole compressed decode stay on this network owner.
+                    let required = decision.span as usize;
+                    self.decoded
+                        .try_reserve(required.saturating_sub(self.decoded.len()))
+                        .map_err(|_| DialError::InvalidOptions)?;
+                    self.decoded.resize(required, 0.0);
+                    self.decoded_count = decoder
+                        .decode_recovering(&self.encoded[..decision.length], &mut self.decoded)
+                        .map_err(DialError::Provider)?;
+                    if self.decoded_count == 0 {
+                        let count = decision.span as usize - skip;
+                        let decision = self.pending.take().expect("unrecoverable media span");
+                        self.commit(now, &decision)?;
+                        return Ok(IaxPeerEvent::Gap(count));
+                    }
+                    self.decoded_position = skip.min(self.decoded_count);
+                }
+                let count = (self.decoded_count - self.decoded_position).min(pcm.len());
+                pcm[..count].copy_from_slice(
+                    &self.decoded[self.decoded_position..self.decoded_position + count],
+                );
+                self.decoded_position += count;
+                if self.decoded_position < self.decoded_count {
+                    self.last_release = Some(now);
+                    return Ok(IaxPeerEvent::Audio(count));
+                }
+                self.decoded_count = 0;
+                self.decoded_position = 0;
+                count
+            }
+            None => G711Ulaw
+                .decode(&self.encoded[skip..decision.length], pcm)
+                .map_err(DialError::Decode)?,
+        };
         let decision = self.pending.take().expect("decoded packet");
         self.commit(now, &decision)?;
         self.last_release = Some(now);
         Ok(IaxPeerEvent::Audio(count))
+    }
+
+    fn gap_event(
+        span: u32,
+        pcm: &mut [f32],
+        decoder: Option<&mut Decoder>,
+    ) -> Result<IaxPeerEvent, DialError> {
+        if let Some(decoder) = decoder {
+            let frames = decoder.conceal(span, pcm).map_err(DialError::Provider)?;
+            if frames != 0 {
+                return Ok(IaxPeerEvent::Audio(frames));
+            }
+        }
+        Ok(IaxPeerEvent::Gap(span as usize))
     }
 
     fn commit(&mut self, now: Instant, decision: &Decision) -> Result<(), DialError> {
@@ -247,7 +382,11 @@ impl Playout {
     fn clear(&mut self) -> Result<(), DialError> {
         self.completed = self.observe()?;
         self.jitter.reset().map_err(|_| DialError::Jitter)?;
+        self.source_origin = None;
         self.pending = None;
+        self.pending_prefix = 0;
+        self.decoded_count = 0;
+        self.decoded_position = 0;
         self.release_deadline = None;
         self.tail_end = None;
         self.released_to = 0;

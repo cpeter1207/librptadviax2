@@ -184,6 +184,50 @@ mod tests {
     use std::{thread, time::Duration};
 
     #[test]
+    fn oversized_receive_does_not_stop_other_peers_or_admission() {
+        let runtime = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let receiver = runtime.block_on(UdpSocket::bind("127.0.0.1:0")).unwrap();
+        let local = receiver.local_addr().unwrap();
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let remote = sender.local_addr().unwrap();
+        crate::network::inject_receive(local, Ok((MAX_DATAGRAM_SIZE + 1, remote)));
+        let mut router = PeerIngressRouter::new(1).unwrap();
+        let mut peer = router.register_call(remote, 22, 42, 7).unwrap();
+        let mut pump = ListenerIngress::start(runtime.clone(), Arc::new(receiver), router);
+        let packet = serialize_full_frame(
+            &FullFrameHeader {
+                source_call_number: 42,
+                destination_call_number: 22,
+                retransmission: false,
+                timestamp: 0,
+                outgoing_sequence: 0,
+                incoming_sequence: 0,
+                frame_type: 6,
+                subclass: IaxCommand::Ack.subclass_value() as u8,
+                subclass_is_log: false,
+            },
+            &[],
+        )
+        .unwrap();
+        sender.send_to(&packet, local).unwrap();
+        let received = runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(2), peer.receive())
+                .await
+                .unwrap()
+                .unwrap()
+        });
+        assert_eq!(received.payload(), packet);
+        assert!(!peer.failed());
+        assert_eq!(pump.stats().active_routes, 1);
+        assert!(pump.try_receive().unwrap().is_none());
+    }
+
+    #[test]
     fn stopped_before_first_poll_fails_admission_and_established_peers() {
         let runtime = Arc::new(
             tokio::runtime::Builder::new_current_thread()
@@ -265,9 +309,7 @@ mod tests {
         assert_eq!(pump.stats().admission.dropped_packets, 64);
         assert_eq!(pump.stats().admission.capacity_packets, 64);
         assert_eq!(pump.stats().active_routes, 1);
-        sender
-            .send_to(&[0; MAX_DATAGRAM_SIZE + 1], address)
-            .unwrap();
+        sender.send_to(&[0; 65_507], address).unwrap();
         sender.send_to(&[0x80, 0], address).unwrap();
         sender
             .send_to(&packet(23, IaxCommand::Ack), address)

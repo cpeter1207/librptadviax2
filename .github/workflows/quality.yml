@@ -4,13 +4,28 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+    inputs:
+      coverage_only:
+        description: Measure coverage without running the full gate
+        type: boolean
+        default: false
 
 permissions:
   contents: read
+  packages: read
 
 jobs:
   quality:
-    uses: cpeter1207/rptadv-shared-library-workflows/.github/workflows/quality.yml@main
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.coverage_only) }}
+    uses: cpeter1207/rptadv-shared-library-workflows/.github/workflows/quality.yml@ci/codec-provider-image
     with:
       code_ref: ${{ github.sha }}
       full: ${{ github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch' }}
+      quality_image: ghcr.io/cpeter1207/rptadv-codecs-quality-debian13:latest
+  coverage:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.coverage_only }}
+    uses: cpeter1207/rptadv-shared-library-workflows/.github/workflows/codec-focused.yml@ci/codec-provider-image
+    with:
+      repository: librptadviax2
+      source_sha: ${{ github.sha }}
+      target: coverage

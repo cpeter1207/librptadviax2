@@ -1,7 +1,7 @@
 use rptadviax2::ffi::{
     RPTADV_IAX2_CLIENT_ABI_VERSION, RPTADV_IAX2_CLIENT_CAPABILITY, RPTADV_IAX2_SERVER_ABI_VERSION,
-    RPTADV_IAX2_SERVER_CAPABILITY, rptadv_iax2_client_descriptor_v1, rptadv_iax2_dial_options_v1,
-    rptadv_iax2_server_descriptor_v1,
+    RPTADV_IAX2_SERVER_CAPABILITY, rptadv_iax2_client_descriptor_v2, rptadv_iax2_dial_options_v2,
+    rptadv_iax2_server_descriptor_v2,
 };
 use std::mem::size_of;
 
@@ -25,8 +25,8 @@ fn async_descriptor_v1_creates_and_releases_a_runtime_for_external_consumers() {
 }
 
 #[test]
-fn descriptor_v1_exposes_dial_and_media_operations() {
-    let descriptor = rptadv_iax2_client_descriptor_v1();
+fn descriptor_v2_exposes_dial_and_media_operations() {
+    let descriptor = rptadv_iax2_client_descriptor_v2();
     assert!(!descriptor.is_null());
 
     let descriptor = unsafe { &*descriptor };
@@ -38,20 +38,22 @@ fn descriptor_v1_exposes_dial_and_media_operations() {
     assert_eq!(descriptor.capability, RPTADV_IAX2_CLIENT_CAPABILITY);
     assert!(descriptor.dial.is_some());
     assert!(descriptor.sample_rate_hz.is_some());
-    assert!(descriptor.send_audio.is_some());
     assert!(descriptor.send_text.is_some());
     assert!(descriptor.poll.is_some());
     assert!(descriptor.hangup.is_some());
     assert!(descriptor.destroy.is_some());
     assert!(descriptor.send_digit.is_some());
-    assert!(descriptor.prepare_ulaw.is_some());
-    assert!(descriptor.send_prepared_ulaw.is_some());
+    assert!(descriptor.open_catalog.is_some());
+    assert!(descriptor.close_catalog.is_some());
+    assert!(descriptor.prepare_audio.is_some());
+    assert!(descriptor.reset_encoder.is_some());
+    assert!(descriptor.send_prepared_audio.is_some());
     assert!(descriptor.elapsed_ms.is_some());
 }
 
 #[test]
-fn server_descriptor_v1_exposes_listener_operations() {
-    let descriptor = rptadv_iax2_server_descriptor_v1();
+fn server_descriptor_v2_exposes_listener_operations() {
+    let descriptor = rptadv_iax2_server_descriptor_v2();
     assert!(!descriptor.is_null());
 
     let descriptor = unsafe { &*descriptor };
@@ -65,10 +67,10 @@ fn server_descriptor_v1_exposes_listener_operations() {
 
 #[test]
 fn dial_rejects_invalid_options_and_clears_output_handle() {
-    let descriptor = unsafe { &*rptadv_iax2_client_descriptor_v1() };
+    let descriptor = unsafe { &*rptadv_iax2_client_descriptor_v2() };
     let dial = descriptor.dial.unwrap();
-    let mut options = rptadv_iax2_dial_options_v1 {
-        struct_size: size_of::<rptadv_iax2_dial_options_v1>() as u32,
+    let mut options = rptadv_iax2_dial_options_v2 {
+        struct_size: size_of::<rptadv_iax2_dial_options_v2>() as u32,
         abi_version: RPTADV_IAX2_CLIENT_ABI_VERSION,
         remote_address: std::ptr::null(),
         remote_address_length: 0,
@@ -81,6 +83,7 @@ fn dial_rejects_invalid_options_and_clears_output_handle() {
         secret: std::ptr::null(),
         secret_length: 0,
         timeout_ms: 0,
+        catalog: std::ptr::null(),
     };
     let mut peer = std::ptr::dangling_mut::<std::ffi::c_void>();
 

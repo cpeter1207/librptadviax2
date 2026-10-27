@@ -1,10 +1,33 @@
 use crate::ingress::{
-    IngressError, IngressPushError, PeerIngressRouter, PeerIngressRouterError, producer_ingress,
+    IngressError, IngressPushError, MAX_DATAGRAM_SIZE, PeerIngressRouter, PeerIngressRouterError,
+    producer_ingress,
 };
 use std::net::SocketAddr;
 
 fn address(port: u16) -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], port))
+}
+
+#[test]
+fn ingress_datagram_bounds_cover_udp_without_reserving_maximum_bytes_per_slot() {
+    use crate::ingress::{InboundDatagram, MAX_DATAGRAM_SIZE};
+    assert_eq!(MAX_DATAGRAM_SIZE, 65527);
+    assert!(std::mem::size_of::<InboundDatagram>() < 128);
+    let (mut producer, mut owner) = producer_ingress(1, 77).unwrap();
+    let mut payload = vec![0xa5; MAX_DATAGRAM_SIZE];
+    payload[MAX_DATAGRAM_SIZE - 1] = 0x5a;
+    producer.try_push(address(1), &payload).unwrap();
+    assert_eq!(
+        producer.try_push(address(1), &[9]),
+        Err(IngressPushError::Full)
+    );
+    assert_eq!(owner.try_pop().unwrap().payload(), payload);
+    payload.push(0);
+    assert!(matches!(
+        producer.try_push(address(1), &payload),
+        Err(IngressPushError::DatagramTooLarge { .. })
+    ));
+    assert!(owner.try_pop().is_none());
 }
 
 #[test]
@@ -198,10 +221,12 @@ fn rejects_zero_capacity_and_oversized_datagrams() {
         IngressError::ZeroCapacity
     );
     let (mut producer, mut owner) = producer_ingress(1, 1).unwrap();
-    let oversized = vec![0; 1501];
+    let oversized = vec![0; MAX_DATAGRAM_SIZE + 1];
     assert_eq!(
         producer.try_push(address(1), &oversized).unwrap_err(),
-        IngressPushError::DatagramTooLarge { length: 1501 }
+        IngressPushError::DatagramTooLarge {
+            length: MAX_DATAGRAM_SIZE + 1
+        }
     );
     assert!(owner.try_pop().is_none());
 }
@@ -347,8 +372,10 @@ fn call_routes_validate_ids_track_drops_and_retire_by_generation() {
         Err(PeerIngressRouterError::UnknownPeer)
     );
     assert_eq!(
-        router.route_call(address(10), 100, 200, &[0; 1501]),
-        Err(PeerIngressRouterError::DatagramTooLarge { length: 1501 })
+        router.route_call(address(10), 100, 200, &[0; MAX_DATAGRAM_SIZE + 1]),
+        Err(PeerIngressRouterError::DatagramTooLarge {
+            length: MAX_DATAGRAM_SIZE + 1
+        })
     );
 
     router.route_call(address(10), 100, 200, &[1]).unwrap();
@@ -392,8 +419,10 @@ fn router_rejects_unknown_sources_and_keeps_known_queues_live() {
     router.route(address(1), &[1]).unwrap();
     assert_eq!(owner.try_pop().unwrap().payload(), [1]);
     assert_eq!(
-        router.route(address(1), &vec![0; 1501]),
-        Err(PeerIngressRouterError::DatagramTooLarge { length: 1501 })
+        router.route(address(1), &vec![0; MAX_DATAGRAM_SIZE + 1]),
+        Err(PeerIngressRouterError::DatagramTooLarge {
+            length: MAX_DATAGRAM_SIZE + 1
+        })
     );
 }
 

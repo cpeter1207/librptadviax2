@@ -8,10 +8,12 @@ use std::{
 
 const CAPABILITY: [u8; 16] = *b"rptadv.jitter\0\0\0";
 /// Maximum opaque datagram payload accepted by the composed jitter capability.
-pub(crate) const MAX_PAYLOAD: usize = 1500;
+pub(crate) const MAX_PAYLOAD: usize = crate::ingress::MAX_DATAGRAM_SIZE - 4;
 /// Source clock used by the negotiated ULAW media stream.
+#[cfg(test)]
 pub(crate) const CLOCK_RATE_HZ: u32 = 8000;
 /// Smallest missing/insertion span emitted by the composed jitter capability.
+#[cfg(test)]
 pub(crate) const CONCEALMENT_SPAN: u32 = 80;
 
 #[repr(C)]
@@ -127,6 +129,7 @@ pub(crate) struct Decision {
 pub(crate) struct Jitter {
     api: Descriptor,
     context: NonNull<c_void>,
+    release_span: u32,
 }
 
 // The capability contract permits thread migration and forbids simultaneous calls.
@@ -139,7 +142,22 @@ impl Jitter {
     /// # Safety
     /// `descriptor` must be readable for its declared size, and its implementing
     /// DSO must remain loaded until this context is dropped. Functions must obey ABI1.
+    #[cfg(test)]
     pub(crate) unsafe fn new(descriptor: *const c_void) -> Result<Self, Error> {
+        unsafe { Self::new_at_rate(descriptor, CLOCK_RATE_HZ, CONCEALMENT_SPAN) }
+    }
+    /// Compose the same millisecond delay policy at the selected source clock.
+    /// # Safety
+    /// The descriptor must be readable for its declared size and its DSO must
+    /// remain loaded until this exclusive context is destroyed.
+    pub(crate) unsafe fn new_at_rate(
+        descriptor: *const c_void,
+        rate: u32,
+        loss_unit: u32,
+    ) -> Result<Self, Error> {
+        if !matches!(rate, 8000 | 16000 | 48000) || loss_unit == 0 || loss_unit > rate / 2 {
+            return Err(Error::InvalidDescriptor);
+        }
         if descriptor.is_null() {
             return Err(Error::InvalidDescriptor);
         }
@@ -167,12 +185,12 @@ impl Jitter {
         let options = Config {
             struct_size: size_of::<Config>() as u32,
             abi_version: 1,
-            clock_rate_hz: CLOCK_RATE_HZ,
-            minimum_delay: 1280,
-            initial_delay: 1440,
-            maximum_delay: 4000,
-            adjustment_step: CONCEALMENT_SPAN,
-            concealment_span: CONCEALMENT_SPAN,
+            clock_rate_hz: rate,
+            minimum_delay: rate * 160 / 1000,
+            initial_delay: rate * 180 / 1000,
+            maximum_delay: rate / 2,
+            adjustment_step: rate / 100,
+            concealment_span: loss_unit,
             maximum_packets: 64,
             maximum_payload_bytes: MAX_PAYLOAD as u32,
         };
@@ -183,7 +201,13 @@ impl Jitter {
         Ok(Self {
             api,
             context: NonNull::new(context).ok_or(Error::OperationFailed)?,
+            release_span: (rate / 50).div_ceil(loss_unit) * loss_unit,
         })
+    }
+
+    /// Closest complete coding-unit request at least the ordinary 20 ms quantum.
+    pub(crate) fn release_span(&self) -> u32 {
+        self.release_span
     }
 
     /// Start a new timestamp/receive epoch, discarding old buffered media.
@@ -297,7 +321,7 @@ fn status(value: i32) -> Result<(), Error> {
 }
 
 #[cfg(test)]
-#[path = "jitter_fixture.rs"]
+#[path = "jitter_fixture_tests.rs"]
 pub(crate) mod fixture;
 
 #[cfg(test)]
@@ -307,6 +331,17 @@ mod tests {
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
+
+    #[test]
+    fn invalid_source_clock_and_loss_units_fail_before_context_creation() {
+        let descriptor = descriptor();
+        for (rate, loss_unit) in [(44100, 160), (8000, 0), (8000, 4001)] {
+            assert!(matches!(
+                unsafe { Jitter::new_at_rate(ptr::from_ref(&descriptor).cast(), rate, loss_unit) },
+                Err(Error::InvalidDescriptor)
+            ));
+        }
+    }
 
     struct State {
         config: Config,
@@ -422,7 +457,7 @@ mod tests {
                 config.maximum_packets,
                 config.maximum_payload_bytes
             ),
-            (8000, 1280, 1440, 4000, 80, 80, 64, 1500)
+            (8000, 1280, 1440, 4000, 80, 80, 64, MAX_PAYLOAD as u32)
         );
         let destroyed = unsafe { &*jitter.context.as_ptr().cast::<State>() }
             .destroyed

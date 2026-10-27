@@ -3,7 +3,7 @@ use crate::{
     codec::{CodecAdapter, G711Ulaw, IAX_FORMAT_ULAW, ULAW_SAMPLE_RATE_HZ},
     ffi::{
         RPTADV_IAX2_CLIENT_ABI_VERSION, RPTADV_IAX2_EVENT_AUDIO, RPTADV_IAX2_EVENT_NONE,
-        RPTADV_IAX2_EVENT_TEXT, rptadv_iax2_client_descriptor_v1, rptadv_iax2_dial_options_v1,
+        RPTADV_IAX2_EVENT_TEXT, rptadv_iax2_client_descriptor_v2, rptadv_iax2_dial_options_v2,
     },
     information_elements::{InformationElement, serialize_information_elements},
     media::{VoiceFrame, parse_voice_frame},
@@ -11,12 +11,121 @@ use crate::{
         FullFrameHeader, IaxCommand, decode_iax_command, encode_subclass, parse_full_frame_packet,
         serialize_full_frame,
     },
+    session::CallSetupError,
 };
 use std::{ffi::c_void, net::UdpSocket, ptr, thread, time::Duration};
 
 const LOCAL_CALL: u16 = 1234;
 const REMOTE_CALL: u16 = 5678;
 const ULAW: u32 = 0x4;
+
+#[test]
+fn formats_egress_codec_packet_timing_uses_retained_opus_provider() {
+    use crate::{
+        codec::providers::{CodecCatalog, ProfileId, ProviderSelection},
+        formats::{FormatCatalog, FormatOffer},
+    };
+    let directory =
+        std::path::PathBuf::from(std::env::var_os("RPTADV_CODEC_DIR").unwrap_or_default());
+    let codecs = std::sync::Arc::new(
+        CodecCatalog::load(&[ProviderSelection {
+            path: directory.join("librptadv_codec_opus.so.1"),
+            profiles: vec![ProfileId::Opus],
+        }])
+        .unwrap(),
+    );
+    let catalog = std::sync::Arc::new(FormatCatalog::new(codecs, &[ProfileId::Opus]).unwrap());
+    let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+    server
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let remote = server.local_addr().unwrap();
+    let responder = thread::spawn(move || {
+        let mut bytes = [0; 1500];
+        let (length, client) = server.recv_from(&mut bytes).unwrap();
+        let new = parse_full_frame_packet(&bytes[..length]).unwrap();
+        let offer = FormatOffer::parse(
+            &crate::information_elements::parse_information_elements(new.payload).unwrap(),
+        );
+        assert_eq!((offer.format, offer.capability), (1u64 << 34, 1u64 << 34));
+        let mut accept = vec![0];
+        accept.extend_from_slice(&(1u64 << 34).to_be_bytes());
+        send_ie(
+            &server,
+            client,
+            (REMOTE_CALL, LOCAL_CALL, 0, 1, IaxCommand::Accept),
+            &[InformationElement {
+                kind: 56,
+                data: &accept,
+            }],
+        );
+        server.recv_from(&mut bytes).unwrap();
+        send_answer(&server, client, 1, 1);
+        let (length, _) = server.recv_from(&mut bytes).unwrap();
+        let VoiceFrame::Full { payload, .. } =
+            parse_voice_frame(&bytes[..length], 1u64 << 34).unwrap()
+        else {
+            panic!("first Opus media must establish its full-frame format");
+        };
+        assert!(!payload.is_empty());
+        assert_ne!(payload.len(), 960);
+    });
+    let mut peer = crate::client::dial(
+        DialOptions {
+            remote,
+            local_call: LOCAL_CALL,
+            local_node: "524950",
+            remote_node: "506316",
+            secret: "",
+            timeout: Duration::from_secs(2),
+        },
+        catalog,
+    )
+    .unwrap();
+    assert_eq!((peer.format(), peer.sample_rate_hz()), (1u64 << 34, 48000));
+    let mut encoded = [0; 4000];
+    let first = peer.prepare_audio(&[0.0; 37], &mut encoded, false).unwrap();
+    assert_eq!((first.consumed_frames, first.encoded_bytes), (37, 0));
+    let result = peer
+        .prepare_audio(&[0.0; 923], &mut encoded, false)
+        .unwrap();
+    assert_eq!(
+        (
+            result.consumed_frames,
+            result.source_start_frames,
+            result.source_frames,
+            result.packet_frames
+        ),
+        (923, 0, 648, 960)
+    );
+    assert_ne!(result.encoded_bytes, result.packet_frames as usize);
+    assert_eq!(
+        peer.send_prepared_audio(&encoded[..result.encoded_bytes], result.packet_frames, 100)
+            .unwrap(),
+        crate::client::MediaSend::Accepted
+    );
+    let tail = peer.prepare_audio(&[], &mut encoded, true).unwrap();
+    assert_eq!(
+        (
+            tail.consumed_frames,
+            tail.source_start_frames,
+            tail.source_frames,
+            tail.packet_frames
+        ),
+        (0, 648, 312, 960)
+    );
+    assert!(tail.encoded_bytes != 0);
+    assert_eq!(
+        peer.prepare_audio(&[], &mut encoded, true)
+            .unwrap()
+            .encoded_bytes,
+        0
+    );
+    peer.reset_encoder().unwrap();
+    let empty = peer.prepare_audio(&[], &mut encoded, true).unwrap();
+    assert_eq!((empty.encoded_bytes, empty.packet_frames), (0, 0));
+    responder.join().unwrap();
+}
 
 fn interop_peer(ack_first: bool) -> (crate::client::IaxPeer, UdpSocket) {
     let server = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -301,7 +410,7 @@ fn interop_first_voice_bootstraps_codec_before_mini_frames() {
     peer.send_ulaw(&[0.0; 160], 40).unwrap();
     let (length, _) = server.recv_from(&mut bytes).unwrap();
     assert!(matches!(
-        parse_voice_frame(&bytes[..length], ULAW).unwrap(),
+        parse_voice_frame(&bytes[..length], u64::from(ULAW)).unwrap(),
         VoiceFrame::Mini { .. }
     ));
     peer.send_text(b"K? * 524950 0 0").unwrap();
@@ -807,7 +916,7 @@ fn dials_an_8khz_ulaw_call_through_calltoken_and_md5_authentication() {
         send_answer(&server, client, 2, 2);
 
         let (length, _) = server.recv_from(&mut bytes).unwrap();
-        let outbound = parse_voice_frame(&bytes[..length], ULAW).unwrap();
+        let outbound = parse_voice_frame(&bytes[..length], u64::from(ULAW)).unwrap();
         let VoiceFrame::Full {
             header, payload, ..
         } = outbound
@@ -882,8 +991,8 @@ fn dials_an_8khz_ulaw_call_through_calltoken_and_md5_authentication() {
     let local_node = b"524950";
     let remote_node = b"506315";
     let secret = b"test-secret";
-    let options = rptadv_iax2_dial_options_v1 {
-        struct_size: std::mem::size_of::<rptadv_iax2_dial_options_v1>() as u32,
+    let options = rptadv_iax2_dial_options_v2 {
+        struct_size: std::mem::size_of::<rptadv_iax2_dial_options_v2>() as u32,
         abi_version: RPTADV_IAX2_CLIENT_ABI_VERSION,
         remote_address: remote_address.as_ptr(),
         remote_address_length: remote_address.len(),
@@ -896,16 +1005,45 @@ fn dials_an_8khz_ulaw_call_through_calltoken_and_md5_authentication() {
         secret: secret.as_ptr(),
         secret_length: secret.len(),
         timeout_ms: 1000,
+        catalog: crate::ffi::test_catalog(),
     };
-    let descriptor = unsafe { &*rptadv_iax2_client_descriptor_v1() };
+    let descriptor = unsafe { &*rptadv_iax2_client_descriptor_v2() };
     let mut peer: *mut c_void = ptr::null_mut();
     assert_eq!(unsafe { descriptor.dial.unwrap()(&options, &mut peer) }, 0);
     assert!(!peer.is_null());
     assert_eq!(unsafe { descriptor.sample_rate_hz.unwrap()(peer) }, 8_000);
 
     let outbound = [0.25_f32; 160];
+    let mut encoded = [0; 160];
+    let mut result = crate::codec::providers::EncodeResultRaw {
+        struct_size: std::mem::size_of::<crate::codec::providers::EncodeResultRaw>() as u32,
+        ..Default::default()
+    };
     assert_eq!(
-        unsafe { descriptor.send_audio.unwrap()(peer, outbound.as_ptr(), outbound.len()) },
+        unsafe {
+            descriptor.prepare_audio.unwrap()(
+                peer,
+                outbound.as_ptr(),
+                outbound.len(),
+                encoded.as_mut_ptr(),
+                encoded.len(),
+                0,
+                &mut result,
+            )
+        },
+        0
+    );
+    assert_eq!(result.consumed_frames, outbound.len());
+    assert_eq!(
+        unsafe {
+            descriptor.send_prepared_audio.unwrap()(
+                peer,
+                encoded.as_ptr(),
+                result.encoded_bytes,
+                result.packet_frames,
+                0,
+            )
+        },
         0
     );
     let mut received = [0.0; 160];
@@ -988,7 +1126,7 @@ fn direct_peer_api_reports_metadata_and_sends_ulaw() {
             Some(IaxCommand::New)
         );
 
-        let format = IAX_FORMAT_ULAW.to_be_bytes();
+        let format = (IAX_FORMAT_ULAW as u32).to_be_bytes();
         send_ie(
             &server,
             client_addr,
@@ -1230,7 +1368,7 @@ fn direct_peer_api_reports_metadata_and_sends_ulaw() {
     }
 
     assert!(matches!(
-        peer.send_ulaw(&vec![0.25; 1500], 80),
+        peer.send_ulaw(&vec![0.25; crate::ingress::MAX_DATAGRAM_SIZE], 80),
         Err(crate::client::DialError::Encode(_))
     ));
     assert!(matches!(
@@ -1260,7 +1398,7 @@ fn direct_peer_reports_radio_key_control_frames() {
             decode_iax_command(&new.header).unwrap(),
             Some(IaxCommand::New)
         );
-        let format = IAX_FORMAT_ULAW.to_be_bytes();
+        let format = (IAX_FORMAT_ULAW as u32).to_be_bytes();
         send_ie(
             &responder,
             client,
@@ -1513,7 +1651,7 @@ fn dial_stops_retransmitting_after_the_transmission_limit() {
 }
 
 #[test]
-fn dial_acks_but_rejects_a_non_ulaw_accepted_format() {
+fn dial_rejects_a_multibit_accepted_format() {
     let server = UdpSocket::bind("127.0.0.1:0").unwrap();
     server
         .set_read_timeout(Some(Duration::from_secs(1)))
@@ -1536,25 +1674,26 @@ fn dial_acks_but_rejects_a_non_ulaw_accepted_format() {
                 data: &(ULAW | 0x08).to_be_bytes(),
             }],
         );
-        let (length, _) = server.recv_from(&mut packet).unwrap();
-        assert_eq!(
-            decode_iax_command(&parse_full_frame_packet(&packet[..length]).unwrap().header)
-                .unwrap(),
-            Some(IaxCommand::Ack)
-        );
     });
 
-    assert!(matches!(
-        dial_ulaw(DialOptions {
-            remote,
-            local_call: LOCAL_CALL,
-            local_node: "524950",
-            remote_node: "506315",
-            secret: "",
-            timeout: Duration::from_secs(1),
-        }),
-        Err(DialError::UnsupportedFormat(12))
-    ));
+    let error = dial_ulaw(DialOptions {
+        remote,
+        local_call: LOCAL_CALL,
+        local_node: "524950",
+        remote_node: "506315",
+        secret: "",
+        timeout: Duration::from_secs(1),
+    })
+    .err();
+    assert!(
+        matches!(
+            error,
+            Some(DialError::Protocol(CallSetupError::UnacceptedFormat {
+                format: 12
+            }))
+        ),
+        "{error:?}"
+    );
     responder.join().unwrap();
 }
 

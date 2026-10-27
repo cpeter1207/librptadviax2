@@ -22,3 +22,39 @@
 - **IA-015:** An established outbound session may issue one PING at a time. It replies to peer PING with a timestamp-echoing PONG; ACKs every valid PONG, reports whether its timestamp matched the outstanding probe, and clears only a matching probe; accepts peer ACKs without changing sequence state; and resends the same PONG for an identical reliable PING retransmission. The caller owns probe scheduling and network I/O.
 - **IA-016:** The first media codec adapter is G.711 μ-law, backed by a released codec library. It advertises the RFC 5456 format bit `0x00000004` at 8 kHz, converts normalized mono `f32` PCM to and from μ-law without allocating, and remains separate from IAX packet parsing and UDP datagram I/O.
 - **IA-017:** The outbound UDP client retransmits its outstanding reliable setup frame when its response is lost. Retransmissions retain the source call, sequence, timestamp, and payload, set the destination retransmission flag, and refresh the incoming sequence from the setup state. The default schedule matches Asterisk's four-transmission policy: 100 ms initial delay, tenfold interval growth capped at 10 seconds; an earlier caller timeout still bounds setup.
+
+## Complete Asterisk 20 codec scope — approved 2026-10-26
+
+- **IA-018:** Support negotiated receive and transmit for all 19 audio formats
+  in Asterisk 20's IAX compatibility mapping: `g723`, `gsm`, `ulaw`, `alaw`,
+  `g726aal2`, `adpcm`, `slin`, `lpc10`, `g729`, `speex`, `ilbc`, `g726`,
+  `g722`, `siren7`, `siren14`, `slin16`, `g719`, `speex16`, and `opus`.
+  Use the corresponding legacy or extended wire-format negotiation, not
+  product-specific format IDs. Protocol recognition without a functioning
+  codec provider does not satisfy this requirement.
+- **IA-019:** Codec adapters remain separate from protocol and datagram I/O
+  and reuse released implementations wherever suitable, per IA-004/IA-005.
+  Preserve distinct G.726 packing variants and codec-specific framing,
+  sample rates and state. Advertise only functioning encode/decode providers;
+  this scope does not authorize incompatible licensing or commercial purchases.
+- **IA-020:** The user deferred `siren7`, `siren14`, and `g719` on 2026-10-26.
+  Keep those three requirements pending and exclude them from current codec
+  offers. The other 16 IA-018 formats remain the active implementation scope;
+  do not claim complete all-19 support while the deferred providers are absent.
+  Original implementations or additional license acquisition for the deferred
+  codecs require a separately resumed requirement.
+- **IA-021:** Each codec implementation is accessed through a replaceable,
+  versioned dynamic adapter with an implementation-neutral contract. Replacing
+  its backend must not require changes to protocol or controller code.
+  External-library types and calls remain inside the adapter.
+- **IA-022:** Prefer released GPLv2-compatible implementations wherever they
+  exist. An original implementation is permitted only if no suitable compatible
+  released implementation exists and the implementation is trivial. Leave
+  nontrivial missing implementations pending and unadvertised. This does not
+  resume the three formats explicitly deferred by IA-020.
+- **IA-023:** Codec adapters are protocol-neutral shared components usable by
+  other protocol adapters without an IAX2 dependency. Codec contracts expose
+  encoding/decoding and codec state, not IAX2 packet types or wire-format IDs.
+  The IAX2 adapter owns mapping codec identities to its negotiated wire formats
+  and transport packet framing. No additional protocol implementation is
+  authorized by this reuse requirement.

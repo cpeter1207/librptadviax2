@@ -14,7 +14,7 @@ pub enum VoiceFrame<'a> {
         /// IAX full-frame header.
         header: FullFrameHeader,
         /// Codec format bit carried by the full-frame subclass.
-        format: u32,
+        format: u64,
         /// Borrowed encoded audio payload.
         payload: &'a [u8],
     },
@@ -23,7 +23,7 @@ pub enum VoiceFrame<'a> {
         /// IAX mini-frame header.
         header: MiniFrameHeader,
         /// Codec format bit selected when the call was accepted.
-        format: u32,
+        format: u64,
         /// Borrowed encoded audio payload.
         payload: &'a [u8],
     },
@@ -108,7 +108,7 @@ pub fn encode_mini_voice_frame(
 /// caller's already-negotiated call state.
 pub fn parse_voice_frame(
     packet: &[u8],
-    negotiated_format: u32,
+    negotiated_format: u64,
 ) -> Result<VoiceFrame<'_>, VoiceFrameError> {
     if packet.len() < 2 {
         return Err(VoiceFrameError::Truncated {
@@ -135,7 +135,7 @@ fn parse_full_voice_frame(packet: &[u8]) -> Result<VoiceFrame<'_>, VoiceFrameErr
     let encoded_subclass = (u8::from(frame.header.subclass_is_log) << 7) | frame.header.subclass;
     let format = decode_subclass(encoded_subclass).map_err(VoiceFrameError::Subclass)?;
     let format =
-        u32::try_from(format).map_err(|_| VoiceFrameError::InvalidFormat { value: format })?;
+        u64::try_from(format).map_err(|_| VoiceFrameError::InvalidFormat { value: format })?;
     validate_format(format)?;
 
     Ok(VoiceFrame::Full {
@@ -147,7 +147,7 @@ fn parse_full_voice_frame(packet: &[u8]) -> Result<VoiceFrame<'_>, VoiceFrameErr
 
 fn parse_mini_voice_frame(
     packet: &[u8],
-    negotiated_format: u32,
+    negotiated_format: u64,
 ) -> Result<VoiceFrame<'_>, VoiceFrameError> {
     validate_format(negotiated_format)?;
     let frame = parse_mini_frame(packet).map_err(VoiceFrameError::MiniFrame)?;
@@ -158,10 +158,10 @@ fn parse_mini_voice_frame(
     })
 }
 
-fn validate_format(format: u32) -> Result<(), VoiceFrameError> {
+fn validate_format(format: u64) -> Result<(), VoiceFrameError> {
     if !format.is_power_of_two() {
         return Err(VoiceFrameError::InvalidFormat {
-            value: i64::from(format),
+            value: format as i64,
         });
     }
     Ok(())

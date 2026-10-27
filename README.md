@@ -5,7 +5,12 @@ construction/parsing separate from network I/O and codec adapters. Codec
 implementations belong in adapters that use released libraries where available;
 this project does not implement audio codecs.
 
-The standalone product loads this library for outbound and inbound ULAW links.
+The standalone product loads this library for outbound and inbound audio links.
+Codec providers supply ULAW, ALAW, GSM, G.723.1, G.726 AAL2, Dialogic ADPCM,
+SLIN, LPC10, G.729, Speex, iLBC, G.726, G.722, SLIN16, Speex16, and Opus.
+ULAW remains the first preference. IAX iLBC uses 30 ms; 20 ms interoperability is
+pending. G.723.1 sends 6.3 kb/s and accepts 5.3/6.3 kb/s. Siren7, Siren14 and G.719
+are not offered.
 The inbound listener applies Asterisk-compatible call tokens and product
 authorization, then routes accepted calls to bounded peer queues. This is the
 initial AllStarLink interoperability slice; it does not claim complete ASL3
@@ -29,8 +34,8 @@ or callback-context ownership. Detach runs off the Tokio executor, joins the
 last callback and receive task, and makes context release safe. Afterwards the
 peer may only be observed for diagnostics or destroyed. Retain this DSO through
 detach and retain any borrowed jitter capability/DSO through peer destruction.
-Without new ingress, turns fall back to the jitter concealment quantum (80 ULAW
-samples at 8 kHz, or 10 ms). A nonempty mailbox that makes no progress waits for
+Without new ingress, turns fall back to the negotiated codec's concealment
+quantum. A nonempty mailbox that makes no progress waits for
 readiness or that timer, avoiding a busy loop while the downstream ring is full.
 
 `server_enable(runtime, server)` transfers a listener's receive socket/router to
@@ -55,8 +60,9 @@ NEW-queue occupancy/full drops and active-route count without a routing lock.
 
 ## Release integration
 
-The library uses SONAME `librptadviax2.so.1` and synchronous ABI 1.
-Debian 13 release assets provide `librptadv-iax2-client1` and
+The library uses SONAME `librptadviax2.so.2` and client/server ABI 2.
+The optional async descriptor remains ABI 1. Codec providers use neutral ABI 1.
+Debian 13 release assets provide `librptadv-iax2-client2` and
 `librptadv-iax2-client-dev` for amd64 and arm64. Consumers select an explicit
 release tag and use the versioned dynamic library. Packages are also available
 from the [shared signed APT repository](https://cpeter1207.github.io/USBRadioPlus/).
@@ -80,10 +86,11 @@ apply. This recovery does not change packet-jitter or PCM buffering settings.
 The optional async table composes a host-supplied packet-jitter descriptor; the
 host retains that descriptor's dynamic library until peer destruction. Peers
 configured this way may emit event `RPTADV_IAX2_EVENT_GAP` (7), whose length is an
-ordered count of missing 8 kHz source samples, not a PCM-buffer length. Forward
+ordered count of missing negotiated-rate source samples, not a PCM-buffer length. Forward
 that count to the shared PCM ring's counted-gap operation before later PCM.
-Only the ring performs concealment; this library does not fill gaps with zeros
-or run a second PLC. Unconfigured synchronous peers do not emit this event.
+The codec first supplies its own supported concealment. Only the remaining gap
+is sent to the shared ring for fallback concealment. Codec-recovered samples
+are not concealed again. Unconfigured synchronous peers do not emit this event.
 
 ## Local checks
 

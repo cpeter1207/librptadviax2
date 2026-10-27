@@ -2,7 +2,10 @@
 
 use crate::{
     codec::{CodecAdapter, CodecError, G711Ulaw, IAX_FORMAT_ULAW, ULAW_SAMPLE_RATE_HZ},
-    information_elements::InformationElement,
+    formats::{FormatCatalog, IaxFormat, append_formats},
+    information_elements::{
+        InformationElement, parse_information_elements, serialize_information_elements,
+    },
     ingress::IngressConsumer,
     media::{VoiceFrame, VoiceFrameEncodeError, VoiceFrameError, parse_voice_frame},
     network::{SharedSocket, UdpEndpoint},
@@ -22,8 +25,6 @@ const IE_CALLED_NUMBER: u8 = 1;
 const IE_CALLING_NUMBER: u8 = 2;
 const IE_CALLING_ANI: u8 = 3;
 const IE_USERNAME: u8 = 6;
-const IE_CAPABILITY: u8 = 8;
-const IE_FORMAT: u8 = 9;
 const IE_VERSION: u8 = 11;
 const INITIAL_RETRY: Duration = Duration::from_millis(100);
 const MAX_RETRY: Duration = Duration::from_secs(10);
@@ -31,13 +32,42 @@ const MAX_TRANSMISSIONS: u8 = 4;
 const LINK_INITIAL_RETRY: Duration = Duration::from_secs(2);
 const MAX_RELIABLE_RETRIES: u8 = 4;
 const MAX_RELIABLE_WINDOW: usize = 64;
-const MAX_PACKET_SIZE: usize = 1500;
+const MAX_PACKET_SIZE: usize = crate::ingress::MAX_DATAGRAM_SIZE + 1;
 const MAX_EARLY_EVENTS: usize = 64;
 
 struct PendingEvent {
     event: IaxPeerEvent,
-    pcm: Vec<f32>,
+    pcm: PacketPcm,
     text: Vec<u8>,
+}
+
+/// One wholly decoded packet, released in caller-sized chunks without decoding twice.
+#[derive(Default)]
+struct PacketPcm {
+    samples: Vec<f32>,
+    position: usize,
+}
+impl PacketPcm {
+    fn remaining(&self) -> usize {
+        self.samples.len() - self.position
+    }
+
+    fn render(&mut self, output: &mut [f32]) -> Result<Option<usize>, DialError> {
+        if self.remaining() == 0 {
+            return Ok(None);
+        }
+        if output.is_empty() {
+            return Err(DialError::Provider(crate::codec::providers::Error {
+                status: crate::codec::providers::Status::OutputFull,
+                required_capacity: 1,
+                operation: "pending packet PCM",
+            }));
+        }
+        let count = self.remaining().min(output.len());
+        output[..count].copy_from_slice(&self.samples[self.position..self.position + count]);
+        self.position += count;
+        Ok(Some(count))
+    }
 }
 
 struct PendingReliableFrame {
@@ -95,13 +125,15 @@ pub enum DialError {
     /// IAX2 setup state rejected a malformed or unexpected response.
     Protocol(CallSetupError),
     /// The peer negotiated a codec other than G.711 μ-law.
-    UnsupportedFormat(u32),
+    UnsupportedFormat(u64),
     /// A media packet was malformed or addressed to another call.
     Voice(VoiceFrameError),
     /// Caller-owned PCM or packet storage is too small for one media frame.
     Encode(VoiceFrameEncodeError),
     /// Decoded μ-law PCM does not fit in caller-owned storage.
     Decode(CodecError),
+    /// A retained neutral provider rejected preparation or media processing.
+    Provider(crate::codec::providers::Error),
     /// The composed jitter capability rejected an operation or returned invalid media.
     Jitter,
 }
@@ -112,16 +144,16 @@ pub struct IaxPeer {
     remote: SocketAddr,
     local_call: u16,
     remote_call: u16,
-    format: u32,
+    format: u64,
+    codecs: Option<crate::codec::stream::Stream>,
     connected_at: Instant,
     setup: OutboundCallSetup,
     pending_reliable: VecDeque<PendingReliableFrame>,
     pending_replies: VecDeque<Vec<u8>>,
     pending_events: VecDeque<PendingEvent>,
+    direct_pcm: PacketPcm,
     answered: bool,
     voice_epoch: Option<u32>,
-    // Last automatic send time and next 8 kHz sample position within its burst.
-    voice_clock: Option<(u32, u64)>,
     release_on_drop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     async_attached: bool,
     // None preserves polling for callers that never supply scheduling deadlines.
@@ -392,9 +424,14 @@ impl IaxPeer {
         if self.async_attached || self.playout.is_some() {
             return Err(DialError::InvalidOptions);
         }
-        let jitter = unsafe { crate::jitter::Jitter::new(descriptor) }
+        let rate = self.sample_rate_hz();
+        let loss_unit = self
+            .codecs
+            .as_ref()
+            .map_or(rate / 100, |codecs| codecs.loss_unit);
+        let jitter = unsafe { crate::jitter::Jitter::new_at_rate(descriptor, rate, loss_unit) }
             .map_err(|_| DialError::InvalidOptions)?;
-        self.playout = Some(Playout::new(jitter, self.connected_at));
+        self.playout = Some(Playout::new_at_rate(jitter, self.connected_at, rate));
         Ok(())
     }
 
@@ -442,7 +479,7 @@ impl IaxPeer {
         remote: SocketAddr,
         local_call: u16,
         remote_call: u16,
-        format: u32,
+        format: u64,
     ) -> Result<(Self, std::sync::Arc<std::sync::atomic::AtomicBool>), DialError> {
         let setup = OutboundCallSetup::for_inbound_call(local_call, remote_call)
             .map_err(DialError::Protocol)?;
@@ -457,14 +494,15 @@ impl IaxPeer {
             local_call,
             remote_call,
             format,
+            codecs: None,
             connected_at: Instant::now(),
             setup,
             pending_reliable: VecDeque::new(),
             pending_replies: VecDeque::new(),
             pending_events: VecDeque::new(),
+            direct_pcm: PacketPcm::default(),
             answered: true,
             voice_epoch: None,
-            voice_clock: None,
             release_on_drop: Some(std::sync::Arc::clone(&released)),
             async_attached: false,
             product_deadline: None,
@@ -473,6 +511,18 @@ impl IaxPeer {
             poll_failure_reported: false,
         };
         Ok((peer, released))
+    }
+
+    /// Prepare the accepted format's directional contexts before sending ACCEPT.
+    pub(crate) fn compose_codec(&mut self, catalog: &FormatCatalog) -> Result<(), DialError> {
+        let profile = IaxFormat(self.format)
+            .profile()
+            .ok_or(DialError::UnsupportedFormat(self.format))?;
+        self.codecs = Some(
+            crate::codec::stream::Stream::open(catalog.codecs(), profile)
+                .map_err(DialError::Provider)?,
+        );
+        Ok(())
     }
 
     /// Send an authorized inbound ACCEPT and ANSWER through the normal reliable window.
@@ -486,13 +536,16 @@ impl IaxPeer {
     }
 
     /// Negotiated IAX codec-format bit.
-    pub const fn format(&self) -> u32 {
+    pub const fn format(&self) -> u64 {
         self.format
     }
 
     /// Required decoded linear-PCM samplerate.
     pub const fn sample_rate_hz(&self) -> u32 {
-        ULAW_SAMPLE_RATE_HZ
+        match &self.codecs {
+            Some(codecs) => codecs.rate,
+            None => ULAW_SAMPLE_RATE_HZ,
+        }
     }
 
     /// Local IAX call number assigned to this peer.
@@ -523,21 +576,6 @@ impl IaxPeer {
             .min(u128::from(u32::MAX)) as u32
     }
 
-    /// Timestamp continuous PCM by sample count, not executor wakeup time.
-    /// Empty audio ends the burst. A gap over Asterisk's 160 ms timestamp-skew
-    /// allowance also reanchors callers that do not send an explicit idle marker.
-    /// Only successful sends advance the clock; fractional milliseconds are retained.
-    pub(crate) fn send_audio(&mut self, pcm: &[f32]) -> Result<(), DialError> {
-        let now = self.elapsed_ms();
-        let sample = self
-            .voice_clock
-            .filter(|(sent, _)| now.wrapping_sub(*sent) <= 160)
-            .map_or(u64::from(now) * 8, |(_, next)| next);
-        self.send_ulaw(pcm, (sample / 8) as u32)?;
-        self.voice_clock = (!pcm.is_empty()).then_some((now, sample + pcm.len() as u64));
-        Ok(())
-    }
-
     /// Establish codec and timestamp epoch with full voice; use mini frames within that epoch.
     pub fn send_ulaw(&mut self, pcm: &[f32], timestamp_ms: u32) -> Result<(), DialError> {
         let mut payload = [0_u8; MAX_PACKET_SIZE - 12];
@@ -561,12 +599,62 @@ impl IaxPeer {
         self.send_encoded_ulaw(payload, timestamp_ms)
     }
 
+    /// Accept source PCM once, retaining incomplete coding units in the peer's
+    /// independent encoder. Byte count, real span and wire frames are distinct.
+    pub fn prepare_audio(
+        &mut self,
+        pcm: &[f32],
+        encoded: &mut [u8],
+        flush: bool,
+    ) -> Result<crate::codec::providers::EncodeResult, DialError> {
+        self.codecs
+            .as_mut()
+            .ok_or(DialError::InvalidOptions)?
+            .encoder
+            .encode(pcm, encoded, flush)
+            .map_err(DialError::Provider)
+    }
+
+    /// Deliberately abandon expired/discontinuous encoder input, never a retry.
+    pub fn reset_encoder(&mut self) -> Result<(), DialError> {
+        self.codecs
+            .as_mut()
+            .ok_or(DialError::InvalidOptions)?
+            .encoder
+            .reset()
+            .map_err(DialError::Provider)
+    }
+
+    /// Submit one previously prepared packet without encoding again. A blocked
+    /// send leaves bytes, timestamp and original media age with its caller.
+    pub fn send_prepared_audio(
+        &mut self,
+        payload: &[u8],
+        packet_frames: u32,
+        timestamp_ms: u32,
+    ) -> Result<MediaSend, DialError> {
+        let codecs = self.codecs.as_ref().ok_or(DialError::InvalidOptions)?;
+        let span = if payload.is_empty() {
+            0
+        } else {
+            codecs
+                .decoder
+                .inspect(payload)
+                .map_err(DialError::Provider)?
+                .frames
+        };
+        if span != packet_frames {
+            return Err(DialError::InvalidOptions);
+        }
+        self.send_encoded_ulaw(payload, timestamp_ms)
+    }
+
     fn send_encoded_ulaw(
         &mut self,
         payload: &[u8],
         timestamp_ms: u32,
     ) -> Result<MediaSend, DialError> {
-        if payload.len() > MAX_PACKET_SIZE - 12 {
+        if payload.len() > self.maximum_datagram() - 12 {
             return Err(DialError::InvalidOptions);
         }
         // An epoch's full voice and earlier signaling must reach the socket first.
@@ -578,7 +666,7 @@ impl IaxPeer {
             self.ensure_reliable_capacity()?;
             let full = self
                 .setup
-                .send_ulaw_frame(payload, timestamp_ms)
+                .send_voice_frame(payload, timestamp_ms, self.format)
                 .map_err(DialError::Protocol)?;
             self.send_reliable(full)?;
             self.voice_epoch = Some(epoch);
@@ -602,7 +690,7 @@ impl IaxPeer {
     /// retransmits it using the bounded Asterisk-compatible retry schedule if the ACK is lost.
     pub fn send_text(&mut self, payload: &[u8]) -> Result<(), DialError> {
         self.ensure_reliable_capacity()?;
-        if payload.len() + 12 > MAX_PACKET_SIZE {
+        if payload.len() > self.maximum_datagram() - 12 {
             return Err(DialError::InvalidOptions);
         }
         let packet = self
@@ -610,6 +698,14 @@ impl IaxPeer {
             .send_text_frame(payload, self.elapsed_ms())
             .map_err(DialError::Protocol)?;
         self.send_reliable(packet)
+    }
+
+    fn maximum_datagram(&self) -> usize {
+        if self.remote.is_ipv4() {
+            65_507
+        } else {
+            crate::ingress::MAX_DATAGRAM_SIZE
+        }
     }
 
     /// Send one completed DTMF digit as a sequenced IAX full frame and retain it until ACKed.
@@ -644,14 +740,18 @@ impl IaxPeer {
         pcm: &mut [f32],
         text: &mut [u8],
     ) -> Result<IaxPeerEvent, DialError> {
-        if let Some(pending) = self.pending_events.front() {
-            if pending.pcm.len() > pcm.len()
-                || pending.text.len() > text.len()
+        if let Some(pending) = self.pending_events.front_mut() {
+            if let Some(count) = pending.pcm.render(pcm)? {
+                if pending.pcm.remaining() == 0 {
+                    self.pending_events.pop_front();
+                }
+                return Ok(IaxPeerEvent::Audio(count));
+            }
+            if pending.text.len() > text.len()
                 || (matches!(pending.event, IaxPeerEvent::Digit(_)) && text.is_empty())
             {
                 return Err(DialError::InvalidOptions);
             }
-            pcm[..pending.pcm.len()].copy_from_slice(&pending.pcm);
             text[..pending.text.len()].copy_from_slice(&pending.text);
             return Ok(self.pending_events.pop_front().expect("front exists").event);
         }
@@ -675,9 +775,12 @@ impl IaxPeer {
                     }
                     self.pending_events.push_back(PendingEvent {
                         event,
-                        pcm: match event {
-                            IaxPeerEvent::Audio(count) => pcm[..count].to_vec(),
-                            _ => Vec::new(),
+                        pcm: PacketPcm {
+                            samples: match event {
+                                IaxPeerEvent::Audio(count) => pcm[..count].to_vec(),
+                                _ => Vec::new(),
+                            },
+                            position: 0,
                         },
                         text: match event {
                             IaxPeerEvent::Text(count) => text[..count].to_vec(),
@@ -697,6 +800,9 @@ impl IaxPeer {
     ) -> Result<IaxPeerEvent, DialError> {
         self.retry_reliable_frames()?;
         self.flush_replies()?;
+        if let Some(count) = self.direct_pcm.render(pcm)? {
+            return Ok(IaxPeerEvent::Audio(count));
+        }
         // Admit the bounded receive batch before advancing packet time. Otherwise
         // executor batching would masquerade as network loss in already due media.
         for _ in 0..MAX_RELIABLE_WINDOW {
@@ -721,7 +827,11 @@ impl IaxPeer {
             }
         }
         match &mut self.playout {
-            Some(playout) => playout.poll(Instant::now(), pcm),
+            Some(playout) => playout.poll_with_codec(
+                Instant::now(),
+                pcm,
+                self.codecs.as_mut().map(|codecs| &mut codecs.decoder),
+            ),
             None => Ok(IaxPeerEvent::None),
         }
     }
@@ -893,13 +1003,46 @@ impl IaxPeer {
             return Ok(IaxPeerEvent::None);
         }
         if let Some(playout) = &mut self.playout {
-            playout.put(timestamp, mini, arrived_at, payload)?;
+            playout.put_with_codec(
+                timestamp,
+                mini,
+                arrived_at,
+                payload,
+                self.codecs.as_ref().map(|codecs| &codecs.decoder),
+            )?;
             return Ok(IaxPeerEvent::None);
         }
-        G711Ulaw
-            .decode(payload, pcm)
-            .map(IaxPeerEvent::Audio)
-            .map_err(DialError::Decode)
+        match &mut self.codecs {
+            Some(codecs) => match codecs.decoder.inspect(payload) {
+                Err(error) if error.status == crate::codec::providers::Status::Malformed => {
+                    Ok(IaxPeerEvent::None)
+                }
+                Err(error) => Err(DialError::Provider(error)),
+                Ok(info) => {
+                    let required = info.frames as usize;
+                    self.direct_pcm
+                        .samples
+                        .try_reserve(required.saturating_sub(self.direct_pcm.samples.len()))
+                        .map_err(|_| DialError::InvalidOptions)?;
+                    self.direct_pcm.samples.resize(required, 0.0);
+                    self.direct_pcm.position = required;
+                    let frames = codecs
+                        .decoder
+                        .decode_recovering(payload, &mut self.direct_pcm.samples)
+                        .map_err(DialError::Provider)?;
+                    self.direct_pcm.samples.truncate(frames);
+                    self.direct_pcm.position = 0;
+                    match self.direct_pcm.render(pcm)? {
+                        Some(count) => Ok(IaxPeerEvent::Audio(count)),
+                        None => Ok(IaxPeerEvent::Gap(required)),
+                    }
+                }
+            },
+            None => G711Ulaw
+                .decode(payload, pcm)
+                .map(IaxPeerEvent::Audio)
+                .map_err(DialError::Decode),
+        }
     }
 
     fn ensure_reliable_capacity(&self) -> Result<(), DialError> {
@@ -1071,6 +1214,21 @@ mod unit_tests;
 /// Asterisk's default 100 ms initial retry, tenfold backoff, and four total
 /// transmissions unless the caller's timeout expires first.
 pub fn dial_ulaw(options: DialOptions<'_>) -> Result<IaxPeer, DialError> {
+    dial_composed(options, None)
+}
+
+/// Establish a provider-backed call advertising only the retained verified catalog.
+pub fn dial(
+    options: DialOptions<'_>,
+    catalog: std::sync::Arc<FormatCatalog>,
+) -> Result<IaxPeer, DialError> {
+    dial_composed(options, Some(catalog))
+}
+
+fn dial_composed(
+    options: DialOptions<'_>,
+    catalog: Option<std::sync::Arc<FormatCatalog>>,
+) -> Result<IaxPeer, DialError> {
     if options.local_call == 0
         || options.local_call > 0x7fff
         || !valid_node(options.local_node)
@@ -1082,7 +1240,6 @@ pub fn dial_ulaw(options: DialOptions<'_>) -> Result<IaxPeer, DialError> {
 
     let endpoint =
         UdpEndpoint::bind(wildcard_for(options.remote.ip())).map_err(DialError::Network)?;
-    let format = IAX_FORMAT_ULAW.to_be_bytes();
     let version = 2_u16.to_be_bytes();
     let elements = [
         InformationElement {
@@ -1102,18 +1259,26 @@ pub fn dial_ulaw(options: DialOptions<'_>) -> Result<IaxPeer, DialError> {
             data: options.local_node.as_bytes(),
         },
         InformationElement {
-            kind: IE_CAPABILITY,
-            data: &format,
-        },
-        InformationElement {
-            kind: IE_FORMAT,
-            data: &format,
-        },
-        InformationElement {
             kind: IE_VERSION,
             data: &version,
         },
     ];
+    let mut payload = serialize_information_elements(&elements)
+        .map_err(|error| DialError::Protocol(CallSetupError::InformationElements(error)))?;
+    let capability = catalog
+        .as_ref()
+        .map_or(IAX_FORMAT_ULAW, |catalog| catalog.advertised_mask());
+    let preferred = catalog.as_ref().map_or(IAX_FORMAT_ULAW, |catalog| {
+        IaxFormat::for_profile(
+            catalog
+                .select(capability)
+                .expect("validated nonempty catalog"),
+        )
+        .0
+    });
+    append_formats(&mut payload, preferred, Some(capability));
+    let elements = parse_information_elements(&payload)
+        .map_err(|error| DialError::Protocol(CallSetupError::InformationElements(error)))?;
     let started = Instant::now();
     let mut setup =
         OutboundCallSetup::new(options.local_call, 0, &elements).map_err(DialError::Protocol)?;
@@ -1125,7 +1290,7 @@ pub fn dial_ulaw(options: DialOptions<'_>) -> Result<IaxPeer, DialError> {
     let mut retry_at = Instant::now() + retry_interval;
     let mut transmissions = 1;
     let mut acknowledged = false;
-    let mut packet = [0_u8; 1500];
+    let mut packet = [0_u8; MAX_PACKET_SIZE];
     while Instant::now() < deadline {
         let Some((length, address)) = endpoint
             .try_receive(&mut packet)
@@ -1171,23 +1336,33 @@ pub fn dial_ulaw(options: DialOptions<'_>) -> Result<IaxPeer, DialError> {
                 acknowledgement,
             } => {
                 send(&endpoint, &acknowledgement, options.remote)?;
-                if format != IAX_FORMAT_ULAW {
-                    return Err(DialError::UnsupportedFormat(format));
-                }
+                let codecs = catalog
+                    .as_ref()
+                    .map(|catalog| {
+                        crate::codec::stream::Stream::open(
+                            catalog.codecs(),
+                            IaxFormat(format)
+                                .profile()
+                                .expect("selected verified format"),
+                        )
+                    })
+                    .transpose()
+                    .map_err(DialError::Provider)?;
                 let mut peer = IaxPeer {
                     endpoint: PeerEndpoint::Dedicated(endpoint),
                     remote: options.remote,
                     local_call: options.local_call,
                     remote_call,
                     format,
+                    codecs,
                     connected_at: Instant::now(),
                     setup,
                     pending_reliable: VecDeque::new(),
                     pending_replies: VecDeque::new(),
                     pending_events: VecDeque::new(),
+                    direct_pcm: PacketPcm::default(),
                     answered: false,
                     voice_epoch: None,
-                    voice_clock: None,
                     release_on_drop: None,
                     async_attached: false,
                     product_deadline: None,
