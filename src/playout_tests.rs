@@ -184,6 +184,74 @@ fn playout_aggregated_packet_decodes_once_and_releases_bounded_pcm_chunks() {
 }
 
 #[test]
+fn playout_malformed_media_uses_native_recovery_without_ending_the_call() {
+    let mut stream = provider_decoder("opus", crate::codec::providers::ProfileId::Opus);
+    let fixture = Fixture::new();
+    fixture.packet(0, 48000, &[0x02, 0xff], 0);
+    fixture.last_packet_span(960);
+    let origin = Instant::now();
+    let mut playout = Playout::new_at_rate(
+        unsafe { Jitter::new_at_rate(fixture.descriptor(), 48000, 960) }.unwrap(),
+        origin,
+        48000,
+    );
+    let mut pcm = [0.75; 960];
+    assert_eq!(
+        playout
+            .poll_with_codec(origin, &mut pcm, Some(&mut stream.decoder))
+            .unwrap(),
+        IaxPeerEvent::Audio(960)
+    );
+    assert_ne!(pcm, [0.75; 960]);
+    assert_eq!(fixture.advances().len(), 1);
+    assert!(!playout.blocks_transport());
+}
+
+#[test]
+fn playout_invalid_framing_cannot_reactivate_or_advance_the_source_clock() {
+    let stream = provider_decoder("gsm", crate::codec::providers::ProfileId::GsmFr);
+    let fixture = Fixture::new();
+    let origin = Instant::now();
+    let mut playout = Playout::new(
+        unsafe { Jitter::new(fixture.descriptor()) }.unwrap(),
+        origin,
+    );
+    playout.unkey();
+    assert_eq!(
+        playout.poll(origin, &mut []).unwrap(),
+        IaxPeerEvent::RadioUnkey
+    );
+    playout
+        .put_with_codec(u32::MAX, false, origin, &[0], Some(&stream.decoder))
+        .unwrap();
+    assert!(!playout.active);
+    assert_eq!(playout.highest_ms, None);
+    assert!(fixture.puts().is_empty());
+}
+
+#[test]
+fn playout_codec_without_native_plc_returns_only_the_ordered_ring_gap() {
+    let mut stream = provider_decoder("gsm", crate::codec::providers::ProfileId::GsmFr);
+    let fixture = Fixture::new();
+    let origin = Instant::now();
+    fixture.gap(0, 8000, 160, false);
+    let mut playout = Playout::new(
+        unsafe { Jitter::new(fixture.descriptor()) }.unwrap(),
+        origin,
+    );
+    let mut pcm = [0.75; 160];
+    assert_eq!(
+        playout
+            .poll_with_codec(origin, &mut pcm, Some(&mut stream.decoder))
+            .unwrap(),
+        IaxPeerEvent::Gap(160)
+    );
+    assert_eq!(pcm, [0.75; 160]);
+    assert_eq!(fixture.advances().len(), 1);
+    assert!(!playout.blocks_transport());
+}
+
+#[test]
 fn key_does_not_discard_voice_that_arrived_ahead_of_its_control_sequence() {
     let fixture = Fixture::new();
     let origin = Instant::now();

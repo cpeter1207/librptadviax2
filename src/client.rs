@@ -990,11 +990,20 @@ impl IaxPeer {
             return Ok(IaxPeerEvent::None);
         }
         match &mut self.codecs {
-            Some(codecs) => codecs
-                .decoder
-                .decode(payload, pcm)
-                .map(IaxPeerEvent::Audio)
-                .map_err(DialError::Provider),
+            Some(codecs) => match codecs.decoder.inspect(payload) {
+                Err(error) if error.status == crate::codec::providers::Status::Malformed => {
+                    Ok(IaxPeerEvent::None)
+                }
+                Err(error) => Err(DialError::Provider(error)),
+                Ok(info) => match codecs
+                    .decoder
+                    .decode_recovering(payload, pcm)
+                    .map_err(DialError::Provider)?
+                {
+                    0 => Ok(IaxPeerEvent::Gap(info.frames as usize)),
+                    frames => Ok(IaxPeerEvent::Audio(frames)),
+                },
+            },
             None => G711Ulaw
                 .decode(payload, pcm)
                 .map(IaxPeerEvent::Audio)

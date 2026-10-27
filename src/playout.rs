@@ -2,7 +2,10 @@
 
 use crate::{
     client::{DialError, IaxPeerEvent},
-    codec::{CodecAdapter, G711Ulaw, providers::Decoder},
+    codec::{
+        CodecAdapter, G711Ulaw,
+        providers::{Decoder, Status},
+    },
     jitter::{Admission, Decision, Jitter, Kind, MAX_PAYLOAD, Observation},
 };
 use std::time::Instant;
@@ -108,20 +111,20 @@ impl Playout {
         payload: &[u8],
         decoder: Option<&Decoder>,
     ) -> Result<(), DialError> {
-        // ASL peers can send valid voice after UNKEY without another KEY. Media
-        // resumes playout; the controller still owns receive/PTT qualification.
+        let span = match decoder {
+            Some(decoder) => match decoder.inspect(payload) {
+                Ok(info) => info.frames,
+                Err(error) if error.status == Status::Malformed => return Ok(()),
+                Err(error) => return Err(DialError::Provider(error)),
+            },
+            None => payload.len() as u32,
+        };
+        // Invalid framing must not revive a burst or move its timestamp epoch.
+        // Valid ASL voice may resume after UNKEY without another KEY; receive/PTT
+        // qualification remains the controller's responsibility.
         self.active = true;
         self.expire_quiet(arrived_at)?;
         let timestamp = self.unwrap_ms(timestamp, mini) * u64::from(self.rate) / 1000;
-        let span = match decoder {
-            Some(decoder) => {
-                decoder
-                    .inspect(payload)
-                    .map_err(DialError::Provider)?
-                    .frames
-            }
-            None => payload.len() as u32,
-        };
         let admission = self
             .jitter
             .put(timestamp, span, self.ns(arrived_at), payload)
@@ -297,8 +300,14 @@ impl Playout {
                         .map_err(|_| DialError::InvalidOptions)?;
                     self.decoded.resize(required, 0.0);
                     self.decoded_count = decoder
-                        .decode(&self.encoded[..decision.length], &mut self.decoded)
+                        .decode_recovering(&self.encoded[..decision.length], &mut self.decoded)
                         .map_err(DialError::Provider)?;
+                    if self.decoded_count == 0 {
+                        let count = decision.span as usize - skip;
+                        let decision = self.pending.take().expect("unrecoverable media span");
+                        self.commit(now, &decision)?;
+                        return Ok(IaxPeerEvent::Gap(count));
+                    }
                     self.decoded_position = skip.min(self.decoded_count);
                 }
                 let count = (self.decoded_count - self.decoded_position).min(pcm.len());

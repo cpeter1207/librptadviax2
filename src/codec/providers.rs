@@ -503,6 +503,18 @@ impl Encoder {
 /// Independent, non-real-time decoder owner.
 pub struct Decoder(Context);
 impl Decoder {
+    /// Preserve native damaged-packet recovery, then request explicit native
+    /// PLC only if decode reports malformed input with a known source span.
+    /// Zero means the codec could not supply that span; the caller uses its ring.
+    pub fn decode_recovering(&mut self, packet: &[u8], pcm: &mut [f32]) -> Result<usize, Error> {
+        match self.decode(packet, pcm) {
+            Err(error) if error.status == Status::Malformed => {
+                let frames = self.inspect(packet)?.frames;
+                self.conceal(frames, pcm)
+            }
+            result => result,
+        }
+    }
     /// Prefer the backend's native PLC for a supported missing source span.
     /// Unsupported spans return zero samples and leave shared-ring fallback to
     /// the caller; successful native output must not be concealed a second time.
