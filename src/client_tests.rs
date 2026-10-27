@@ -20,7 +20,7 @@ const REMOTE_CALL: u16 = 5678;
 const ULAW: u32 = 0x4;
 
 #[test]
-fn formats_outgoing_opus_uses_retained_provider_clock() {
+fn formats_egress_codec_packet_timing_uses_retained_opus_provider() {
     use crate::{
         codec::providers::{CodecCatalog, ProfileId, ProviderSelection},
         formats::{FormatCatalog, FormatOffer},
@@ -61,8 +61,16 @@ fn formats_outgoing_opus_uses_retained_provider_clock() {
         );
         server.recv_from(&mut bytes).unwrap();
         send_answer(&server, client, 1, 1);
+        let (length, _) = server.recv_from(&mut bytes).unwrap();
+        let VoiceFrame::Full { payload, .. } =
+            parse_voice_frame(&bytes[..length], 1u64 << 34).unwrap()
+        else {
+            panic!("first Opus media must establish its full-frame format");
+        };
+        assert!(!payload.is_empty());
+        assert_ne!(payload.len(), 960);
     });
-    let peer = crate::client::dial(
+    let mut peer = crate::client::dial(
         DialOptions {
             remote,
             local_call: LOCAL_CALL,
@@ -75,6 +83,30 @@ fn formats_outgoing_opus_uses_retained_provider_clock() {
     )
     .unwrap();
     assert_eq!((peer.format(), peer.sample_rate_hz()), (1u64 << 34, 48000));
+    let mut encoded = [0; 4000];
+    let first = peer.prepare_audio(&[0.0; 37], &mut encoded, false).unwrap();
+    assert_eq!((first.consumed_frames, first.encoded_bytes), (37, 0));
+    let result = peer
+        .prepare_audio(&[0.0; 923], &mut encoded, false)
+        .unwrap();
+    assert_eq!(
+        (
+            result.consumed_frames,
+            result.source_start_frames,
+            result.source_frames,
+            result.packet_frames
+        ),
+        (923, 0, 960, 960)
+    );
+    assert_ne!(result.encoded_bytes, result.packet_frames as usize);
+    assert_eq!(
+        peer.send_prepared_audio(&encoded[..result.encoded_bytes], result.packet_frames, 100)
+            .unwrap(),
+        crate::client::MediaSend::Accepted
+    );
+    peer.reset_encoder().unwrap();
+    let empty = peer.prepare_audio(&[], &mut encoded, true).unwrap();
+    assert_eq!((empty.encoded_bytes, empty.packet_frames), (0, 0));
     responder.join().unwrap();
 }
 

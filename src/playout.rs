@@ -16,6 +16,9 @@ pub(crate) struct Playout {
     pending: Option<Decision>,
     pending_prefix: u32,
     rate: u32,
+    decoded: Vec<f32>,
+    decoded_position: usize,
+    decoded_count: usize,
     tail_end: Option<u64>,
     released_to: u64,
     skipped_span: u64,
@@ -73,6 +76,9 @@ impl Playout {
             pending: None,
             pending_prefix: 0,
             rate,
+            decoded: Vec::new(),
+            decoded_position: 0,
+            decoded_count: 0,
             tail_end: None,
             released_to: 0,
             skipped_span: 0,
@@ -276,12 +282,37 @@ impl Playout {
         let skip = decision.start_offset.saturating_neg().max(0) as usize;
         let count = match decoder {
             Some(decoder) => {
-                let frames = decoder
-                    .decode(&self.encoded[..decision.length], pcm)
-                    .map_err(DialError::Provider)?;
-                let skip = skip.min(frames);
-                pcm.copy_within(skip..frames, 0);
-                frames - skip
+                if pcm.is_empty() {
+                    return Err(DialError::Decode(crate::codec::CodecError {
+                        required: 1,
+                        available: 0,
+                    }));
+                }
+                if self.decoded_count == 0 {
+                    // One packet's source PCM, not another timing queue. Allocation
+                    // and the whole compressed decode stay on this network owner.
+                    let required = decision.span as usize;
+                    self.decoded
+                        .try_reserve(required.saturating_sub(self.decoded.len()))
+                        .map_err(|_| DialError::InvalidOptions)?;
+                    self.decoded.resize(required, 0.0);
+                    self.decoded_count = decoder
+                        .decode(&self.encoded[..decision.length], &mut self.decoded)
+                        .map_err(DialError::Provider)?;
+                    self.decoded_position = skip.min(self.decoded_count);
+                }
+                let count = (self.decoded_count - self.decoded_position).min(pcm.len());
+                pcm[..count].copy_from_slice(
+                    &self.decoded[self.decoded_position..self.decoded_position + count],
+                );
+                self.decoded_position += count;
+                if self.decoded_position < self.decoded_count {
+                    self.last_release = Some(now);
+                    return Ok(IaxPeerEvent::Audio(count));
+                }
+                self.decoded_count = 0;
+                self.decoded_position = 0;
+                count
             }
             None => G711Ulaw
                 .decode(&self.encoded[skip..decision.length], pcm)
@@ -331,6 +362,8 @@ impl Playout {
         self.jitter.reset().map_err(|_| DialError::Jitter)?;
         self.pending = None;
         self.pending_prefix = 0;
+        self.decoded_count = 0;
+        self.decoded_position = 0;
         self.release_deadline = None;
         self.tail_end = None;
         self.released_to = 0;

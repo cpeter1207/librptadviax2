@@ -75,9 +75,9 @@ fn send_dtmf_rejects_invalid_digits_and_unlinked_calls() {
 }
 
 #[test]
-fn send_ulaw_frame_rejects_unlinked_calls() {
+fn send_voice_frame_rejects_unlinked_calls() {
     assert_eq!(
-        setup().send_ulaw_frame(&[0xff], 25),
+        setup().send_voice_frame(&[0xff], 25, IAX_FORMAT_ULAW),
         Err(CallSetupError::NotLinked)
     );
 }

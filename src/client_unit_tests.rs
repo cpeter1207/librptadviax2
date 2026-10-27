@@ -355,7 +355,7 @@ fn egress_prepared_oversize_is_rejected_before_committing_protocol_state() {
     remote.set_nonblocking(true).unwrap();
     let mut peer = linked_peer(remote.local_addr().unwrap());
     let api = unsafe { &*crate::ffi::rptadv_iax2_client_descriptor_v1() };
-    let payload = [0xff; 1489];
+    let payload = vec![0xff; super::MAX_PACKET_SIZE];
     assert_eq!(
         unsafe {
             api.send_prepared_ulaw.unwrap()(
@@ -1100,9 +1100,9 @@ fn interop_ffi_sample_clock_preserves_fractional_samples_bursts_wrap_and_failure
             "failed send",
             None,
             &[
-                (1501, -1, 0, false),
+                (super::MAX_PACKET_SIZE, -1, 0, false),
                 (160, 0, 0, true),
-                (1501, -1, 0, false),
+                (super::MAX_PACKET_SIZE, -1, 0, false),
                 (160, 0, 20, false),
             ][..],
         ),
@@ -1125,8 +1125,8 @@ fn interop_ffi_sample_clock_preserves_fractional_samples_bursts_wrap_and_failure
         peer.connected_at = Instant::now() + Duration::from_secs(3600);
         peer.voice_clock = next_sample.map(|sample| (0, sample));
         let descriptor = unsafe { &*crate::ffi::rptadv_iax2_client_descriptor_v1() };
-        let samples = [0.25; 1501];
-        let mut packet = [0; 1500];
+        let samples = vec![0.25; super::MAX_PACKET_SIZE];
+        let mut packet = [0; super::MAX_PACKET_SIZE];
         for &(count, result, expected_timestamp, expected_full) in steps {
             assert_eq!(
                 unsafe {
@@ -1312,7 +1312,7 @@ fn reliable_capacity_and_text_size_are_bounded_before_sending() {
     let remote: SocketAddr = "127.0.0.1:4569".parse().unwrap();
     let mut peer = linked_peer(remote);
     assert!(matches!(
-        peer.send_text(&vec![0; 1489]),
+        peer.send_text(&vec![0; super::MAX_PACKET_SIZE]),
         Err(DialError::InvalidOptions)
     ));
 

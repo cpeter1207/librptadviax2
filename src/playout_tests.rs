@@ -147,6 +147,43 @@ fn playout_source_clock_and_native_gap_retry_preserve_the_prefix() {
 }
 
 #[test]
+fn playout_aggregated_packet_decodes_once_and_releases_bounded_pcm_chunks() {
+    let mut stream = provider_decoder("gsm", crate::codec::providers::ProfileId::GsmFr);
+    let mut packet = Vec::new();
+    let mut unit = [0; 33];
+    for _ in 0..30 {
+        stream
+            .encoder
+            .encode(&[0.1; 160], &mut unit, false)
+            .unwrap();
+        packet.extend_from_slice(&unit);
+    }
+    let mut reference = provider_decoder("gsm", crate::codec::providers::ProfileId::GsmFr);
+    let mut expected = vec![0.0; 4800];
+    reference.decoder.decode(&packet, &mut expected).unwrap();
+    let fixture = Fixture::new();
+    fixture.packet(0, 8000, &packet, 0);
+    fixture.last_packet_span(4800);
+    let origin = Instant::now();
+    let mut playout = Playout::new(
+        unsafe { Jitter::new(fixture.descriptor()) }.unwrap(),
+        origin,
+    );
+    let mut pcm = [0.0; 160];
+    for part in expected.chunks_exact(160) {
+        assert_eq!(
+            playout
+                .poll_with_codec(origin, &mut pcm, Some(&mut stream.decoder))
+                .unwrap(),
+            IaxPeerEvent::Audio(160)
+        );
+        assert_eq!(pcm, part);
+    }
+    assert_eq!(fixture.advances().len(), 1);
+    assert!(!playout.blocks_transport());
+}
+
+#[test]
 fn key_does_not_discard_voice_that_arrived_ahead_of_its_control_sequence() {
     let fixture = Fixture::new();
     let origin = Instant::now();

@@ -1,6 +1,6 @@
 use super::{NetworkIngressError, UdpEndpoint, configure_socket, receive_result, route_received};
 use crate::{
-    ingress::{PeerIngressRouter, PeerIngressRouterError},
+    ingress::{MAX_DATAGRAM_SIZE, PeerIngressRouter, PeerIngressRouterError},
     protocol::{FullFrameHeader, MiniFrameHeader, serialize_full_frame, serialize_mini_frame},
 };
 use std::io::{Error, ErrorKind};
@@ -10,6 +10,28 @@ use std::time::{Duration, Instant};
 
 fn loopback() -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
+}
+
+#[test]
+fn ingress_datagram_bounds_preserve_maximum_ipv4_udp_payload() {
+    let sender = UdpEndpoint::bind(loopback()).unwrap();
+    let receiver = UdpEndpoint::bind(loopback()).unwrap();
+    let mut payload = vec![0xa5; 65507];
+    payload[65506] = 0x5a;
+    sender
+        .send_to(&payload, receiver.local_addr().unwrap())
+        .unwrap();
+    let mut bytes = vec![0; crate::ingress::MAX_DATAGRAM_SIZE + 1];
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let length = loop {
+        if let Some((length, _)) = receiver.try_receive(&mut bytes).unwrap() {
+            break length;
+        }
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(1));
+    };
+    assert_eq!(length, payload.len());
+    assert_eq!(bytes[..length], payload);
 }
 
 #[test]
@@ -121,7 +143,7 @@ fn endpoint_routes_received_datagrams_to_peer_owner_queue() {
     let mut router = PeerIngressRouter::new(2).unwrap();
     let mut owner = router.register(sender.local_addr().unwrap(), 42).unwrap();
     let destination = endpoint.local_addr().unwrap();
-    let mut buffer = [0; 1500];
+    let mut buffer = [0; MAX_DATAGRAM_SIZE + 1];
     assert!(matches!(
         endpoint.try_receive_routed(&mut router, &mut buffer),
         Ok(None)
@@ -155,7 +177,7 @@ fn endpoint_demultiplexes_full_and_mini_frames_by_call() {
     let mut first = router.register_call(remote, 100, 200, 11).unwrap();
     let mut second = router.register_call(remote, 101, 201, 22).unwrap();
     let destination = endpoint.local_addr().unwrap();
-    let mut buffer = [0; 1500];
+    let mut buffer = [0; MAX_DATAGRAM_SIZE + 1];
     let first_frame = serialize_full_frame(
         &FullFrameHeader {
             source_call_number: 200,
@@ -204,7 +226,7 @@ fn endpoint_rejects_malformed_and_unknown_call_frames() {
     let mut router = PeerIngressRouter::new(1).unwrap();
     let mut owner = router.register_call(remote, 100, 200, 1).unwrap();
     let destination = endpoint.local_addr().unwrap();
-    let mut buffer = [0; 1500];
+    let mut buffer = [0; MAX_DATAGRAM_SIZE + 1];
 
     sender.send_to(&[0x80], destination).unwrap();
     assert!(matches!(
@@ -275,7 +297,7 @@ fn endpoint_returns_unknown_full_frame_length_for_inbound_admission() {
     )
     .unwrap();
     sender.send_to(&packet, destination).unwrap();
-    let mut buffer = [0; 1500];
+    let mut buffer = [0; MAX_DATAGRAM_SIZE + 1];
     let result = receive_routed_until_ready(&endpoint, &mut router, &mut buffer);
 
     assert!(matches!(
@@ -309,7 +331,7 @@ fn endpoint_keeps_address_only_routes_for_existing_callers() {
         &[1],
     )
     .unwrap();
-    let mut buffer = [0; 1500];
+    let mut buffer = [0; MAX_DATAGRAM_SIZE + 1];
     sender.send_to(&frame, destination).unwrap();
 
     assert!(matches!(
@@ -328,7 +350,7 @@ fn endpoint_surfaces_unknown_peer_and_full_queue_route_errors() {
         .register(SocketAddr::from(([127, 0, 0, 1], 9)), 7)
         .unwrap();
     let destination = endpoint.local_addr().unwrap();
-    let mut buffer = [0; 1500];
+    let mut buffer = [0; MAX_DATAGRAM_SIZE + 1];
 
     sender.send_to(&[1], destination).unwrap();
     assert!(matches!(
@@ -352,7 +374,7 @@ fn endpoint_surfaces_unknown_peer_and_full_queue_route_errors() {
 fn receive_routed_until_ready(
     endpoint: &UdpEndpoint,
     router: &mut PeerIngressRouter,
-    buffer: &mut [u8; 1500],
+    buffer: &mut [u8; MAX_DATAGRAM_SIZE + 1],
 ) -> Result<Option<SocketAddr>, NetworkIngressError> {
     let deadline = Instant::now() + Duration::from_secs(1);
     loop {

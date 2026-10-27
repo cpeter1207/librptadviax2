@@ -8,7 +8,7 @@ use std::{
 
 const CAPABILITY: [u8; 16] = *b"rptadv.jitter\0\0\0";
 /// Maximum opaque datagram payload accepted by the composed jitter capability.
-pub(crate) const MAX_PAYLOAD: usize = 1500;
+pub(crate) const MAX_PAYLOAD: usize = crate::ingress::MAX_DATAGRAM_SIZE - 4;
 /// Source clock used by the negotiated ULAW media stream.
 #[cfg(test)]
 pub(crate) const CLOCK_RATE_HZ: u32 = 8000;
@@ -439,7 +439,7 @@ mod tests {
                 config.maximum_packets,
                 config.maximum_payload_bytes
             ),
-            (8000, 1280, 1440, 4000, 80, 80, 64, 1500)
+            (8000, 1280, 1440, 4000, 80, 80, 64, MAX_PAYLOAD as u32)
         );
         let destroyed = unsafe { &*jitter.context.as_ptr().cast::<State>() }
             .destroyed

@@ -65,8 +65,31 @@ pub fn process_inbound_ulaw_new(
     local_node: &str,
     local_call: u16,
     now_seconds: u32,
+    authorize: impl FnMut(&str) -> bool,
+) -> Result<InboundNewAction, InboundAdmissionError> {
+    process_inbound_new(
+        tokens,
+        source,
+        packet,
+        (local_node, local_call),
+        now_seconds,
+        None,
+        authorize,
+    )
+}
+
+/// Apply the existing token/authorization gate with a verified codec catalog.
+/// The identity pair contains the addressed local node and allocated call ID.
+pub fn process_inbound_new(
+    tokens: &CallTokenAuthority,
+    source: std::net::SocketAddr,
+    packet: &[u8],
+    identity: (&str, u16),
+    now_seconds: u32,
+    catalog: Option<&FormatCatalog>,
     mut authorize: impl FnMut(&str) -> bool,
 ) -> Result<InboundNewAction, InboundAdmissionError> {
+    let (local_node, local_call) = identity;
     match tokens
         .handle_initial_new(source, packet, now_seconds)
         .map_err(InboundAdmissionError::CallToken)?
@@ -75,7 +98,11 @@ pub fn process_inbound_ulaw_new(
             Ok(InboundNewAction::Reply(reply))
         }
         InitialNewDisposition::Continue => {
-            let Ok(accepted) = accept_inbound_ulaw_new(packet, local_node, local_call) else {
+            let accepted = match catalog {
+                Some(catalog) => accept_inbound_new(packet, local_node, local_call, catalog),
+                None => accept_inbound_ulaw_new(packet, local_node, local_call),
+            };
+            let Ok(accepted) = accepted else {
                 return tokens
                     .reject_initial_new(packet)
                     .map(InboundNewAction::Reply)
@@ -616,17 +643,29 @@ impl OutboundCallSetup {
         Ok(packet)
     }
 
-    /// Establish the outgoing ULAW codec with a sequenced full voice frame.
-    pub(crate) fn send_ulaw_frame(
+    /// Sequence complete media with the negotiated 64-bit format subclass.
+    pub(crate) fn send_voice_frame(
         &mut self,
         payload: &[u8],
         timestamp_ms: u32,
+        format: u64,
     ) -> Result<Vec<u8>, CallSetupError> {
         if self.state != State::Linked {
             return Err(CallSetupError::NotLinked);
         }
         let remote_call = self.remote_call.ok_or(CallSetupError::CallFinished)?;
-        let mut header = self.outgoing_header(remote_call, timestamp_ms, self.next_incoming, 4);
+        if IaxFormat(format).profile().is_none() {
+            return Err(CallSetupError::InvalidAcceptedFormat);
+        }
+        let subclass =
+            crate::protocol::encode_subclass(format as i64).expect("verified single-bit profile");
+        let mut header = self.outgoing_header(
+            remote_call,
+            timestamp_ms,
+            self.next_incoming,
+            subclass & 0x7f,
+        );
+        header.subclass_is_log = subclass & 0x80 != 0;
         header.frame_type = 2;
         let packet = serialize_full_frame(&header, payload).map_err(CallSetupError::Frame)?;
         self.next_outgoing = self.next_outgoing.wrapping_add(1);

@@ -744,7 +744,7 @@ fn c_peer_api_reports_events_and_rejects_invalid_buffers() {
     let (peer, server, client) = establish();
     assert_eq!(unsafe { sample_rate_hz(peer) }, 8_000);
     assert_eq!(unsafe { send_audio(peer, ptr::null(), 1) }, -1);
-    let oversized_pcm = [0.0_f32; 1500];
+    let oversized_pcm = vec![0.0_f32; crate::ingress::MAX_DATAGRAM_SIZE + 1];
     assert_eq!(
         unsafe { send_audio(peer, oversized_pcm.as_ptr(), oversized_pcm.len()) },
         -1

@@ -265,9 +265,7 @@ mod tests {
         assert_eq!(pump.stats().admission.dropped_packets, 64);
         assert_eq!(pump.stats().admission.capacity_packets, 64);
         assert_eq!(pump.stats().active_routes, 1);
-        sender
-            .send_to(&[0; MAX_DATAGRAM_SIZE + 1], address)
-            .unwrap();
+        sender.send_to(&[0; 65_507], address).unwrap();
         sender.send_to(&[0x80, 0], address).unwrap();
         sender
             .send_to(&packet(23, IaxCommand::Ack), address)

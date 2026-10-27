@@ -7,7 +7,7 @@ use crate::{
     ingress::{PeerIngressRouter, PeerIngressRouterError},
     network::UdpEndpoint,
     protocol::{parse_full_frame_packet, parse_mini_frame},
-    session::{InboundNewAction, process_inbound_ulaw_new},
+    session::{InboundNewAction, process_inbound_new},
 };
 use std::{
     io,
@@ -110,6 +110,7 @@ pub struct InboundIaxListener {
     routes: Vec<InboundRoute>,
     generation: u64,
     async_ingress: Option<ListenerIngress>,
+    catalog: Option<Arc<crate::formats::FormatCatalog>>,
     #[cfg(test)]
     fail_next_poll: bool,
     #[cfg(test)]
@@ -132,6 +133,22 @@ impl InboundIaxListener {
 
     /// Bind one UDP endpoint that accepts calls addressed to any configured local node.
     pub fn bind_many(local: SocketAddr, local_nodes: &[String]) -> Result<Self, ListenerError> {
+        Self::bind_composed(local, local_nodes, None)
+    }
+
+    /// Retain one composition catalog for all authorized incoming calls.
+    pub fn bind_with_catalog(
+        local: SocketAddr,
+        local_nodes: &[String],
+        catalog: Arc<crate::formats::FormatCatalog>,
+    ) -> Result<Self, ListenerError> {
+        Self::bind_composed(local, local_nodes, Some(catalog))
+    }
+    fn bind_composed(
+        local: SocketAddr,
+        local_nodes: &[String],
+        catalog: Option<Arc<crate::formats::FormatCatalog>>,
+    ) -> Result<Self, ListenerError> {
         if !valid_local_nodes(local_nodes) {
             return Err(ListenerError::InvalidFrame);
         }
@@ -146,6 +163,7 @@ impl InboundIaxListener {
             routes: Vec::new(),
             generation: 0,
             async_ingress: None,
+            catalog,
             #[cfg(test)]
             fail_next_poll: false,
             #[cfg(test)]
@@ -231,7 +249,7 @@ impl InboundIaxListener {
             )));
         }
         self.reap_released_routes()?;
-        let mut packet = [0_u8; crate::ingress::MAX_DATAGRAM_SIZE];
+        let mut packet = [0_u8; crate::ingress::MAX_DATAGRAM_SIZE + 1];
         let (length, remote) = if let Some(ingress) = &mut self.async_ingress {
             let Some(received) = ingress.try_receive().map_err(ListenerError::Network)? else {
                 return Ok(ListenerEvent::None);
@@ -253,6 +271,9 @@ impl InboundIaxListener {
             (length, remote)
         };
         let bytes = &packet[..length];
+        if length > crate::ingress::MAX_DATAGRAM_SIZE {
+            return Ok(ListenerEvent::Ignored);
+        }
         let Ok(request) = parse_full_frame_packet(bytes) else {
             return Ok(ListenerEvent::Ignored);
         };
@@ -264,13 +285,13 @@ impl InboundIaxListener {
             .unwrap_or(&self.local_nodes[0])
             .to_owned();
         let remote_address = remote;
-        let action = match process_inbound_ulaw_new(
+        let action = match process_inbound_new(
             &self.tokens,
             remote,
             bytes,
-            &local_node,
-            local_call,
+            (&local_node, local_call),
             now_seconds,
+            self.catalog.as_deref(),
             &mut |remote: &str| authorize(&local_node, remote, remote_address),
         ) {
             Ok(action) => action,
@@ -321,6 +342,10 @@ impl InboundIaxListener {
                     accepted.format,
                 )
                 .map_err(|_| ListenerError::InvalidFrame)?;
+                if let Some(catalog) = &self.catalog {
+                    peer.compose_codec(catalog)
+                        .map_err(|_| ListenerError::InvalidFrame)?;
+                }
                 self.routes.push(InboundRoute {
                     remote,
                     local_call,

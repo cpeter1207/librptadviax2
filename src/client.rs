@@ -32,7 +32,7 @@ const MAX_TRANSMISSIONS: u8 = 4;
 const LINK_INITIAL_RETRY: Duration = Duration::from_secs(2);
 const MAX_RELIABLE_RETRIES: u8 = 4;
 const MAX_RELIABLE_WINDOW: usize = 64;
-const MAX_PACKET_SIZE: usize = 1500;
+const MAX_PACKET_SIZE: usize = crate::ingress::MAX_DATAGRAM_SIZE + 1;
 const MAX_EARLY_EVENTS: usize = 64;
 
 struct PendingEvent {
@@ -485,6 +485,18 @@ impl IaxPeer {
         Ok((peer, released))
     }
 
+    /// Prepare the accepted format's directional contexts before sending ACCEPT.
+    pub(crate) fn compose_codec(&mut self, catalog: &FormatCatalog) -> Result<(), DialError> {
+        let profile = IaxFormat(self.format)
+            .profile()
+            .ok_or(DialError::UnsupportedFormat(self.format))?;
+        self.codecs = Some(
+            crate::codec::stream::Stream::open(catalog.codecs(), profile)
+                .map_err(DialError::Provider)?,
+        );
+        Ok(())
+    }
+
     /// Send an authorized inbound ACCEPT and ANSWER through the normal reliable window.
     pub(crate) fn accept_inbound(&mut self, accept: Vec<u8>) -> Result<(), DialError> {
         let answer = self
@@ -574,12 +586,62 @@ impl IaxPeer {
         self.send_encoded_ulaw(payload, timestamp_ms)
     }
 
+    /// Accept source PCM once, retaining incomplete coding units in the peer's
+    /// independent encoder. Byte count, real span and wire frames are distinct.
+    pub fn prepare_audio(
+        &mut self,
+        pcm: &[f32],
+        encoded: &mut [u8],
+        flush: bool,
+    ) -> Result<crate::codec::providers::EncodeResult, DialError> {
+        self.codecs
+            .as_mut()
+            .ok_or(DialError::InvalidOptions)?
+            .encoder
+            .encode(pcm, encoded, flush)
+            .map_err(DialError::Provider)
+    }
+
+    /// Deliberately abandon expired/discontinuous encoder input, never a retry.
+    pub fn reset_encoder(&mut self) -> Result<(), DialError> {
+        self.codecs
+            .as_mut()
+            .ok_or(DialError::InvalidOptions)?
+            .encoder
+            .reset()
+            .map_err(DialError::Provider)
+    }
+
+    /// Submit one previously prepared packet without encoding again. A blocked
+    /// send leaves bytes, timestamp and original media age with its caller.
+    pub fn send_prepared_audio(
+        &mut self,
+        payload: &[u8],
+        packet_frames: u32,
+        timestamp_ms: u32,
+    ) -> Result<MediaSend, DialError> {
+        let codecs = self.codecs.as_ref().ok_or(DialError::InvalidOptions)?;
+        let span = if payload.is_empty() {
+            0
+        } else {
+            codecs
+                .decoder
+                .inspect(payload)
+                .map_err(DialError::Provider)?
+                .frames
+        };
+        if span != packet_frames {
+            return Err(DialError::InvalidOptions);
+        }
+        self.send_encoded_ulaw(payload, timestamp_ms)
+    }
+
     fn send_encoded_ulaw(
         &mut self,
         payload: &[u8],
         timestamp_ms: u32,
     ) -> Result<MediaSend, DialError> {
-        if payload.len() > MAX_PACKET_SIZE - 12 {
+        if payload.len() > self.maximum_datagram() - 12 {
             return Err(DialError::InvalidOptions);
         }
         // An epoch's full voice and earlier signaling must reach the socket first.
@@ -591,7 +653,7 @@ impl IaxPeer {
             self.ensure_reliable_capacity()?;
             let full = self
                 .setup
-                .send_ulaw_frame(payload, timestamp_ms)
+                .send_voice_frame(payload, timestamp_ms, self.format)
                 .map_err(DialError::Protocol)?;
             self.send_reliable(full)?;
             self.voice_epoch = Some(epoch);
@@ -615,7 +677,7 @@ impl IaxPeer {
     /// retransmits it using the bounded Asterisk-compatible retry schedule if the ACK is lost.
     pub fn send_text(&mut self, payload: &[u8]) -> Result<(), DialError> {
         self.ensure_reliable_capacity()?;
-        if payload.len() + 12 > MAX_PACKET_SIZE {
+        if payload.len() > self.maximum_datagram() - 12 {
             return Err(DialError::InvalidOptions);
         }
         let packet = self
@@ -623,6 +685,14 @@ impl IaxPeer {
             .send_text_frame(payload, self.elapsed_ms())
             .map_err(DialError::Protocol)?;
         self.send_reliable(packet)
+    }
+
+    fn maximum_datagram(&self) -> usize {
+        if self.remote.is_ipv4() {
+            65_507
+        } else {
+            crate::ingress::MAX_DATAGRAM_SIZE
+        }
     }
 
     /// Send one completed DTMF digit as a sequenced IAX full frame and retain it until ACKed.
@@ -1177,7 +1247,7 @@ fn dial_composed(
     let mut retry_at = Instant::now() + retry_interval;
     let mut transmissions = 1;
     let mut acknowledged = false;
-    let mut packet = [0_u8; 1500];
+    let mut packet = [0_u8; MAX_PACKET_SIZE];
     while Instant::now() < deadline {
         let Some((length, address)) = endpoint
             .try_receive(&mut packet)

@@ -107,7 +107,8 @@ impl UdpEndpoint {
         Arc::clone(&self.socket)
     }
 
-    /// Try to receive one datagram; `None` means the socket would block.
+    /// Try to receive one datagram; `None` means the socket would block. Protocol
+    /// parsers provide MAX_DATAGRAM_SIZE+1 bytes to distinguish guard overflow.
     pub fn try_receive(&self, buffer: &mut [u8]) -> io::Result<Option<(usize, SocketAddr)>> {
         receive_result(self.socket.socket.recv_from(buffer))
     }
@@ -116,7 +117,7 @@ impl UdpEndpoint {
     pub fn try_receive_routed(
         &self,
         router: &mut PeerIngressRouter,
-        buffer: &mut [u8; MAX_DATAGRAM_SIZE],
+        buffer: &mut [u8; MAX_DATAGRAM_SIZE + 1],
     ) -> Result<Option<SocketAddr>, NetworkIngressError> {
         route_received(self.try_receive(buffer), router, buffer)
     }
@@ -125,11 +126,14 @@ impl UdpEndpoint {
 fn route_received(
     received: io::Result<Option<(usize, SocketAddr)>>,
     router: &mut PeerIngressRouter,
-    buffer: &[u8; MAX_DATAGRAM_SIZE],
+    buffer: &[u8],
 ) -> Result<Option<SocketAddr>, NetworkIngressError> {
     let Some((length, remote)) = received.map_err(NetworkIngressError::Io)? else {
         return Ok(None);
     };
+    if length > MAX_DATAGRAM_SIZE || length > buffer.len() {
+        return Err(NetworkIngressError::MalformedPacket);
+    }
     let payload = &buffer[..length];
     if payload.first().is_some_and(|first| first & 0x80 != 0) {
         let frame =
