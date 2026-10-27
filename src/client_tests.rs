@@ -1368,7 +1368,7 @@ fn direct_peer_api_reports_metadata_and_sends_ulaw() {
     }
 
     assert!(matches!(
-        peer.send_ulaw(&vec![0.25; 1500], 80),
+        peer.send_ulaw(&vec![0.25; crate::ingress::MAX_DATAGRAM_SIZE], 80),
         Err(crate::client::DialError::Encode(_))
     ));
     assert!(matches!(

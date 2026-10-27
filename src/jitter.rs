@@ -129,6 +129,7 @@ pub(crate) struct Decision {
 pub(crate) struct Jitter {
     api: Descriptor,
     context: NonNull<c_void>,
+    release_span: u32,
 }
 
 // The capability contract permits thread migration and forbids simultaneous calls.
@@ -200,7 +201,13 @@ impl Jitter {
         Ok(Self {
             api,
             context: NonNull::new(context).ok_or(Error::OperationFailed)?,
+            release_span: (rate / 50).div_ceil(loss_unit) * loss_unit,
         })
+    }
+
+    /// Closest complete coding-unit request at least the ordinary 20 ms quantum.
+    pub(crate) fn release_span(&self) -> u32 {
+        self.release_span
     }
 
     /// Start a new timestamp/receive epoch, discarding old buffered media.

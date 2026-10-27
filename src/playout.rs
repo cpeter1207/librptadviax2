@@ -15,6 +15,7 @@ pub(crate) struct Playout {
     jitter: Jitter,
     origin: Instant,
     highest_ms: Option<u64>,
+    source_origin: Option<u64>,
     encoded: [u8; MAX_PAYLOAD],
     pending: Option<Decision>,
     pending_prefix: u32,
@@ -75,6 +76,7 @@ impl Playout {
             jitter,
             origin,
             highest_ms: None,
+            source_origin: None,
             encoded: [0; MAX_PAYLOAD],
             pending: None,
             pending_prefix: 0,
@@ -124,7 +126,18 @@ impl Playout {
         // qualification remains the controller's responsibility.
         self.active = true;
         self.expire_quiet(arrived_at)?;
-        let timestamp = self.unwrap_ms(timestamp, mini) * u64::from(self.rate) / 1000;
+        let mut timestamp = self.unwrap_ms(timestamp, mini) * u64::from(self.rate) / 1000;
+        let quantum = self.jitter.release_span();
+        if quantum * 1000 % self.rate != 0 {
+            // IAX milliseconds cannot represent LPC10's 22.5 ms coding grid.
+            // Recover whole-unit positions instead of trimming four valid
+            // samples from alternating, otherwise contiguous packets.
+            let origin = *self.source_origin.get_or_insert(timestamp);
+            let offset = i128::from(timestamp) - i128::from(origin);
+            let unit = i128::from(quantum);
+            timestamp = (i128::from(origin) + (offset + unit / 2).div_euclid(unit) * unit)
+                .clamp(0, i128::from(u64::MAX)) as u64;
+        }
         let admission = self
             .jitter
             .put(timestamp, span, self.ns(arrived_at), payload)
@@ -171,7 +184,7 @@ impl Playout {
         }
         let decision = self
             .jitter
-            .get(self.ns(now), self.rate / 50, &mut self.encoded)
+            .get(self.ns(now), self.jitter.release_span(), &mut self.encoded)
             .map_err(|_| DialError::Jitter)?;
         match decision.kind {
             Kind::NotDue => {
@@ -369,6 +382,7 @@ impl Playout {
     fn clear(&mut self) -> Result<(), DialError> {
         self.completed = self.observe()?;
         self.jitter.reset().map_err(|_| DialError::Jitter)?;
+        self.source_origin = None;
         self.pending = None;
         self.pending_prefix = 0;
         self.decoded_count = 0;

@@ -18,6 +18,62 @@ fn provider_decoder(
 }
 
 #[test]
+fn playout_fractional_codec_timestamps_retain_every_source_sample() {
+    let mut stream = provider_decoder("spandsp", crate::codec::providers::ProfileId::Lpc10);
+    let fixture = Fixture::new();
+    let origin = Instant::now();
+    let mut playout = Playout::new_at_rate(
+        unsafe { Jitter::new_at_rate(fixture.descriptor(), stream.rate, stream.loss_unit) }
+            .unwrap(),
+        origin,
+        stream.rate,
+    );
+    for timestamp in [1000, 1022, 1045, 1067] {
+        let mut packet = [0; 7];
+        stream
+            .encoder
+            .encode(&[0.1; 180], &mut packet, false)
+            .unwrap();
+        playout
+            .put_with_codec(timestamp, false, origin, &packet, Some(&stream.decoder))
+            .unwrap();
+    }
+    let packets = fixture.puts();
+    let first = packets[0].0;
+    assert_eq!(
+        packets
+            .iter()
+            .map(|packet| packet.0 - first)
+            .collect::<Vec<_>>(),
+        [0, 180, 360, 540]
+    );
+}
+
+#[test]
+fn playout_codec_requests_whole_natural_loss_units() {
+    for (backend, id) in [
+        ("ffmpeg", crate::codec::providers::ProfileId::G723),
+        ("spandsp", crate::codec::providers::ProfileId::Lpc10),
+        ("ilbc", crate::codec::providers::ProfileId::Ilbc),
+    ] {
+        let mut stream = provider_decoder(backend, id);
+        let fixture = Fixture::new();
+        let mut playout = Playout::new_at_rate(
+            unsafe { Jitter::new_at_rate(fixture.descriptor(), stream.rate, stream.loss_unit) }
+                .unwrap(),
+            Instant::now(),
+            stream.rate,
+        );
+        assert_eq!(
+            playout
+                .poll_with_codec(Instant::now(), &mut [0.0; 960], Some(&mut stream.decoder))
+                .unwrap(),
+            IaxPeerEvent::None
+        );
+    }
+}
+
+#[test]
 fn playout_codec_native_plc_precedes_ring_fallback_and_never_double_conceals() {
     let mut stream = provider_decoder("speex", crate::codec::providers::ProfileId::Speex);
     let mut encoded = [0; 1024];
