@@ -1,5 +1,5 @@
 //! One peer's retained codec owners, prepared outside the audio callbacks.
-use super::providers::{CodecCatalog, Decoder, Encoder, Error, ProfileId, error};
+use super::providers::{CodecCatalog, Decoder, Encoder, Error, ProfileId, Status};
 
 /// Independent directional contexts and their actual linear PCM clock.
 pub struct Stream {
@@ -18,9 +18,11 @@ impl Stream {
     /// Open the preferred explicit mode. Stream codecs use 20 ms; longer
     /// coding units retain their natural duration instead of being truncated.
     pub fn open(catalog: &CodecCatalog, id: ProfileId) -> Result<Self, Error> {
-        let profile = catalog
-            .profile(id)
-            .ok_or_else(|| error("unselected stream profile"))?;
+        let profile = catalog.profile(id).ok_or(Error {
+            status: Status::Failed,
+            required_capacity: 0,
+            operation: "unselected stream profile",
+        })?;
         let mode = &profile.modes[0];
         let packet_frames =
             (profile.sample_rate_hz / 50 / mode.frame_samples).max(1) * mode.frame_samples;

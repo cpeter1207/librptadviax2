@@ -278,14 +278,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
+name = "rptadv-codec-client"
+version = "0.1.0-alpha1"
+source = "git+https://github.com/cpeter1207/rptadv-codec-adapters?rev=becbff939a0817cc91df6dcb0d40e85e381ec87b#becbff939a0817cc91df6dcb0d40e85e381ec87b"
+dependencies = [
+ "bindgen",
+ "libloading",
+]
+
+[[package]]
 name = "rptadviax2"
 version = "0.1.0"
 dependencies = [
  "audio-codec-algorithms",
- "bindgen",
  "getrandom",
  "libloading",
  "md-5",
+ "rptadv-codec-client",
  "sha1",
  "tokio",
 ]
