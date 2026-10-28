@@ -287,6 +287,11 @@ dependencies = [
 ]
 
 [[package]]
+name = "rptadv-jitter-client"
+version = "0.1.0-alpha17"
+source = "git+https://github.com/cpeter1207/rpt_advanced?rev=a151c00450937c5316607c80cd37bbedb12fc5e0#a151c00450937c5316607c80cd37bbedb12fc5e0"
+
+[[package]]
 name = "rptadviax2"
 version = "0.1.0"
 dependencies = [
@@ -295,6 +300,7 @@ dependencies = [
  "libloading",
  "md-5",
  "rptadv-codec-client",
+ "rptadv-jitter-client",
  "sha1",
  "tokio",
 ]

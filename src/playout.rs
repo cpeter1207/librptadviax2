@@ -138,9 +138,10 @@ impl Playout {
             timestamp = (i128::from(origin) + (offset + unit / 2).div_euclid(unit) * unit)
                 .clamp(0, i128::from(u64::MAX)) as u64;
         }
+        let arrival_ns = self.ns(arrived_at);
         let admission = self
             .jitter
-            .put(timestamp, span, self.ns(arrived_at), payload)
+            .put(timestamp, span, arrival_ns, payload)
             .map_err(|_| DialError::Jitter)?;
         if admission == Admission::Accepted {
             self.tail_end = Some(self.tail_end.unwrap_or(0).max(timestamp + u64::from(span)));
@@ -182,9 +183,11 @@ impl Playout {
             // concealment and its existing 60ms receive-activity fallback.
             return Ok(IaxPeerEvent::None);
         }
+        let now_ns = self.ns(now);
+        let release_span = self.jitter.release_span();
         let decision = self
             .jitter
-            .get(self.ns(now), self.jitter.release_span(), &mut self.encoded)
+            .get(now_ns, release_span, &mut self.encoded)
             .map_err(|_| DialError::Jitter)?;
         match decision.kind {
             Kind::NotDue => {
@@ -363,8 +366,9 @@ impl Playout {
     fn commit(&mut self, now: Instant, decision: &Decision) -> Result<(), DialError> {
         // The caller accepts this whole event before polling again. Ring reserve is
         // deliberately not fed back as a second packet-delay controller.
+        let now_ns = self.ns(now);
         self.jitter
-            .advance(self.ns(now), 0)
+            .advance(now_ns, 0)
             .map_err(|_| DialError::Jitter)?;
         let observation = self.jitter.observe().map_err(|_| DialError::Jitter)?;
         let media_span = if decision.kind == Kind::Insertion {
