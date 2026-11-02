@@ -11,5 +11,5 @@
 /debian/tmp
 /debian/*.substvars
 /debian/*.debhelper.log
-/debian/librptadv-iax2-client1
+/debian/librptadv-iax2-client[0-9]*/
 /debian/librptadv-iax2-client-dev

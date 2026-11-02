@@ -1,30 +1,33 @@
-//! Versioned C boundary for the standalone ULAW IAX2 client.
+//! Versioned C boundary for provider-backed standalone IAX2 media.
 
 use crate::{
-    client::{DialError, DialOptions, IaxPeer, IaxPeerEvent, MediaSend, dial_ulaw},
-    codec::{CodecAdapter, G711Ulaw},
+    client::{DialError, DialOptions, IaxPeer, IaxPeerEvent, MediaSend},
+    codec::providers::{CodecCatalog, EncodeResultRaw, ProfileId, ProviderSelection},
+    formats::FormatCatalog,
 };
 use std::{
-    ffi::c_void,
+    ffi::{CStr, c_char, c_void},
     mem::size_of,
     net::SocketAddr,
     panic::{AssertUnwindSafe, catch_unwind},
+    path::PathBuf,
     ptr, slice, str,
+    sync::Arc,
     time::Duration,
 };
 
 /// Exact C-client ABI revision.
-pub const RPTADV_IAX2_CLIENT_ABI_VERSION: u32 = 1;
+pub const RPTADV_IAX2_CLIENT_ABI_VERSION: u32 = 2;
 /// Fixed-width capability identifier returned by the C descriptor.
-pub const RPTADV_IAX2_CLIENT_CAPABILITY: [u8; 16] = *b"rptadv.iax2.v1\0\0";
+pub const RPTADV_IAX2_CLIENT_CAPABILITY: [u8; 16] = *b"rptadv.iax2.v2\0\0";
 /// Exact C-server ABI revision.
-pub const RPTADV_IAX2_SERVER_ABI_VERSION: u32 = 1;
+pub const RPTADV_IAX2_SERVER_ABI_VERSION: u32 = 2;
 /// Fixed-width capability identifier returned by the inbound server descriptor.
-pub const RPTADV_IAX2_SERVER_CAPABILITY: [u8; 16] = *b"rptadv.iaxsrv1\0\0";
+pub const RPTADV_IAX2_SERVER_CAPABILITY: [u8; 16] = *b"rptadv.iaxsrv2\0\0";
 
 /// No event is available from a nonblocking poll.
 pub const RPTADV_IAX2_EVENT_NONE: u32 = 0;
-/// A decoded mono F32 ULAW media block is available.
+/// A decoded mono F32 block at the selected profile's source rate is available.
 pub const RPTADV_IAX2_EVENT_AUDIO: u32 = 1;
 /// A reliable ASL text message is available.
 pub const RPTADV_IAX2_EVENT_TEXT: u32 = 2;
@@ -40,9 +43,20 @@ pub const RPTADV_IAX2_EVENT_RADIO_UNKEY: u32 = 6;
 /// Only peers explicitly configured with the jitter capability emit this event.
 pub const RPTADV_IAX2_EVENT_GAP: u32 = 7;
 
-/// Caller-owned parameters for one outbound ULAW IAX2 call.
+/// One explicit bidirectional neutral profile and its trusted provider path.
 #[repr(C)]
-pub struct rptadv_iax2_dial_options_v1 {
+pub struct rptadv_iax2_codec_selection_v2 {
+    /// Complete readable selection size.
+    pub struct_size: u32,
+    /// Neutral ID from the installed codec contract, never an IAX format bit.
+    pub profile_id: u32,
+    /// NUL-terminated provider path; copied by open_catalog.
+    pub provider_path: *const c_char,
+}
+
+/// Caller-owned parameters for one outbound provider-backed IAX2 call.
+#[repr(C)]
+pub struct rptadv_iax2_dial_options_v2 {
     /// Complete readable structure size.
     pub struct_size: u32,
     /// Exact [`RPTADV_IAX2_CLIENT_ABI_VERSION`].
@@ -69,30 +83,34 @@ pub struct rptadv_iax2_dial_options_v1 {
     pub secret_length: usize,
     /// Maximum call-setup time in milliseconds; zero is invalid.
     pub timeout_ms: u32,
+    /// Catalog borrowed during dial; directional contexts retain their providers.
+    pub catalog: *const c_void,
 }
 
-/// Versioned function table for one-owner outbound ULAW peer sessions.
+/// Versioned function table for one-owner peer sessions and prepared media.
 #[repr(C)]
-pub struct rptadv_iax2_client_descriptor_v1 {
+pub struct rptadv_iax2_client_descriptor_v2 {
     /// Complete readable descriptor size.
     pub struct_size: u32,
     /// Exact [`RPTADV_IAX2_CLIENT_ABI_VERSION`].
     pub abi_version: u32,
     /// NUL-padded [`RPTADV_IAX2_CLIENT_CAPABILITY`].
     pub capability: [u8; 16],
+    /// Load selected providers off audio, copying paths and retaining both directions.
+    pub open_catalog: Option<
+        unsafe extern "C" fn(*const rptadv_iax2_codec_selection_v2, usize, *mut *mut c_void) -> i32,
+    >,
+    /// Release the caller's catalog owner after outstanding catalog calls finish.
+    pub close_catalog: Option<unsafe extern "C" fn(*mut c_void)>,
     /// Establish one outbound call. Success returns a uniquely owned peer handle.
     pub dial: Option<
         unsafe extern "C" fn(
-            options: *const rptadv_iax2_dial_options_v1,
+            options: *const rptadv_iax2_dial_options_v2,
             peer: *mut *mut c_void,
         ) -> i32,
     >,
     /// Return the negotiated peer's linear PCM rate in samples per second.
     pub sample_rate_hz: Option<unsafe extern "C" fn(peer: *const c_void) -> u32>,
-    /// Encode and send one mono F32 ULAW media block.
-    pub send_audio: Option<
-        unsafe extern "C" fn(peer: *mut c_void, samples: *const f32, sample_count: usize) -> i32,
-    >,
     /// Send one ASL text payload.
     pub send_text:
         Option<unsafe extern "C" fn(peer: *mut c_void, bytes: *const u8, length: usize) -> i32>,
@@ -114,18 +132,32 @@ pub struct rptadv_iax2_client_descriptor_v1 {
     pub destroy: Option<unsafe extern "C" fn(peer: *mut c_void)>,
     /// Send one completed DTMF digit.
     pub send_digit: Option<unsafe extern "C" fn(peer: *mut c_void, digit: u8) -> i32>,
-    /// Encode into caller storage: one ULAW byte per source sample, no peer mutation.
-    pub prepare_ulaw: Option<unsafe extern "C" fn(*const f32, usize, *mut u8, usize) -> i32>,
-    /// Submit encoded media: zero transfers ownership, one leaves an uncommitted item with caller.
-    /// Zero bytes submit an end-of-burst marker at the supplied source timestamp.
-    pub send_prepared_ulaw: Option<unsafe extern "C" fn(*mut c_void, *const u8, usize, u32) -> i32>,
+    /// Consume input once and return the installed neutral result/status (0..5).
+    /// OutputFull consumes nothing; invalid pointers/records return negative.
+    pub prepare_audio: Option<
+        unsafe extern "C" fn(
+            *mut c_void,
+            *const f32,
+            usize,
+            *mut u8,
+            usize,
+            u32,
+            *mut EncodeResultRaw,
+        ) -> i32,
+    >,
+    /// Abandon expired or discontinuous input on the exclusive peer owner.
+    pub reset_encoder: Option<unsafe extern "C" fn(*mut c_void) -> i32>,
+    /// Zero transfers ownership; one leaves the uncommitted packet with caller.
+    /// Byte count, source packet frames and IAX milliseconds are independent.
+    pub send_prepared_audio:
+        Option<unsafe extern "C" fn(*mut c_void, *const u8, usize, u32, u32) -> i32>,
     /// Existing call-relative clock, sampled only by the serialized non-audio owner.
     pub elapsed_ms: Option<unsafe extern "C" fn(*const c_void) -> u32>,
 }
 
 /// Caller-owned options for a single UDP endpoint serving configured local nodes.
 #[repr(C)]
-pub struct rptadv_iax2_server_options_v1 {
+pub struct rptadv_iax2_server_options_v2 {
     /// Complete readable structure size.
     pub struct_size: u32,
     /// Exact [`RPTADV_IAX2_SERVER_ABI_VERSION`].
@@ -138,6 +170,8 @@ pub struct rptadv_iax2_server_options_v1 {
     pub local_nodes: *const u8,
     /// Local-node list byte count.
     pub local_nodes_length: usize,
+    /// Catalog retained independently by the listener and admitted codec contexts.
+    pub catalog: *const c_void,
 }
 
 /// Product callback allowing one authenticated inbound node/source pair.
@@ -165,7 +199,7 @@ pub type RptadvIax2AcceptV1 = unsafe extern "C" fn(
 
 /// Versioned inbound UDP listener descriptor, separate from protocol session ownership.
 #[repr(C)]
-pub struct rptadv_iax2_server_descriptor_v1 {
+pub struct rptadv_iax2_server_descriptor_v2 {
     /// Complete readable descriptor size.
     pub struct_size: u32,
     /// Exact [`RPTADV_IAX2_SERVER_ABI_VERSION`].
@@ -174,7 +208,7 @@ pub struct rptadv_iax2_server_descriptor_v1 {
     pub capability: [u8; 16],
     /// Bind one endpoint and return a uniquely owned listener.
     pub bind:
-        Option<unsafe extern "C" fn(*const rptadv_iax2_server_options_v1, *mut *mut c_void) -> i32>,
+        Option<unsafe extern "C" fn(*const rptadv_iax2_server_options_v2, *mut *mut c_void) -> i32>,
     /// Poll at most one datagram; product callbacks run synchronously on this control owner.
     pub poll: Option<
         unsafe extern "C" fn(
@@ -191,25 +225,27 @@ pub struct rptadv_iax2_server_descriptor_v1 {
     pub destroy: Option<unsafe extern "C" fn(*mut c_void)>,
 }
 
-const DESCRIPTOR: rptadv_iax2_client_descriptor_v1 = rptadv_iax2_client_descriptor_v1 {
-    struct_size: size_of::<rptadv_iax2_client_descriptor_v1>() as u32,
+const DESCRIPTOR: rptadv_iax2_client_descriptor_v2 = rptadv_iax2_client_descriptor_v2 {
+    struct_size: size_of::<rptadv_iax2_client_descriptor_v2>() as u32,
     abi_version: RPTADV_IAX2_CLIENT_ABI_VERSION,
     capability: RPTADV_IAX2_CLIENT_CAPABILITY,
+    open_catalog: Some(open_catalog),
+    close_catalog: Some(close_catalog),
     dial: Some(dial),
     sample_rate_hz: Some(sample_rate_hz),
-    send_audio: Some(send_audio),
     send_text: Some(send_text),
     poll: Some(poll),
     hangup: Some(hangup),
     destroy: Some(destroy),
     send_digit: Some(send_digit),
-    prepare_ulaw: Some(prepare_ulaw),
-    send_prepared_ulaw: Some(send_prepared_ulaw),
+    prepare_audio: Some(prepare_audio),
+    reset_encoder: Some(reset_encoder),
+    send_prepared_audio: Some(send_prepared_audio),
     elapsed_ms: Some(elapsed_ms),
 };
 
-const SERVER_DESCRIPTOR: rptadv_iax2_server_descriptor_v1 = rptadv_iax2_server_descriptor_v1 {
-    struct_size: size_of::<rptadv_iax2_server_descriptor_v1>() as u32,
+const SERVER_DESCRIPTOR: rptadv_iax2_server_descriptor_v2 = rptadv_iax2_server_descriptor_v2 {
+    struct_size: size_of::<rptadv_iax2_server_descriptor_v2>() as u32,
     abi_version: RPTADV_IAX2_SERVER_ABI_VERSION,
     capability: RPTADV_IAX2_SERVER_CAPABILITY,
     bind: Some(server_bind),
@@ -222,19 +258,97 @@ const SERVER_DESCRIPTOR: rptadv_iax2_server_descriptor_v1 = rptadv_iax2_server_d
 #[path = "ffi_tests.rs"]
 mod tests;
 
-/// Return the immutable process-lifetime ULAW client descriptor.
+/// Return the immutable process-lifetime provider-backed client descriptor.
 #[unsafe(no_mangle)]
-pub extern "C" fn rptadv_iax2_client_descriptor_v1() -> *const rptadv_iax2_client_descriptor_v1 {
+pub extern "C" fn rptadv_iax2_client_descriptor_v2() -> *const rptadv_iax2_client_descriptor_v2 {
     &DESCRIPTOR
 }
 
 /// Return the immutable process-lifetime inbound UDP listener descriptor.
 #[unsafe(no_mangle)]
-pub extern "C" fn rptadv_iax2_server_descriptor_v1() -> *const rptadv_iax2_server_descriptor_v1 {
+pub extern "C" fn rptadv_iax2_server_descriptor_v2() -> *const rptadv_iax2_server_descriptor_v2 {
     &SERVER_DESCRIPTOR
 }
 
 struct ServerHandle(crate::server::InboundIaxListener);
+
+unsafe extern "C" fn open_catalog(
+    selections: *const rptadv_iax2_codec_selection_v2,
+    count: usize,
+    output: *mut *mut c_void,
+) -> i32 {
+    boundary(-1, || {
+        let Some(output) = (unsafe { output.as_mut() }) else {
+            return -1;
+        };
+        *output = ptr::null_mut();
+        let Some(selections) = (unsafe { input_slice(selections, count) }) else {
+            return -1;
+        };
+        let mut providers: std::collections::BTreeMap<PathBuf, Vec<ProfileId>> =
+            std::collections::BTreeMap::new();
+        let mut preference = Vec::with_capacity(count);
+        for selection in selections {
+            if selection.struct_size < size_of::<rptadv_iax2_codec_selection_v2>() as u32
+                || selection.provider_path.is_null()
+            {
+                return -1;
+            }
+            let Some(profile) = ProfileId::from_raw(selection.profile_id) else {
+                return -1;
+            };
+            let Ok(path) = (unsafe { CStr::from_ptr(selection.provider_path) }).to_str() else {
+                return -1;
+            };
+            providers
+                .entry(PathBuf::from(path))
+                .or_default()
+                .push(profile);
+            preference.push(profile);
+        }
+        let selections = providers
+            .into_iter()
+            .map(|(path, profiles)| ProviderSelection { path, profiles })
+            .collect::<Vec<_>>();
+        let Ok(codecs) = CodecCatalog::load(&selections) else {
+            return -1;
+        };
+        let Ok(catalog) = FormatCatalog::new(Arc::new(codecs), &preference) else {
+            return -1;
+        };
+        *output = Box::into_raw(Box::new(Arc::new(catalog))).cast();
+        0
+    })
+}
+
+unsafe extern "C" fn close_catalog(handle: *mut c_void) {
+    if !handle.is_null() {
+        unsafe { drop(Box::from_raw(handle.cast::<Arc<FormatCatalog>>())) };
+    }
+}
+
+unsafe fn clone_catalog(handle: *const c_void) -> Option<Arc<FormatCatalog>> {
+    unsafe { handle.cast::<Arc<FormatCatalog>>().as_ref() }.cloned()
+}
+
+#[cfg(test)]
+pub(crate) fn test_catalog() -> *const c_void {
+    ptr::from_ref(test_peer_catalog()).cast()
+}
+
+#[cfg(test)]
+pub(crate) fn test_peer_catalog() -> &'static Arc<FormatCatalog> {
+    static CATALOG: std::sync::OnceLock<Arc<FormatCatalog>> = std::sync::OnceLock::new();
+    CATALOG.get_or_init(|| {
+        let directory = PathBuf::from(std::env::var_os("RPTADV_CODEC_DIR").unwrap_or_default());
+        let codecs = CodecCatalog::load(&[ProviderSelection {
+            path: directory.join("librptadv_codec_g711.so.1"),
+            profiles: vec![ProfileId::G711Mu],
+        }])
+        .unwrap();
+        Arc::new(FormatCatalog::new(Arc::new(codecs), &[ProfileId::G711Mu]).unwrap())
+    })
+}
 
 pub(crate) unsafe fn server_enable_async(
     handle: *mut c_void,
@@ -256,21 +370,23 @@ fn async_enable_status(result: Result<(), crate::server::ListenerError>) -> i32 
 }
 
 unsafe extern "C" fn server_bind(
-    options: *const rptadv_iax2_server_options_v1,
+    options: *const rptadv_iax2_server_options_v2,
     output: *mut *mut c_void,
 ) -> i32 {
     boundary(-1, || {
-        let (Some(options), Some(output)) =
-            (unsafe { options.as_ref() }, unsafe { output.as_mut() })
-        else {
+        let Some(output) = (unsafe { output.as_mut() }) else {
             return -1;
         };
         *output = ptr::null_mut();
-        if options.abi_version != RPTADV_IAX2_SERVER_ABI_VERSION
-            || options.struct_size < size_of::<rptadv_iax2_server_options_v1>() as u32
-        {
+        let Some(options) = (unsafe { sized_ref(options) }) else {
+            return -1;
+        };
+        if options.abi_version != RPTADV_IAX2_SERVER_ABI_VERSION {
             return -1;
         }
+        let Some(catalog) = (unsafe { clone_catalog(options.catalog) }) else {
+            return -1;
+        };
         let (Some(address), Some(nodes)) = (
             unsafe { utf8(options.bind_address, options.bind_address_length) }
                 .and_then(|text| text.parse::<SocketAddr>().ok()),
@@ -279,7 +395,7 @@ unsafe extern "C" fn server_bind(
             return -1;
         };
         let local_nodes = nodes.split(',').map(str::to_owned).collect::<Vec<_>>();
-        match crate::server::InboundIaxListener::bind_many(address, &local_nodes) {
+        match crate::server::InboundIaxListener::bind_with_catalog(address, &local_nodes, catalog) {
             Ok(listener) => {
                 *output = Box::into_raw(Box::new(ServerHandle(listener))).cast();
                 0
@@ -377,7 +493,7 @@ unsafe extern "C" fn server_set_local_nodes(
 }
 
 unsafe extern "C" fn dial(
-    options: *const rptadv_iax2_dial_options_v1,
+    options: *const rptadv_iax2_dial_options_v2,
     output: *mut *mut c_void,
 ) -> i32 {
     boundary(-1, || {
@@ -385,15 +501,15 @@ unsafe extern "C" fn dial(
             return -1;
         };
         *output = ptr::null_mut();
-        let Some(options) = (unsafe { options.as_ref() }) else {
+        let Some(options) = (unsafe { sized_ref(options) }) else {
             return -1;
         };
-        if options.abi_version != RPTADV_IAX2_CLIENT_ABI_VERSION
-            || options.struct_size < size_of::<rptadv_iax2_dial_options_v1>() as u32
-            || options.reserved != 0
-        {
+        if options.abi_version != RPTADV_IAX2_CLIENT_ABI_VERSION || options.reserved != 0 {
             return -1;
         }
+        let Some(catalog) = (unsafe { clone_catalog(options.catalog) }) else {
+            return -1;
+        };
         let Some(remote) = (unsafe { utf8(options.remote_address, options.remote_address_length) })
             .and_then(|value| value.parse::<SocketAddr>().ok())
         else {
@@ -410,31 +526,23 @@ unsafe extern "C" fn dial(
         let Some(secret) = (unsafe { utf8(options.secret, options.secret_length) }) else {
             return -1;
         };
-        match dial_ulaw(DialOptions {
-            remote,
-            local_call: options.local_call_number,
-            local_node,
-            remote_node,
-            secret,
-            timeout: Duration::from_millis(u64::from(options.timeout_ms)),
-        }) {
+        match crate::client::dial(
+            DialOptions {
+                remote,
+                local_call: options.local_call_number,
+                local_node,
+                remote_node,
+                secret,
+                timeout: Duration::from_millis(u64::from(options.timeout_ms)),
+            },
+            catalog,
+        ) {
             Ok(peer) => {
                 *output = Box::into_raw(Box::new(peer)).cast();
                 0
             }
             Err(error) => dial_error_code(error),
         }
-    })
-}
-
-unsafe extern "C" fn send_audio(peer: *mut c_void, samples: *const f32, count: usize) -> i32 {
-    boundary(-1, || {
-        let (Some(peer), Some(samples)) = (unsafe { peer.cast::<IaxPeer>().as_mut() }, unsafe {
-            input_slice(samples, count)
-        }) else {
-            return -1;
-        };
-        peer.send_audio(samples).map_or_else(|_| -1, |_| 0)
     })
 }
 
@@ -464,26 +572,70 @@ unsafe extern "C" fn send_digit(peer: *mut c_void, digit: u8) -> i32 {
     })
 }
 
-unsafe extern "C" fn prepare_ulaw(
+unsafe extern "C" fn prepare_audio(
+    peer: *mut c_void,
     samples: *const f32,
     count: usize,
     output: *mut u8,
     capacity: usize,
+    flush: u32,
+    result: *mut EncodeResultRaw,
 ) -> i32 {
     boundary(-1, || {
-        let (Some(samples), Some(output)) = (unsafe { input_slice(samples, count) }, unsafe {
-            output_slice(output, capacity)
-        }) else {
+        let (Some(peer), Some(samples), Some(output)) = (
+            unsafe { peer.cast::<IaxPeer>().as_mut() },
+            unsafe { input_slice(samples, count) },
+            unsafe { output_slice(output, capacity) },
+        ) else {
             return -1;
         };
-        G711Ulaw.encode(samples, output).map_or(-1, |_| 0)
+        if flush > 1
+            || result.is_null()
+            || unsafe { result.cast::<u32>().read() } < size_of::<EncodeResultRaw>() as u32
+        {
+            return -1;
+        }
+        let mut raw = EncodeResultRaw {
+            struct_size: size_of::<EncodeResultRaw>() as u32,
+            ..Default::default()
+        };
+        let status = match peer.prepare_audio(samples, output, flush != 0) {
+            Ok(encoded) => {
+                raw.status = encoded.status.as_raw();
+                raw.consumed_frames = encoded.consumed_frames;
+                raw.encoded_bytes = encoded.encoded_bytes;
+                raw.source_start_frames = encoded.source_start_frames;
+                raw.source_frames = encoded.source_frames;
+                raw.packet_frames = encoded.packet_frames;
+                raw.status as i32
+            }
+            Err(DialError::Provider(error)) => {
+                raw.status = error.status.as_raw();
+                raw.required_capacity = error.required_capacity;
+                raw.status as i32
+            }
+            Err(_) => return -1,
+        };
+        // Sized validation precedes writing the complete common result record.
+        unsafe { result.write(raw) };
+        status
     })
 }
 
-unsafe extern "C" fn send_prepared_ulaw(
+unsafe extern "C" fn reset_encoder(peer: *mut c_void) -> i32 {
+    boundary(-1, || {
+        let Some(peer) = (unsafe { peer.cast::<IaxPeer>().as_mut() }) else {
+            return -1;
+        };
+        peer.reset_encoder().map_or(-1, |_| 0)
+    })
+}
+
+unsafe extern "C" fn send_prepared_audio(
     peer: *mut c_void,
     bytes: *const u8,
     count: usize,
+    packet_frames: u32,
     timestamp: u32,
 ) -> i32 {
     boundary(-1, || {
@@ -492,7 +644,7 @@ unsafe extern "C" fn send_prepared_ulaw(
         }) else {
             return -1;
         };
-        match peer.send_prepared_ulaw(payload, timestamp) {
+        match peer.send_prepared_audio(payload, packet_frames, timestamp) {
             Ok(MediaSend::Accepted) => 0,
             Ok(MediaSend::WouldBlock) => 1,
             Err(_) => -1,
@@ -567,6 +719,14 @@ unsafe extern "C" fn poll(
             Ok(IaxPeerEvent::RadioUnkey) => {
                 *event_kind = RPTADV_IAX2_EVENT_RADIO_UNKEY;
                 0
+            }
+            Err(DialError::Provider(error))
+                if error.status == crate::codec::providers::Status::OutputFull =>
+            {
+                // The pending native decode/PLC operation has not consumed its
+                // source span. Let the owner retry with sufficient storage.
+                *event_length = error.required_capacity;
+                1
             }
             Err(error) => {
                 report_poll_error(peer, &error);
@@ -646,7 +806,7 @@ fn dial_error_code(error: DialError) -> i32 {
         DialError::Network(_) => -2,
         DialError::Timeout => -3,
         DialError::Rejected => -4,
-        DialError::UnsupportedFormat(_) => -5,
+        DialError::UnsupportedFormat(_) | DialError::Provider(_) => -5,
         DialError::Hangup
         | DialError::EarlyEventsFull
         | DialError::ReliableWindowFull
@@ -656,6 +816,14 @@ fn dial_error_code(error: DialError) -> i32 {
         | DialError::Encode(_)
         | DialError::Decode(_) => -6,
     }
+}
+
+/// Check the readable record size before borrowing any newly appended fields.
+unsafe fn sized_ref<'a, T>(pointer: *const T) -> Option<&'a T> {
+    if pointer.is_null() || unsafe { pointer.cast::<u32>().read() } < size_of::<T>() as u32 {
+        return None;
+    }
+    unsafe { pointer.as_ref() }
 }
 
 unsafe fn utf8<'a>(pointer: *const u8, length: usize) -> Option<&'a str> {

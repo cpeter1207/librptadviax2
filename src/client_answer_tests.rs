@@ -108,17 +108,19 @@ fn dial_waits_for_answer_and_replays_early_events_in_order() {
         IaxPeerEvent::Text(9)
     );
     assert_eq!(&text[..9], b"!NEWKEY1!");
-    assert!(matches!(
-        peer.poll_event(&mut [0.0; 2], &mut text),
-        Err(DialError::InvalidOptions)
-    ));
+    let mut prefix = [0.0; 2];
+    assert_eq!(
+        peer.poll_event(&mut prefix, &mut text).unwrap(),
+        IaxPeerEvent::Audio(2)
+    );
     assert_eq!(
         peer.poll_event(&mut pcm, &mut text).unwrap(),
-        IaxPeerEvent::Audio(3)
+        IaxPeerEvent::Audio(1)
     );
     let mut expected = [0.0; 3];
     G711Ulaw.decode(&[0x80, 0xff, 0x00], &mut expected).unwrap();
-    assert_eq!(&pcm[..3], &expected);
+    assert_eq!(&prefix, &expected[..2]);
+    assert_eq!(pcm[0], expected[2]);
     assert_eq!(
         peer.poll_event(&mut pcm, &mut text).unwrap(),
         IaxPeerEvent::Text(11)

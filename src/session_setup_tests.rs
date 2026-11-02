@@ -10,8 +10,26 @@ use crate::session::{
 
 const LOCAL_CALL: u16 = 1;
 const REMOTE_CALL: u16 = 77;
-const OFFERED_FORMAT: u32 = IAX_FORMAT_ULAW;
-const OFFERED_FORMAT_BYTES: [u8; 4] = OFFERED_FORMAT.to_be_bytes();
+const OFFERED_FORMAT: u64 = IAX_FORMAT_ULAW;
+const OFFERED_FORMAT_BYTES: [u8; 4] = (OFFERED_FORMAT as u32).to_be_bytes();
+
+#[test]
+fn formats_setup_accepts_offered_extended_opus() {
+    let opus = 1u64 << 34;
+    let mut new_payload = Vec::new();
+    crate::formats::append_formats(&mut new_payload, 4, Some(4 | opus));
+    let elements = crate::information_elements::parse_information_elements(&new_payload).unwrap();
+    let mut setup = OutboundCallSetup::new(LOCAL_CALL, 0, &elements).unwrap();
+    let mut accept = Vec::new();
+    crate::formats::append_formats(&mut accept, opus, None);
+    let response = setup
+        .receive(&incoming(IaxCommand::Accept, 0, 1, &accept), 10, "unused")
+        .unwrap();
+    let CallSetupResponse::Accepted { format, .. } = response else {
+        panic!("not accepted")
+    };
+    assert_eq!(format, opus);
+}
 
 fn initial_elements() -> [InformationElement<'static>; 2] {
     [
@@ -1259,7 +1277,7 @@ fn rejects_malformed_or_zero_accept_format_and_md5_authreq() {
     let zero_format = incoming(IaxCommand::Accept, 0, 1, &[9, 4, 0, 0, 0, 0]);
     assert_eq!(
         setup.receive(&zero_format, 1, "secret"),
-        Err(CallSetupError::UnacceptedFormat { format: 0 })
+        Err(CallSetupError::InvalidAcceptedFormat)
     );
     assert!(matches!(
         setup.receive(

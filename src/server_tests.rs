@@ -24,6 +24,48 @@ use std::{
 };
 
 #[test]
+fn formats_inbound_listener_uses_the_same_verified_catalog() {
+    use crate::{
+        codec::providers::{CodecCatalog, ProfileId, ProviderSelection},
+        formats::FormatCatalog,
+    };
+    let directory =
+        std::path::PathBuf::from(std::env::var_os("RPTADV_CODEC_DIR").unwrap_or_default());
+    let codecs = Arc::new(
+        CodecCatalog::load(&[ProviderSelection {
+            path: directory.join("librptadv_codec_opus.so.1"),
+            profiles: vec![ProfileId::Opus],
+        }])
+        .unwrap(),
+    );
+    let catalog = Arc::new(FormatCatalog::new(codecs, &[ProfileId::Opus]).unwrap());
+    let mut listener = InboundIaxListener::bind_with_catalog(
+        "127.0.0.1:0".parse().unwrap(),
+        &["524950".to_owned()],
+        catalog,
+    )
+    .unwrap();
+    let server = listener.local_addr().unwrap();
+    let (client, initial) = initial_new("127.0.0.1:0".parse().unwrap(), server);
+    let first = parse_full_frame_packet(&initial).unwrap();
+    let mut payload = first.payload.to_vec();
+    assert!(payload.ends_with(&[54, 0]));
+    payload.truncate(payload.len() - 2);
+    crate::formats::append_formats(&mut payload, 1u64 << 34, Some(1u64 << 34));
+    payload.extend_from_slice(&[54, 0]);
+    let initial = serialize_full_frame(&first.header, &payload).unwrap();
+    let ListenerEvent::Accepted(accepted) =
+        finish_inbound_handshake(&mut listener, &client, &initial, server)
+    else {
+        panic!("token-valid Opus call not admitted");
+    };
+    assert_eq!(
+        (accepted.format, accepted.into_peer().sample_rate_hz()),
+        (1u64 << 34, 48000)
+    );
+}
+
+#[test]
 fn local_node_configuration_requires_unique_decimal_nodes() {
     assert!(valid_local_nodes(&[
         "524950".to_owned(),
@@ -652,12 +694,34 @@ fn existing_routes_ignore_malformed_and_unknown_call_frames() {
     assert!(!listener.route_existing(remote, &[0x80, 0x01]));
     assert!(!listener.route_existing(remote, &full_packet(42, 22, 4)));
     let mut oversized = full_packet(42, 22, 4);
-    oversized.resize(1501, 0);
+    oversized.resize(crate::ingress::MAX_DATAGRAM_SIZE + 1, 0);
     let mut routed = InboundIaxListener::bind("127.0.0.1:0".parse().unwrap(), "524950").unwrap();
     let _consumer = routed.router.register_call(remote, 22, 42, 7).unwrap();
     assert!(routed.route_existing(remote, &oversized));
     assert!(!listener.route_existing(remote, &mini_packet(42)));
     assert!(!listener.route_existing(remote, &[0, 0]));
+}
+
+#[test]
+fn listener_ignores_oversized_receive_without_losing_later_admission() {
+    let mut listener = InboundIaxListener::bind("127.0.0.1:0".parse().unwrap(), "524950").unwrap();
+    let server = listener.local_addr().unwrap();
+    crate::network::inject_receive(
+        server,
+        Ok((
+            crate::ingress::MAX_DATAGRAM_SIZE + 1,
+            "127.0.0.1:4568".parse().unwrap(),
+        )),
+    );
+    assert!(matches!(
+        listener.poll(0, |_| false).unwrap(),
+        ListenerEvent::Ignored
+    ));
+    let (client, initial) = initial_new("127.0.0.1:0".parse().unwrap(), server);
+    assert!(matches!(
+        finish_inbound_handshake(&mut listener, &client, &initial, server),
+        ListenerEvent::Accepted(_)
+    ));
 }
 
 #[test]

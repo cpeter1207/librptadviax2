@@ -11,7 +11,7 @@ PACKAGE := librptadviax2
 CRATE := rptadviax2
 VERSION ?= $(shell dpkg-parsechangelog -S Version | sed 's/-[0-9]*$$//' | tr '~' '-')
 PACKAGE_VERSION ?= $(VERSION)
-SOVERSION := 1
+SOVERSION := 2
 PREFIX ?= /usr
 LIBDIR ?= $(PREFIX)/lib
 DESTDIR ?=
@@ -29,9 +29,11 @@ SMOKE_BINARY := build/abi-header-smoke
 DEBIAN_VERSION = $(shell dpkg-parsechangelog -S Version)
 DEBIAN_ARCH = $(shell dpkg-architecture -qDEB_HOST_ARCH)
 DEBIAN_MULTIARCH = $(shell dpkg-architecture -qDEB_HOST_MULTIARCH)
-DEBIAN_RUNTIME_DEB := build/librptadv-iax2-client1_$(DEBIAN_VERSION)_$(DEBIAN_ARCH).deb
+DEBIAN_RUNTIME_DEB := build/librptadv-iax2-client2_$(DEBIAN_VERSION)_$(DEBIAN_ARCH).deb
 DEBIAN_DEV_DEB := build/librptadv-iax2-client-dev_$(DEBIAN_VERSION)_$(DEBIAN_ARCH).deb
 STAGE := build/stage
+RPTADV_CODEC_INCLUDE ?= /usr/include/rptadv-codec
+CPPFLAGS += -I$(RPTADV_CODEC_INCLUDE)
 
 SONAME_RUSTFLAGS = $(RUSTFLAGS) -C link-arg=-Wl,-soname,$(LIBRARY_BASENAME).so.$(SOVERSION)
 
@@ -84,7 +86,7 @@ lint:
 static-analysis:
 	$(CARGO) clippy --all-targets -- -D warnings
 	$(CPPCHECK) --force --enable=warning,style,performance,portability --error-exitcode=1 \
-		--std=c11 -Iinclude $(SMOKE_SOURCE)
+		--std=c11 -Iinclude $(CPPFLAGS) $(wildcard tests/*.c)
 
 docs: rustdoc | build
 	$(DOXYGEN) Doxyfile
@@ -93,8 +95,8 @@ docs: rustdoc | build
 rustdoc:
 	RUSTDOCFLAGS="-D warnings" $(CARGO) doc --no-deps --locked
 
-$(SMOKE_BINARY): $(SMOKE_SOURCE) $(HEADER) $(LIBRARY_LINK) | build
-	$(CC) -std=c11 -Wall -Wextra -Werror -Iinclude $< -Lbuild \
+$(SMOKE_BINARY): $(SMOKE_SOURCE) $(HEADER) $(RPTADV_CODEC_INCLUDE)/rptadv_codec.h $(LIBRARY_LINK) | build
+	$(CC) -std=c11 -Wall -Wextra -Werror -Iinclude $(CPPFLAGS) $< -Lbuild \
 		-l$(CRATE) -Wl,-rpath,'$$ORIGIN' -o $@
 
 install: all $(PC_FILE)
@@ -115,7 +117,7 @@ install-check: all
 	test -f $(STAGE)/usr/include/rptadv_iax2/$(notdir $(HEADER))
 	test ! -e $(STAGE)/usr/lib/$(DEBIAN_MULTIARCH)/$(LIBRARY_BASENAME).a
 	$(READELF) -d $(STAGE)/usr/lib/$(DEBIAN_MULTIARCH)/$(notdir $(LIBRARY_VERSIONED)) | grep -F '$(LIBRARY_BASENAME).so.$(SOVERSION)'
-	$(CC) -std=c11 -Wall -Wextra -Werror -I$(STAGE)/usr/include/rptadv_iax2 $(SMOKE_SOURCE) \
+	$(CC) -std=c11 -Wall -Wextra -Werror -I$(STAGE)/usr/include/rptadv_iax2 $(CPPFLAGS) $(SMOKE_SOURCE) \
 		-L$(STAGE)/usr/lib/$(DEBIAN_MULTIARCH) -l$(CRATE) \
 		-Wl,-rpath,$(CURDIR)/$(STAGE)/usr/lib/$(DEBIAN_MULTIARCH) -o $(STAGE)/abi-header-smoke
 	$(STAGE)/abi-header-smoke
@@ -138,7 +140,7 @@ package-check:
 	test -L build/package-stage/usr/lib/$(DEBIAN_MULTIARCH)/$(notdir $(LIBRARY_LINK))
 	test -f build/package-stage/usr/include/rptadv_iax2/$(notdir $(HEADER))
 	$(READELF) -d build/package-stage/usr/lib/$(DEBIAN_MULTIARCH)/$(notdir $(LIBRARY_VERSIONED)) | grep -F '$(LIBRARY_BASENAME).so.$(SOVERSION)'
-	$(CC) -std=c11 -Wall -Wextra -Werror -Ibuild/package-stage/usr/include/rptadv_iax2 $(SMOKE_SOURCE) \
+	$(CC) -std=c11 -Wall -Wextra -Werror -Ibuild/package-stage/usr/include/rptadv_iax2 $(CPPFLAGS) $(SMOKE_SOURCE) \
 		-Lbuild/package-stage/usr/lib/$(DEBIAN_MULTIARCH) -l$(CRATE) \
 		-Wl,-rpath,$(CURDIR)/build/package-stage/usr/lib/$(DEBIAN_MULTIARCH) -o build/package-stage/abi-header-smoke
 	build/package-stage/abi-header-smoke
@@ -147,8 +149,9 @@ package-check:
 debian-package-check: package-check
 
 release-packages: package-check dist
+	rm -rf build/debian-source
 	mkdir -p build/debian-source
-	cp build/*.deb build/debian-source/
+	cp $(DEBIAN_RUNTIME_DEB) $(DEBIAN_DEV_DEB) build/debian-source/
 
 dist:
 	mkdir -p build

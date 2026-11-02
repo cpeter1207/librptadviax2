@@ -8,6 +8,8 @@ use std::{
 
 #[derive(Default)]
 struct State {
+    rate: u32,
+    loss_unit: u32,
     puts: Vec<(u64, u32, u64, Vec<u8>)>,
     admission: i32,
     decisions: VecDeque<(RawDecision, Vec<u8>)>,
@@ -68,8 +70,12 @@ impl Fixture {
         self.0.lock().unwrap().observation = observation;
     }
 }
-unsafe extern "C" fn create(_: *const Config, output: *mut *mut c_void) -> i32 {
+unsafe extern "C" fn create(config: *const Config, output: *mut *mut c_void) -> i32 {
     let state = NEXT.with(|next| next.borrow_mut().take()).unwrap();
+    let mut values = state.lock().unwrap();
+    values.rate = unsafe { (*config).clock_rate_hz };
+    values.loss_unit = unsafe { (*config).concealment_span };
+    drop(values);
     unsafe { *output = Box::into_raw(Box::new(state)).cast() };
     0
 }
@@ -103,11 +109,13 @@ unsafe extern "C" fn get(
     capacity: usize,
     output: *mut RawDecision,
 ) -> i32 {
-    assert_eq!(desired, 160);
     assert_eq!(capacity, MAX_PAYLOAD);
     let mut state = unsafe { &*context.cast::<Arc<Mutex<State>>>() }
         .lock()
         .unwrap();
+    if desired == 0 || desired % state.loss_unit != 0 {
+        return -1;
+    }
     let output = unsafe { &mut *output };
     if state
         .decisions

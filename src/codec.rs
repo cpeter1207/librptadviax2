@@ -1,9 +1,12 @@
 //! Released codec adapters for IAX2-negotiated media formats.
 
+pub mod providers;
+pub mod stream;
+
 use audio_codec_algorithms::{decode_ulaw as decode_sample, encode_ulaw as encode_sample};
 
 /// IAX format bit for G.711 μ-law (RFC 5456, §8.7).
-pub const IAX_FORMAT_ULAW: u32 = 0x0000_0004;
+pub const IAX_FORMAT_ULAW: u64 = 0x0000_0004;
 
 /// G.711 μ-law's required narrowband sample rate.
 pub const ULAW_SAMPLE_RATE_HZ: u32 = 8_000;
@@ -20,7 +23,7 @@ pub struct CodecError {
 /// Codec conversion boundary kept independent of IAX packet and socket code.
 pub trait CodecAdapter {
     /// IAX capability/format bit for this codec.
-    fn iax_format(&self) -> u32;
+    fn iax_format(&self) -> u64;
 
     /// Required PCM sample rate for this codec.
     fn sample_rate_hz(&self) -> u32;
@@ -39,7 +42,7 @@ pub trait CodecAdapter {
 pub struct G711Ulaw;
 
 impl CodecAdapter for G711Ulaw {
-    fn iax_format(&self) -> u32 {
+    fn iax_format(&self) -> u64 {
         IAX_FORMAT_ULAW
     }
 

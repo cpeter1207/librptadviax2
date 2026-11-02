@@ -10,7 +10,7 @@ use tokio::sync::Notify;
 use tokio::sync::mpsc::{self, Receiver, Sender, error::TrySendError};
 
 /// Maximum UDP payload retained by one queued IAX datagram.
-pub const MAX_DATAGRAM_SIZE: usize = 1500;
+pub const MAX_DATAGRAM_SIZE: usize = 65_527;
 
 /// Why a producer-owner ingress queue could not be created.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -74,8 +74,7 @@ pub struct InboundDatagram {
     generation: u64,
     arrived_at: Instant,
     remote: SocketAddr,
-    length: usize,
-    payload: [u8; MAX_DATAGRAM_SIZE],
+    payload: Box<[u8]>,
 }
 
 impl InboundDatagram {
@@ -96,7 +95,7 @@ impl InboundDatagram {
 
     /// Borrow the received datagram bytes.
     pub fn payload(&self) -> &[u8] {
-        &self.payload[..self.length]
+        &self.payload
     }
 }
 
@@ -136,30 +135,28 @@ impl IngressProducer {
                 length: payload.len(),
             });
         }
-        let mut packet = InboundDatagram {
+        // Reserve before allocating/copying: congested peers consume no extra
+        // packet storage. Ordinary small packets retain only their actual bytes.
+        let permit = self.queue.try_reserve().map_err(|error| match error {
+            TrySendError::Full(_) => {
+                let _ = self.wake.0.dropped.fetch_update(
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                    |count| Some(count.saturating_add(1)),
+                );
+                IngressPushError::Full
+            }
+            TrySendError::Closed(_) => IngressPushError::Closed,
+        })?;
+        let packet = InboundDatagram {
             generation: self.generation,
             arrived_at,
             remote,
-            length: payload.len(),
-            payload: [0; MAX_DATAGRAM_SIZE],
+            payload: payload.into(),
         };
-        packet.payload[..payload.len()].copy_from_slice(payload);
-        // Increment before publication: the consumer may remove the packet immediately.
+        // Increment before publication: the consumer may remove it immediately.
         self.wake.0.pending.fetch_add(1, Ordering::AcqRel);
-        self.queue.try_send(packet).map_err(|error| {
-            self.wake.0.pending.fetch_sub(1, Ordering::AcqRel);
-            match error {
-                TrySendError::Full(_) => {
-                    let _ = self.wake.0.dropped.fetch_update(
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
-                        |count| Some(count.saturating_add(1)),
-                    );
-                    IngressPushError::Full
-                }
-                TrySendError::Closed(_) => IngressPushError::Closed,
-            }
-        })?;
+        permit.send(packet);
         self.wake.0.ready.notify_one();
         Ok(())
     }

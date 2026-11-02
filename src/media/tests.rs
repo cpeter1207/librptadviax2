@@ -52,6 +52,25 @@ fn parses_full_voice_codec_format_and_borrows_payload() {
 }
 
 #[test]
+fn formats_full_voice_preserves_extended_opus_subclass() {
+    let mut header = crate::protocol::parse_full_frame_packet(&full_voice(4, 2, &[]))
+        .unwrap()
+        .header;
+    header.subclass = 34;
+    header.subclass_is_log = true;
+    let packet = serialize_full_frame(&header, &[0xf8, 0xff, 0xfe]).unwrap();
+    assert_eq!(packet[11], 0xa2);
+    let VoiceFrame::Full {
+        format, payload, ..
+    } = parse_voice_frame(&packet, 4).unwrap()
+    else {
+        panic!("expected full voice");
+    };
+    assert_eq!(format, 1u64 << 34);
+    assert_eq!(payload, [0xf8, 0xff, 0xfe]);
+}
+
+#[test]
 fn parses_mini_voice_using_the_negotiated_format_then_decodes() {
     let packet = serialize_mini_frame(
         &MiniFrameHeader {
@@ -94,7 +113,7 @@ fn rejects_non_voice_and_invalid_negotiated_formats() {
         assert_eq!(
             parse_voice_frame(&mini, format),
             Err(VoiceFrameError::InvalidFormat {
-                value: i64::from(format),
+                value: format as i64,
             })
         );
     }

@@ -1,3 +1,12 @@
+librptadviax2 (0.1.0~alpha9) unstable; urgency=medium
+
+  * Publish client/server ABI 2 with retained neutral codec catalogs.
+  * Keep native codec concealment enabled before shared-ring fallback.
+  * Separate encoded byte counts, source frames, and packet timestamps.
+  * Preserve the asynchronous executor and peer-observation ABI 1.
+
+ -- Chris Peterson <cpeter1207@users.noreply.github.com>  Tue, 27 Oct 2026 08:00:00 -0500
+
 librptadviax2 (0.1.0~alpha8) unstable; urgency=medium
 
   * Ignore validated empty voice packets without interrupting linked audio.
