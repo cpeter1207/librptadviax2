@@ -48,7 +48,7 @@ def main():
             "[phone-test]\nexten => 999,1,Answer()\nsame => n,Echo()\nsame => n,Hangup()\n"
         )
         (root / "iax.conf").write_text(
-            f"[general]\nbindport={port}\nbindaddr=127.0.0.1\ndisallow=all\nallow=ulaw\nrequirecalltoken=yes\n[club-account]\ntype=user\nauth=md5\nsecret=fixture-only\ncontext=phone-test\ndeny=0.0.0.0/0.0.0.0\npermit=127.0.0.1/255.255.255.255\n"
+            f"[general]\nbindport={port}\nbindaddr=127.0.0.1\ndisallow=all\nallow=ulaw\n[club-account]\ntype=user\nrequirecalltoken=yes\nauth=md5\nsecret=fixture-only\ncontext=phone-test\ndeny=0.0.0.0/0.0.0.0\npermit=127.0.0.1/255.255.255.255\n"
         )
         with (
             open(root / "asterisk.log", "w+") as log,
