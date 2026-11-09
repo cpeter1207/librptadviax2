@@ -1,6 +1,7 @@
 //! IAX2 protocol and transport components for the standalone controller.
 #![deny(missing_docs)]
 
+pub mod account;
 pub mod async_driver;
 #[cfg(test)]
 mod async_driver_tests;

@@ -1229,17 +1229,10 @@ fn dial_composed(
     options: DialOptions<'_>,
     catalog: Option<std::sync::Arc<FormatCatalog>>,
 ) -> Result<IaxPeer, DialError> {
-    if options.local_call == 0
-        || options.local_call > 0x7fff
-        || !valid_node(options.local_node)
-        || !valid_node(options.remote_node)
-        || options.timeout.is_zero()
-    {
+    if !valid_node(options.local_node) || !valid_node(options.remote_node) {
         return Err(DialError::InvalidOptions);
     }
 
-    let endpoint =
-        UdpEndpoint::bind(wildcard_for(options.remote.ip())).map_err(DialError::Network)?;
     let version = 2_u16.to_be_bytes();
     let elements = [
         InformationElement {
@@ -1263,7 +1256,42 @@ fn dial_composed(
             data: &version,
         },
     ];
-    let mut payload = serialize_information_elements(&elements)
+    dial_new(
+        CallRequest {
+            remote: options.remote,
+            local_call: options.local_call,
+            secret: options.secret,
+            timeout: options.timeout,
+        },
+        &elements,
+        catalog,
+    )
+}
+
+/// Common transport/session inputs; provider identity stays in its NEW elements.
+pub(crate) struct CallRequest<'a> {
+    pub remote: SocketAddr,
+    pub local_call: u16,
+    pub secret: &'a str,
+    pub timeout: Duration,
+}
+
+/// Reuse one setup, codec and established-peer implementation for both identities.
+pub(crate) fn dial_new(
+    options: CallRequest<'_>,
+    elements: &[InformationElement<'_>],
+    catalog: Option<std::sync::Arc<FormatCatalog>>,
+) -> Result<IaxPeer, DialError> {
+    let started = Instant::now();
+    let deadline = started
+        .checked_add(options.timeout)
+        .filter(|_| {
+            options.local_call != 0 && options.local_call <= 0x7fff && !options.timeout.is_zero()
+        })
+        .ok_or(DialError::InvalidOptions)?;
+    let endpoint =
+        UdpEndpoint::bind(wildcard_for(options.remote.ip())).map_err(DialError::Network)?;
+    let mut payload = serialize_information_elements(elements)
         .map_err(|error| DialError::Protocol(CallSetupError::InformationElements(error)))?;
     let capability = catalog
         .as_ref()
@@ -1279,13 +1307,11 @@ fn dial_composed(
     append_formats(&mut payload, preferred, Some(capability));
     let elements = parse_information_elements(&payload)
         .map_err(|error| DialError::Protocol(CallSetupError::InformationElements(error)))?;
-    let started = Instant::now();
     let mut setup =
         OutboundCallSetup::new(options.local_call, 0, &elements).map_err(DialError::Protocol)?;
     let mut pending_packet = setup.initial_packet().to_vec();
     send(&endpoint, &pending_packet, options.remote)?;
 
-    let deadline = started + options.timeout;
     let mut retry_interval = INITIAL_RETRY;
     let mut retry_at = Instant::now() + retry_interval;
     let mut transmissions = 1;

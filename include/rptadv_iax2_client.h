@@ -138,6 +138,35 @@ struct rptadv_iax2_dial_options_v2 {
     const void *catalog;              /**< Catalog borrowed for dial; never NULL. */
 };
 
+/** Provider call options, distinct from numeric AllStarLink caller/node identity.
+ * All strings are UTF-8 with explicit byte lengths; NEW fields are at most 255
+ * bytes and contain no controls. Empty caller/name/context fields are permitted.
+ * Strings/catalog are borrowed only during dial. Number policies belong to the
+ * provider. No secret is included in NEW or diagnostic messages.
+ */
+struct rptadv_iax2_account_dial_options_v1 {
+    uint32_t struct_size; /**< Complete readable option size. */
+    uint32_t abi_version; /**< One. */
+    const uint8_t *remote_address; /**< Resolved numeric IP:port or [IPv6]:port. */
+    size_t remote_address_length; /**< Address byte count. */
+    uint16_t local_call_number; /**< Unique nonzero 15-bit IAX call number. */
+    uint16_t reserved; /**< Zero. */
+    const uint8_t *username; /**< Nonempty provider account username. */
+    size_t username_length; /**< Username byte count. */
+    const uint8_t *destination; /**< Nonempty provider destination, not rewritten. */
+    size_t destination_length; /**< Destination byte count. */
+    const uint8_t *caller_number; /**< Optional caller number. */
+    size_t caller_number_length; /**< Caller-number byte count. */
+    const uint8_t *caller_name; /**< Optional caller display name. */
+    size_t caller_name_length; /**< Display-name byte count. */
+    const uint8_t *context; /**< Optional provider dial context. */
+    size_t context_length; /**< Context byte count. */
+    const uint8_t *secret; /**< Challenge-response secret. */
+    size_t secret_length; /**< Secret byte count. */
+    uint32_t timeout_ms; /**< Nonzero total setup/answer timeout. */
+    const void *catalog; /**< Borrowed codec catalog; never NULL. */
+};
+
 /** One-owner client operations; all peer calls are serialized by the caller. */
 struct rptadv_iax2_client_descriptor_v2 {
     uint32_t struct_size; /**< Complete descriptor size. */
@@ -182,6 +211,12 @@ struct rptadv_iax2_client_descriptor_v2 {
         uint32_t packet_frames, uint32_t timestamp_ms);
     /** Read the call clock on the exclusive peer owner; NULL returns zero. */
     uint32_t (*elapsed_ms)(const void *peer);
+    /** Optional tail: check struct_size through this field before accessing it.
+     * Dial using distinct provider identity; clears peer on every failure.
+     * Returned handles use the existing peer operations and ownership contract.
+     */
+    int32_t (*dial_account)(const struct rptadv_iax2_account_dial_options_v1 *options,
+                           void **peer);
 };
 
 /**

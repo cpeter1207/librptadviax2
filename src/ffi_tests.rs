@@ -268,6 +268,10 @@ fn establish() -> (*mut c_void, UdpSocket, SocketAddr) {
 }
 
 fn establish_profile(profile: ProfileId) -> (*mut c_void, UdpSocket, SocketAddr) {
+    establish_kind(profile, false)
+}
+
+fn establish_kind(profile: ProfileId, account: bool) -> (*mut c_void, UdpSocket, SocketAddr) {
     let server = UdpSocket::bind("127.0.0.1:0").unwrap();
     server
         .set_read_timeout(Some(Duration::from_secs(1)))
@@ -336,9 +340,119 @@ fn establish_profile(profile: ProfileId) -> (*mut c_void, UdpSocket, SocketAddr)
     let mut dial_options = options(remote.as_bytes(), local, destination, secret);
     dial_options.catalog = ptr::from_ref(&catalog).cast();
     let mut peer = ptr::null_mut();
-    assert_eq!(unsafe { dial(&dial_options, &mut peer) }, 0);
+    if account {
+        let mut account_options = account_options(remote.as_bytes());
+        account_options.catalog = dial_options.catalog;
+        assert_eq!(unsafe { dial_account(&account_options, &mut peer) }, 0);
+    } else {
+        assert_eq!(unsafe { dial(&dial_options, &mut peer) }, 0);
+    }
     let (server, client) = responder.join().unwrap();
     (peer, server, client)
+}
+
+fn account_options(remote: &[u8]) -> rptadv_iax2_account_dial_options_v1 {
+    rptadv_iax2_account_dial_options_v1 {
+        struct_size: size_of::<rptadv_iax2_account_dial_options_v1>() as u32,
+        abi_version: 1,
+        remote_address: remote.as_ptr(),
+        remote_address_length: remote.len(),
+        local_call_number: LOCAL_CALL,
+        reserved: 0,
+        username: b"club-account".as_ptr(),
+        username_length: 12,
+        destination: b"999".as_ptr(),
+        destination_length: 3,
+        caller_number: ptr::null(),
+        caller_number_length: 0,
+        caller_name: ptr::null(),
+        caller_name_length: 0,
+        context: ptr::null(),
+        context_length: 0,
+        secret: ptr::null(),
+        secret_length: 0,
+        timeout_ms: 1000,
+        catalog: test_catalog(),
+    }
+}
+
+#[test]
+fn provider_dial_uses_existing_peer_media_and_lifetime_operations() {
+    let (peer, server, _) = establish_kind(ProfileId::G711Mu, true);
+    assert_eq!(unsafe { sample_rate_hz(peer) }, 8000);
+    assert_eq!(unsafe { send_digit(peer, b'#') }, 0);
+    let mut bytes = [0; 1500];
+    let (length, _) = server.recv_from(&mut bytes).unwrap();
+    let packet = crate::protocol::parse_full_frame_packet(&bytes[..length]).unwrap();
+    assert_eq!(
+        (packet.header.frame_type, packet.header.subclass),
+        (1, b'#')
+    );
+    assert_eq!(unsafe { hangup(peer) }, 0);
+    unsafe { destroy(peer) };
+}
+
+#[test]
+fn provider_dial_rejects_invalid_records_and_clears_output() {
+    assert_eq!(unsafe { dial_account(ptr::null(), ptr::null_mut()) }, -1);
+    let mut peer = ptr::dangling_mut();
+    assert_eq!(unsafe { dial_account(ptr::null(), &mut peer) }, -1);
+    assert!(peer.is_null());
+    for invalid in 0..18 {
+        let mut options = account_options(b"127.0.0.1:9");
+        match invalid {
+            0 => options.struct_size -= 1,
+            1 => options.abi_version = 2,
+            2 => options.reserved = 1,
+            3 => options.catalog = ptr::null(),
+            4 => options.remote_address = ptr::null(),
+            5 => options.remote_address_length = 1,
+            6 => {
+                options.remote_address = b"\xff".as_ptr();
+                options.remote_address_length = 1;
+            }
+            7 => {
+                options.username = b"\xff".as_ptr();
+                options.username_length = 1;
+            }
+            8 => {
+                options.destination = b"\xff".as_ptr();
+                options.destination_length = 1;
+            }
+            9 => {
+                options.caller_number = b"\xff".as_ptr();
+                options.caller_number_length = 1;
+            }
+            10 => {
+                options.caller_name = b"\xff".as_ptr();
+                options.caller_name_length = 1;
+            }
+            11 => {
+                options.context = b"\xff".as_ptr();
+                options.context_length = 1;
+            }
+            12 => {
+                options.secret = b"\xff".as_ptr();
+                options.secret_length = 1;
+            }
+            13 => options.local_call_number = 0,
+            14 => options.timeout_ms = 0,
+            15 => options.username_length = 0,
+            16 => options.destination_length = 0,
+            17 => {
+                options.context = b"\n".as_ptr();
+                options.context_length = 1;
+            }
+            _ => unreachable!(),
+        }
+        peer = ptr::dangling_mut();
+        assert_eq!(
+            unsafe { dial_account(&options, &mut peer) },
+            -1,
+            "case {invalid}"
+        );
+        assert!(peer.is_null(), "case {invalid}");
+    }
 }
 
 struct InboundObservation {
@@ -1145,7 +1259,11 @@ fn native_plc_output_capacity_is_retryable_not_a_peer_failure() {
 #[test]
 fn egress_abi2_layout_and_prepared_codec() {
     let api = unsafe { &*super::rptadv_iax2_client_descriptor_v2() };
-    assert_eq!(api.struct_size as usize, 24 + 13 * size_of::<usize>());
+    assert_eq!(api.struct_size as usize, 24 + 14 * size_of::<usize>());
+    assert_eq!(
+        std::mem::offset_of!(rptadv_iax2_client_descriptor_v2, dial_account),
+        24 + 13 * size_of::<usize>()
+    );
     assert_eq!(api.abi_version, 2);
     let (peer, _server, _) = establish();
     let prepare = api.prepare_audio.unwrap();
