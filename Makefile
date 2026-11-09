@@ -37,7 +37,7 @@ CPPFLAGS += -I$(RPTADV_CODEC_INCLUDE)
 
 SONAME_RUSTFLAGS = $(RUSTFLAGS) -C link-arg=-Wl,-soname,$(LIBRARY_BASENAME).so.$(SOVERSION)
 
-.PHONY: all quality lint static-analysis docs rustdoc test coverage platform-verify install install-check package-check debian-package-check release-packages dist clean FORCE
+.PHONY: all quality lint static-analysis docs rustdoc test coverage platform-verify provider-interop-check install install-check package-check debian-package-check release-packages dist clean FORCE
 
 all: $(LIBRARY_VERSIONED) $(LIBRARY_SONAME) $(LIBRARY_LINK)
 
@@ -74,7 +74,11 @@ coverage:
 		--output-path build/coverage/rust.json
 	$(PYTHON) tests/check_coverage.py build/coverage/rust.json
 
-platform-verify: test install-check package-check
+platform-verify: test install-check package-check provider-interop-check
+
+# Independent test provider only; the installed library never loads Asterisk.
+provider-interop-check: $(SMOKE_BINARY)
+	$(PYTHON) tests/provider_interop.py $(abspath $(SMOKE_BINARY))
 
 quality: lint static-analysis docs
 

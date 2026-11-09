@@ -87,6 +87,51 @@ pub struct rptadv_iax2_dial_options_v2 {
     pub catalog: *const c_void,
 }
 
+/// Distinct provider credentials and destination; no numeric node alias is created.
+#[repr(C)]
+pub struct rptadv_iax2_account_dial_options_v1 {
+    /// Complete readable size; this record has no borrowed optional tail.
+    pub struct_size: u32,
+    /// One.
+    pub abi_version: u32,
+    /// Numeric provider socket address, resolved by the host.
+    pub remote_address: *const u8,
+    /// Address byte count.
+    pub remote_address_length: usize,
+    /// Unique nonzero 15-bit call number.
+    pub local_call_number: u16,
+    /// Zero.
+    pub reserved: u16,
+    /// Nonempty provider username, independent of caller number.
+    pub username: *const u8,
+    /// Username byte count.
+    pub username_length: usize,
+    /// Nonempty provider destination, without number-policy rewriting.
+    pub destination: *const u8,
+    /// Destination byte count.
+    pub destination_length: usize,
+    /// Optional caller number.
+    pub caller_number: *const u8,
+    /// Caller-number byte count.
+    pub caller_number_length: usize,
+    /// Optional display name.
+    pub caller_name: *const u8,
+    /// Display-name byte count.
+    pub caller_name_length: usize,
+    /// Optional provider context.
+    pub context: *const u8,
+    /// Context byte count.
+    pub context_length: usize,
+    /// Borrowed challenge-response secret; never sent in NEW or logged.
+    pub secret: *const u8,
+    /// Secret byte count.
+    pub secret_length: usize,
+    /// Nonzero total setup/answer timeout.
+    pub timeout_ms: u32,
+    /// Catalog borrowed during setup; accepted peers retain their codec owners.
+    pub catalog: *const c_void,
+}
+
 /// Versioned function table for one-owner peer sessions and prepared media.
 #[repr(C)]
 pub struct rptadv_iax2_client_descriptor_v2 {
@@ -153,6 +198,12 @@ pub struct rptadv_iax2_client_descriptor_v2 {
         Option<unsafe extern "C" fn(*mut c_void, *const u8, usize, u32, u32) -> i32>,
     /// Existing call-relative clock, sampled only by the serialized non-audio owner.
     pub elapsed_ms: Option<unsafe extern "C" fn(*const c_void) -> u32>,
+    /// Optional sized tail: ordinary provider call with independent username.
+    /// Check the readable tail before accessing this field; existing peers use
+    /// the same media, async, hangup and destruction operations as numeric calls.
+    pub dial_account: Option<
+        unsafe extern "C" fn(*const rptadv_iax2_account_dial_options_v1, *mut *mut c_void) -> i32,
+    >,
 }
 
 /// Caller-owned options for a single UDP endpoint serving configured local nodes.
@@ -242,6 +293,7 @@ const DESCRIPTOR: rptadv_iax2_client_descriptor_v2 = rptadv_iax2_client_descript
     reset_encoder: Some(reset_encoder),
     send_prepared_audio: Some(send_prepared_audio),
     elapsed_ms: Some(elapsed_ms),
+    dial_account: Some(dial_account),
 };
 
 const SERVER_DESCRIPTOR: rptadv_iax2_server_descriptor_v2 = rptadv_iax2_server_descriptor_v2 {
@@ -549,6 +601,71 @@ unsafe extern "C" fn dial(
 unsafe extern "C" fn sample_rate_hz(peer: *const c_void) -> u32 {
     boundary(0, || {
         unsafe { peer.cast::<IaxPeer>().as_ref() }.map_or(0, IaxPeer::sample_rate_hz)
+    })
+}
+
+/// Provider identity must use its own option record, never a fabricated node ID.
+unsafe extern "C" fn dial_account(
+    options: *const rptadv_iax2_account_dial_options_v1,
+    output: *mut *mut c_void,
+) -> i32 {
+    boundary(-1, || {
+        let Some(output) = (unsafe { output.as_mut() }) else {
+            return -1;
+        };
+        *output = ptr::null_mut();
+        let Some(options) = (unsafe { sized_ref(options) }) else {
+            return -1;
+        };
+        if options.abi_version != 1 || options.reserved != 0 {
+            return -1;
+        }
+        let Some(catalog) = (unsafe { clone_catalog(options.catalog) }) else {
+            return -1;
+        };
+        let Some(remote) = (unsafe { utf8(options.remote_address, options.remote_address_length) })
+            .and_then(|value| value.parse::<SocketAddr>().ok())
+        else {
+            return -1;
+        };
+        let [
+            Some(username),
+            Some(destination),
+            Some(caller_number),
+            Some(caller_name),
+            Some(context),
+            Some(secret),
+        ] = [
+            unsafe { utf8(options.username, options.username_length) },
+            unsafe { utf8(options.destination, options.destination_length) },
+            unsafe { utf8(options.caller_number, options.caller_number_length) },
+            unsafe { utf8(options.caller_name, options.caller_name_length) },
+            unsafe { utf8(options.context, options.context_length) },
+            unsafe { utf8(options.secret, options.secret_length) },
+        ]
+        else {
+            return -1;
+        };
+        match crate::account::dial(
+            crate::account::DialOptions {
+                remote,
+                local_call: options.local_call_number,
+                username,
+                destination,
+                caller_number,
+                caller_name,
+                context,
+                secret,
+                timeout: Duration::from_millis(u64::from(options.timeout_ms)),
+            },
+            catalog,
+        ) {
+            Ok(peer) => {
+                *output = Box::into_raw(Box::new(peer)).cast();
+                0
+            }
+            Err(error) => dial_error_code(error),
+        }
     })
 }
 

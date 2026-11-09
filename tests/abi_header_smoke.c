@@ -1,8 +1,10 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
+#define _POSIX_C_SOURCE 200809L
 #include "rptadv_iax2_client.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 _Static_assert(offsetof(struct rptadv_iax2_async_descriptor_v1, peer_configure_jitter) ==
     24 + 5 * sizeof(void (*)(void)), "async descriptor prefix changed");
@@ -22,6 +24,8 @@ _Static_assert(offsetof(struct rptadv_iax2_client_descriptor_v2, prepare_audio) 
     24 + 9 * sizeof(void (*)(void)), "prepared codec layout differs");
 _Static_assert(offsetof(struct rptadv_iax2_client_descriptor_v2, elapsed_ms) ==
     24 + 12 * sizeof(void (*)(void)), "call clock tail order changed");
+_Static_assert(offsetof(struct rptadv_iax2_client_descriptor_v2, dial_account) ==
+    24 + 13 * sizeof(void (*)(void)), "provider dial tail must preserve prefix");
 
 static void *open_catalog(void)
 {
@@ -86,8 +90,83 @@ static int server_lifecycle(void)
 	return result;
 }
 
-int main(void)
+/* Independent provider fixture; all wire/media calls use the actual public header. */
+static int provider_lifecycle(const char *address)
 {
+	const struct rptadv_iax2_client_descriptor_v2 *api = rptadv_iax2_client_descriptor_v2();
+	void *catalog = open_catalog();
+	void *peer = NULL;
+	int failed = 1;
+	size_t received = 0;
+	static const uint8_t username[] = "club-account", destination[] = "999";
+	static const uint8_t number[] = "KG0BP", name[] = "Radio club";
+	static const uint8_t context[] = "phone-test", secret[] = "fixture-only";
+	struct rptadv_iax2_account_dial_options_v1 options = {
+		.struct_size = sizeof(options), .abi_version = 1,
+		.remote_address = (const uint8_t *)address, .remote_address_length = strlen(address),
+		.local_call_number = 1234,
+		.username = username, .username_length = sizeof(username) - 1,
+		.destination = destination, .destination_length = sizeof(destination) - 1,
+		.caller_number = number, .caller_number_length = sizeof(number) - 1,
+		.caller_name = name, .caller_name_length = sizeof(name) - 1,
+		.context = context, .context_length = sizeof(context) - 1,
+		.secret = secret, .secret_length = sizeof(secret) - 1,
+		.timeout_ms = 3000, .catalog = catalog,
+	};
+	if (!catalog || api->dial_account(&options, &peer) != 0 || !peer ||
+		api->sample_rate_hz(peer) != 8000)
+		goto done;
+	float source[160], output[4096];
+	uint8_t encoded[512], text[4096];
+	for (size_t sample = 0; sample < 160; sample++)
+		source[sample] = 0.25f;
+	for (uint32_t block = 0; block < 30; block++) {
+		struct rptadv_codec_encode_result_v1 result = { .struct_size = sizeof(result) };
+		if (api->prepare_audio(peer, source, 160, encoded, sizeof(encoded), 0, &result) != 0 ||
+			!result.encoded_bytes || api->send_prepared_audio(peer, encoded,
+			result.encoded_bytes, result.packet_frames, block * 20) != 0)
+			goto done;
+		for (size_t turn = 0; turn < 8; turn++) {
+			uint32_t event = 0;
+			size_t count = 0;
+			if (api->poll(peer, output, 4096, text, sizeof(text), &event, &count) != 0)
+				goto done;
+			if (event == RPTADV_IAX2_EVENT_AUDIO)
+				received += count;
+			else if (event == RPTADV_IAX2_EVENT_NONE)
+				break;
+		}
+		struct timespec pause = { .tv_nsec = 20000000 };
+		nanosleep(&pause, NULL);
+	}
+	if (!received || api->hangup(peer) != 0)
+		goto done;
+	api->destroy(peer);
+	peer = NULL;
+	static const uint8_t incorrect[] = "wrong-fixture";
+	options.secret = incorrect;
+	options.secret_length = sizeof(incorrect) - 1;
+	options.local_call_number++;
+	if (api->dial_account(&options, &peer) != -4 || peer)
+		goto done;
+	printf("{\"echo_samples\":%zu,\"bad_password_rejected\":true}\n", received);
+	failed = 0;
+done:
+	if (peer)
+		api->destroy(peer);
+	if (catalog)
+		api->close_catalog(catalog);
+	if (failed)
+		fprintf(stderr, "provider interop failed; echo samples=%zu\n", received);
+	return failed;
+}
+
+int main(int argc, char **argv)
+{
+	if (argc == 3 && strcmp(argv[1], "--provider") == 0)
+		return provider_lifecycle(argv[2]);
+	if (argc != 1)
+		return 1;
 	const struct rptadv_iax2_async_descriptor_v1 *async = rptadv_iax2_async_descriptor_v1();
 	void *runtime = NULL;
 	void *registration = (void *)1;
@@ -114,6 +193,7 @@ int main(void)
 		   descriptor->open_catalog != NULL && descriptor->close_catalog != NULL &&
 		   descriptor->reset_encoder != NULL &&
 		   descriptor->elapsed_ms != NULL && descriptor->dial != NULL &&
+		   descriptor->dial_account != NULL &&
 		   descriptor->send_digit != NULL &&
 		   descriptor->dial(&options, &peer) == -1 && peer == NULL &&
 		   server_lifecycle() == 0

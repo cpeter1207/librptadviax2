@@ -49,6 +49,7 @@ fn descriptor_v2_exposes_dial_and_media_operations() {
     assert!(descriptor.reset_encoder.is_some());
     assert!(descriptor.send_prepared_audio.is_some());
     assert!(descriptor.elapsed_ms.is_some());
+    assert!(descriptor.dial_account.is_some());
 }
 
 #[test]

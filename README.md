@@ -6,6 +6,14 @@ implementations belong in adapters that use released libraries where available;
 this project does not implement audio codecs.
 
 The standalone product loads this library for outbound and inbound audio links.
+The optional `dial_account` client-descriptor tail also supports ordinary outgoing
+provider calls with a separate account username, caller identity, destination and
+context. Check `struct_size` through that field before access. These calls reuse
+the same codec/media, async owner and teardown operations; the existing numeric
+AllStarLink dial path is unchanged. Destinations retain short numbers and telephone
+symbols without a second cost/emergency-number policy. Provider registration and
+incoming provider-account admission remain separate integration work.
+
 Codec providers supply ULAW, ALAW, GSM, G.723.1, G.726 AAL2, Dialogic ADPCM,
 SLIN, LPC10, G.729, Speex, iLBC, G.726, G.722, SLIN16, Speex16, and Opus.
 ULAW remains the first preference. IAX iLBC uses 30 ms; 20 ms interoperability is
@@ -100,7 +108,15 @@ cargo test --all-targets --locked
 cargo clippy --all-targets -- -D warnings
 RUSTDOCFLAGS='-D warnings' cargo doc --no-deps
 make coverage
+make provider-interop-check
 ```
+
+The explicit platform gate `provider-interop-check` uses the quality image's
+Asterisk as a loopback-only independent provider. The C smoke consumer uses the
+installed header and candidate DSO for call-token/MD5 setup, μ-law echo media,
+hangup, wrong-secret rejection and endpoint cleanup. Asterisk is a test tool;
+the runtime library and ordinary Debian package build do not depend on a PBX.
+Real-provider, registration, NAT and radio acceptance remain unverified.
 
 The client ABI is versioned and released as a shared object. Complete ASL3
 call/session behavior and live peer interoperability remain to be verified.
