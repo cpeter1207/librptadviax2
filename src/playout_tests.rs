@@ -2,6 +2,42 @@ use super::*;
 use crate::jitter::fixture::Fixture;
 use std::time::Duration;
 
+#[test]
+fn accepted_original_receipts_have_a_separate_bounded_metadata_budget() {
+    let (clock, receiver, sender) = crate::source_time::tests::timestamp_probe();
+    let fixture = Fixture::new();
+    let origin = Instant::now();
+    let mut playout = Playout::new(
+        unsafe { Jitter::new(fixture.descriptor()) }.unwrap(),
+        origin,
+    );
+    // A backend may discard older packets internally. Its valid Accepted status
+    // cannot grow the caller's provenance map beyond its own64-record budget.
+    for index in 0..65 {
+        sender
+            .send_to(&[0xff; 160], receiver.local_addr().unwrap())
+            .unwrap();
+        let mut payload = [0; 160];
+        let (_, _, receipt) = clock.receive(&receiver, &mut payload).unwrap();
+        let receipt = receipt.unwrap();
+        let result = playout.put_received(
+            index * 20,
+            false,
+            receipt.instant,
+            &payload,
+            None,
+            Some(receipt),
+        );
+        if index == 64 {
+            assert!(matches!(result, Err(DialError::Jitter)));
+        } else {
+            result.unwrap();
+        }
+    }
+    assert_eq!(playout.anchors.len(), 64);
+    assert_eq!(fixture.puts().len(), 65);
+}
+
 fn provider_decoder(
     backend: &str,
     id: crate::codec::providers::ProfileId,

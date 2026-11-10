@@ -11,8 +11,132 @@ provider calls with a separate account username, caller identity, destination an
 context. Check `struct_size` through that field before access. These calls reuse
 the same codec/media, async owner and teardown operations; the existing numeric
 AllStarLink dial path is unchanged. Destinations retain short numbers and telephone
-symbols without a second cost/emergency-number policy. Provider registration and
-incoming provider-account admission remain separate integration work.
+symbols without a second cost/emergency-number policy.
+
+## Configured provider accounts
+
+The optional server ABI2 tail adds `configure_accounts`, `register_account`,
+`poll_accounts`, and `dial_provider_account`. Check `struct_size` through each
+required slot: the released 56-byte table prefix is unchanged; the complete table
+is 88 bytes. Bind options retain their 48-byte prefix and have a 64-byte complete
+record. Account arrays use the exact ABI1 record stride declared in the header.
+
+Configure an opaque account label, nonzero configuration generation, resolved
+provider endpoint, username, literal secret, and local admission binding.
+A binding may contain a nondecimal configured local name, up to 63 UTF-8 bytes.
+Changed settings require a new generation. Validated replacements retire changed
+owners atomically; unchanged accounts retain their existing lifetime. Provider
+caller/display/context fields are untrusted data and never become an ASL node or
+mailbox authorization. The consumer applies mailbox/PIN and command policy.
+
+After `server_enable`, registration, refresh, authenticated REGREL, incoming
+MD5 authentication, and `dial_provider_account` share the listener's source port
+and existing router. The consumer refreshes using the actual granted interval;
+absent REFRESH means 60 seconds. The registration primitive performs one bounded
+transaction and does not schedule refresh. Provider transport uses UDP and MD5
+challenge authentication; it provides no media/signaling encryption.
+
+`poll_accounts` applies configured endpoint/account matching and CALLTOKEN before
+MD5 authentication, then invokes the separate provider policy/ownership callbacks.
+Metadata is borrowed only during the callback. Accept returning zero transfers
+one peer; a nonzero result retains library ownership and sends best-effort HANGUP
+before release. Rust `prepare_*`/`Prepared*::run`/`finish_poll` split permits network
+waits and foreign callbacks outside the short listener/control lock. Execute
+blocking work off the shared executor. Retirements fence late route installs,
+returns, and media. A timeout requests no teardown acknowledgment: retained call
+and operation owners still retain their actual socket resources. Destroy the
+server only after in-flight entries/callbacks are quiescent; close/drop every peer
+before unloading its DSO. Route capacity returns only after actual receiver cleanup.
+
+One listener admits at most 64 configured accounts and 64 provider reservations,
+including calls, registration operations, and pending authentication. Existing
+NEW, route-command, and per-peer ingress queues remain bounded at 64 items.
+Configured phone providers offer only verified PCMU/PCMA at 8 kHz with 20 ms packets
+(160 encoded bytes/samples). Unsupported offers or packet shapes fail closed.
+Their composed neutral jitter profile is 20/40/100 ms; generic/numeric IAX and the
+independent client `dial_account` retain their existing codec and jitter policy.
+Retain the borrowed neutral jitter descriptor's DSO until the peer is destroyed.
+
+This callable account/media layer still requires product configuration and host
+composition. Mailbox/PIN, radio attachment, and live-provider acceptance remain
+separate consumer work.
+
+## Original receive time
+
+The optional client ABI 2 `poll_timed` slot preserves the released 136-byte prefix;
+check through its 144-byte table prefix before accessing it. Its caller-sized ABI 1 record is
+72 bytes on supported native 64-bit Linux. The ordinary `poll` remains untimed. Use one
+poll mode per exclusive peer owner; legacy polling rejects after timed activation.
+
+Capture a stable Host clock epoch and `reference_now_ns` **before** provider entry.
+Only `TIMED_BIRTH` grants original-time qualification. At first exposure, the
+provider subtracts genuine kernel RX age plus a conservative 5 ms uncertainty from
+that fixed reference. It caches the result for the whole original span, including
+every PCM partial/retry/suffix. Underflow, missing/future/unrepresentable receipt,
+legacy caller-supplied ingress time, concealment and gaps never supply a fresh birth.
+`source_start` is the checked per-epoch playout PCM cursor, including gaps and delay
+insertion; it is not claimed to be an IAX wire clock or DTMF interval. IAX digits
+remain private untimed events.
+
+Owned UDP sockets request `SO_TIMESTAMPING` software RX stamps, without the
+`SO_TIMESTAMP[NS]` options that can synthesize a missing stamp during dequeue.
+Linux timestamp activation may be deferred; packets without an actual RX record
+remain unqualified. One nonblocking CLOEXEC `timerfd` monitors realtime steps with
+`CANCEL_ON_SET`, plus a fixed realtime/monotonic anchor. Its checked absolute 2262
+deadline fits signed 64-bit native ktime and is never rearmed. Initial unavailable
+qualification leaves private control/media usable. Later clock qualification loss
+is sticky and revokes retained epochs; protocol teardown continues without rebase.
+
+Retained source media older than 500 ms retires actual packet jitter, decoded PCM
+and codec history. `TIMED_DISCONTINUITY` names the new **target** epoch. No fresh
+Audio/Gap is exposed until the consumer acknowledges that exact target **after**
+its prior ring, DSP and RF owners actually retire; stale acknowledgments cannot
+release a newer target. Private control can continue while retirement is pending.
+A native reset failure stays closed until peer teardown. This timing capability
+does not itself authorize mailbox access or RF.
+
+## Timed prepared transmission
+
+The optional client slots `send_prepared_audio_timed` and `retire_egress` extend
+the table to 160 bytes, preserving both released 136 and timed RX 144-byte prefixes.
+Only these explicitly negotiated phone operations implement the transmit age
+contract; ordinary numeric and independent generic prepared-send behavior remains.
+The first profile is PCMU/PCMA at 8 kHz and 20 ms, exactly 160 encoded bytes/source frames.
+
+Retire egress before its first timed send and each source discontinuity. A completed
+serial local retirement returns a checked TX epoch token, independent of RX epochs.
+It resets the actual encoder and cancels old local PCM eligibility. The consumer
+also abandons its old staged items; their old tokens cannot send after retirement.
+A failed reset stays closed until teardown. A previously committed legacy PCM full
+frame remains `Pending` until real ACK or teardown: it keeps its reliable OSeq hole
+while PCM retries are suppressed. Text/key/control reliability remains intact.
+Successful prior UDP sends cannot be recalled; completion claims no remote ACK.
+
+For a prepared packet, sample `elapsed_ms` **first**, then the Host reference and
+the oldest contributing original PCM age. Add the remaining 500 ms age budget to
+that earlier native floor, rounding down and checking overflow. Unknown/future
+source age or a saturated native clock cannot qualify a packet. Keep this absolute
+deadline and TX token unchanged through partial encoding, retained buffers and
+`WouldBlock`. The provider rechecks the actual native deadline inside the short
+account lifetime guard immediately before nonblocking UDP commit. `Expired` is
+distinct from `WouldBlock`, and neither commits PCM.
+
+Timed PCM travels only in Mini frames. Reliable full Voice frames announce codec
+and timestamp with **zero PCM**, including first use, Mini wrap and timestamp
+discontinuity/long silence. Lost initial markers can lose media until their reliable
+retry; expired PCM is never retransmitted. Marker/control sequence ownership remains
+intact. Retirements cannot claim a clean protocol shutdown merely because local
+media is canceled. The independent Asterisk fixture checks both G.711 modes,
+incoming/outgoing setup and actual Mini wrap; live-provider/NAT/RF acceptance remains
+separate work.
+
+The kernel contracts are documented in [Linux timestamping](https://docs.kernel.org/networking/timestamping.html)
+and [timerfd](https://man7.org/linux/man-pages/man2/timerfd_create.2.html). The fixed
+ancillary layout follows Linux v6.18 `__sock_recv_timestamp`: this exclusively owned
+Internet UDP socket subscribes to no other ancillary records and never reads the
+error queue. Missing/short records and `MSG_CTRUNC` never qualify; `MSG_TRUNC` drops
+the partial datagram. IPv6 scope/flow and mapped IPv4 endpoints retain the actual
+owned socket family. Tests use owned child-only syscall faults, never host clock changes.
 
 Codec providers supply ULAW, ALAW, GSM, G.723.1, G.726 AAL2, Dialogic ADPCM,
 SLIN, LPC10, G.729, Speex, iLBC, G.726, G.722, SLIN16, Speex16, and Opus.
@@ -75,8 +199,8 @@ Debian 13 release assets provide `librptadv-iax2-client2` and
 release tag and use the versioned dynamic library. Packages are also available
 from the [shared signed APT repository](https://cpeter1207.github.io/USBRadioPlus/).
 
-Packet-jitter buffering starts at 180 ms, with a 160 ms minimum and a 500 ms
-maximum. Valid voice resumes playout after a radio-unkey event even when the
+Generic/numeric packet-jitter buffering starts at 180 ms, with a 160 ms minimum
+and a 500 ms maximum. Valid voice resumes playout after a radio-unkey event even when the
 peer does not send another radio-key event.
 
 Validated empty voice packets do not enter audio playout. Unexpected peer
@@ -113,10 +237,11 @@ make provider-interop-check
 
 The explicit platform gate `provider-interop-check` uses the quality image's
 Asterisk as a loopback-only independent provider. The C smoke consumer uses the
-installed header and candidate DSO for call-token/MD5 setup, μ-law echo media,
-hangup, wrong-secret rejection and endpoint cleanup. Asterisk is a test tool;
+installed header and candidate DSO for call-token/MD5 setup, G.711 echo media,
+registration, refresh, release, incoming and outgoing provider calls, hangup,
+wrong-secret rejection and endpoint cleanup. Asterisk is a test tool;
 the runtime library and ordinary Debian package build do not depend on a PBX.
-Real-provider, registration, NAT and radio acceptance remain unverified.
+Live-provider, NAT and radio acceptance remain unverified.
 
 The client ABI is versioned and released as a shared object. Complete ASL3
 call/session behavior and live peer interoperability remain to be verified.

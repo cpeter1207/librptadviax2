@@ -1,5 +1,6 @@
 //! IAX timestamp translation and ordered codec/gap delivery around the jitter capability.
 
+use crate::source_time::{Receipt, Span};
 use crate::{
     client::{DialError, IaxPeerEvent},
     codec::{
@@ -8,7 +9,7 @@ use crate::{
     },
     jitter::{Admission, Decision, Jitter, Kind, MAX_PAYLOAD, Observation},
 };
-use std::time::Instant;
+use std::{collections::VecDeque, time::Instant};
 
 /// One connection's exclusive packet-release state; no PCM queue or PLC lives here.
 pub(crate) struct Playout {
@@ -32,6 +33,9 @@ pub(crate) struct Playout {
     next_key: Option<u32>,
     completed: Observation,
     release_deadline: Option<Instant>,
+    anchors: VecDeque<(u64, Span)>,
+    pending_span: Span,
+    last_span: Span,
 }
 
 impl Playout {
@@ -93,6 +97,9 @@ impl Playout {
             next_key: None,
             completed: Observation::default(),
             release_deadline: None,
+            anchors: VecDeque::new(),
+            pending_span: Span::default(),
+            last_span: Span::default(),
         }
     }
     #[cfg(test)]
@@ -105,6 +112,7 @@ impl Playout {
     ) -> Result<(), DialError> {
         self.put_with_codec(timestamp, mini, arrived_at, payload, None)
     }
+    #[cfg(test)]
     pub(crate) fn put_with_codec(
         &mut self,
         timestamp: u32,
@@ -112,6 +120,17 @@ impl Playout {
         arrived_at: Instant,
         payload: &[u8],
         decoder: Option<&Decoder>,
+    ) -> Result<(), DialError> {
+        self.put_received(timestamp, mini, arrived_at, payload, decoder, None)
+    }
+    pub(crate) fn put_received(
+        &mut self,
+        timestamp: u32,
+        mini: bool,
+        arrived_at: Instant,
+        payload: &[u8],
+        decoder: Option<&Decoder>,
+        receipt: Option<Receipt>,
     ) -> Result<(), DialError> {
         let span = match decoder {
             Some(decoder) => match decoder.inspect(payload) {
@@ -144,6 +163,15 @@ impl Playout {
             .put(timestamp, span, arrival_ns, payload)
             .map_err(|_| DialError::Jitter)?;
         if admission == Admission::Accepted {
+            if let Some(receipt) = receipt {
+                // The composed jitter contract has64 slots. Missing provenance
+                // never becomes a guessed birth if its own bounded metadata fills.
+                if self.anchors.len() == 64 {
+                    return Err(DialError::Jitter);
+                }
+                self.anchors
+                    .push_back((timestamp, Span::new(Some(receipt))));
+            }
             self.tail_end = Some(self.tail_end.unwrap_or(0).max(timestamp + u64::from(span)));
         }
         Ok(())
@@ -163,6 +191,7 @@ impl Playout {
         decoder: Option<&mut Decoder>,
     ) -> Result<IaxPeerEvent, DialError> {
         self.release_deadline = None;
+        self.last_span = Span::default();
         if self.pending.is_some() {
             return self.decode_pending(now, pcm, decoder);
         }
@@ -216,6 +245,14 @@ impl Playout {
                 if decision.span != frames {
                     return Err(DialError::Jitter);
                 }
+                // The neutral ABI returns the actual packet timestamp. Its
+                // signed offset is only a playout-prefix/overlap correction.
+                self.pending_span = self
+                    .anchors
+                    .iter()
+                    .position(|(start, _)| *start == decision.timestamp)
+                    .and_then(|index| self.anchors.remove(index))
+                    .map_or_else(Span::default, |(_, span)| span);
                 self.pending_prefix = decision.start_offset.max(0) as u32;
                 self.pending = Some(decision);
                 self.decode_pending(now, pcm, decoder)
@@ -298,6 +335,7 @@ impl Playout {
             self.commit(now, &decision)?;
             return Ok(event);
         }
+        self.last_span = self.pending_span.clone();
         let skip = decision.start_offset.saturating_neg().max(0) as usize;
         let count = match decoder {
             Some(decoder) => {
@@ -383,10 +421,33 @@ impl Playout {
         Ok(())
     }
 
+    pub(crate) fn last_span(&self) -> &Span {
+        &self.last_span
+    }
+    pub(crate) fn original_deadline(&self) -> Option<Instant> {
+        self.anchors
+            .iter()
+            .filter_map(|(_, span)| span.receipt)
+            .chain(self.pending_span.receipt)
+            .map(|receipt| receipt.instant)
+            .min()
+    }
+    pub(crate) fn retained_expired(&self, now: Instant) -> bool {
+        self.anchors.iter().any(|(_, span)| span.expired(now)) || self.pending_span.expired(now)
+    }
+    pub(crate) fn retire_media(&mut self) -> Result<(), DialError> {
+        self.clear()?;
+        self.highest_ms = None;
+        self.next_key = None;
+        Ok(())
+    }
     fn clear(&mut self) -> Result<(), DialError> {
         self.completed = self.observe()?;
         self.jitter.reset().map_err(|_| DialError::Jitter)?;
         self.source_origin = None;
+        self.anchors.clear();
+        self.pending_span = Span::default();
+        self.last_span = Span::default();
         self.pending = None;
         self.pending_prefix = 0;
         self.decoded_count = 0;

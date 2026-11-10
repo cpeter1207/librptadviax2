@@ -26,6 +26,7 @@ PC_TEMPLATE := rptadv_iax2.pc.in
 PC_FILE := build/rptadv_iax2.pc
 SMOKE_SOURCE := tests/abi_header_smoke.c
 SMOKE_BINARY := build/abi-header-smoke
+LISTENER_FIXTURE := build/provider-listener-fixture
 DEBIAN_VERSION = $(shell dpkg-parsechangelog -S Version)
 DEBIAN_ARCH = $(shell dpkg-architecture -qDEB_HOST_ARCH)
 DEBIAN_MULTIARCH = $(shell dpkg-architecture -qDEB_HOST_MULTIARCH)
@@ -37,7 +38,7 @@ CPPFLAGS += -I$(RPTADV_CODEC_INCLUDE)
 
 SONAME_RUSTFLAGS = $(RUSTFLAGS) -C link-arg=-Wl,-soname,$(LIBRARY_BASENAME).so.$(SOVERSION)
 
-.PHONY: all quality lint static-analysis docs rustdoc test coverage platform-verify provider-interop-check install install-check package-check debian-package-check release-packages dist clean FORCE
+.PHONY: all quality lint static-analysis docs rustdoc test coverage coverage-ffi-check platform-verify provider-interop-check install install-check package-check debian-package-check release-packages dist clean FORCE
 
 all: $(LIBRARY_VERSIONED) $(LIBRARY_SONAME) $(LIBRARY_LINK)
 
@@ -69,16 +70,22 @@ test: all
 	LD_LIBRARY_PATH="$(CURDIR)/build:$${LD_LIBRARY_PATH}" ./$(SMOKE_BINARY)
 
 coverage:
-	mkdir -p build/coverage
-	$(CARGO) +nightly-2025-02-20 llvm-cov --all-targets --branch --json \
-		--output-path build/coverage/rust.json
-	$(PYTHON) tests/check_coverage.py build/coverage/rust.json
+	CARGO="$(CARGO)" sh tests/coverage.sh
+
+coverage-ffi-check:
+	$(CC) -std=c11 -Wall -Wextra -Werror -Iinclude $(CPPFLAGS) $(SMOKE_SOURCE) \
+		-Lbuild/coverage/ffi -l$(CRATE) -Wl,-rpath,'$$ORIGIN' -o build/coverage/ffi/abi-header-smoke
+	$(CC) -std=c11 -Wall -Wextra -Werror -Iinclude $(CPPFLAGS) tests/provider_listener_fixture.c \
+		-Lbuild/coverage/ffi -l$(CRATE) -Wl,-rpath,'$$ORIGIN' -ldl -o build/coverage/ffi/provider-listener-fixture
+	./build/coverage/ffi/abi-header-smoke
+	$(PYTHON) tests/provider_interop.py $(abspath build/coverage/ffi/abi-header-smoke) \
+		$(abspath build/coverage/ffi/provider-listener-fixture)
 
 platform-verify: test install-check package-check provider-interop-check
 
 # Independent test provider only; the installed library never loads Asterisk.
-provider-interop-check: $(SMOKE_BINARY)
-	$(PYTHON) tests/provider_interop.py $(abspath $(SMOKE_BINARY))
+provider-interop-check: $(SMOKE_BINARY) $(LISTENER_FIXTURE)
+	$(PYTHON) tests/provider_interop.py $(abspath $(SMOKE_BINARY)) $(abspath $(LISTENER_FIXTURE))
 
 quality: lint static-analysis docs
 
@@ -90,7 +97,7 @@ lint:
 static-analysis:
 	$(CARGO) clippy --all-targets -- -D warnings
 	$(CPPCHECK) --force --enable=warning,style,performance,portability --error-exitcode=1 \
-		--std=c11 -Iinclude $(CPPFLAGS) $(wildcard tests/*.c)
+		--check-level=exhaustive --std=c11 -Iinclude $(CPPFLAGS) $(wildcard tests/*.c)
 
 docs: rustdoc | build
 	$(DOXYGEN) Doxyfile
@@ -102,6 +109,10 @@ rustdoc:
 $(SMOKE_BINARY): $(SMOKE_SOURCE) $(HEADER) $(RPTADV_CODEC_INCLUDE)/rptadv_codec.h $(LIBRARY_LINK) | build
 	$(CC) -std=c11 -Wall -Wextra -Werror -Iinclude $(CPPFLAGS) $< -Lbuild \
 		-l$(CRATE) -Wl,-rpath,'$$ORIGIN' -o $@
+
+$(LISTENER_FIXTURE): tests/provider_listener_fixture.c $(HEADER) $(RPTADV_CODEC_INCLUDE)/rptadv_codec.h $(LIBRARY_LINK) | build
+	$(CC) -std=c11 -Wall -Wextra -Werror -Iinclude $(CPPFLAGS) $< -Lbuild \
+		-l$(CRATE) -Wl,-rpath,'$$ORIGIN' -ldl -o $@
 
 install: all $(PC_FILE)
 	install -d $(DESTDIR)$(LIBDIR) $(DESTDIR)$(PREFIX)/include/rptadv_iax2 \

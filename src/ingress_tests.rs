@@ -9,6 +9,75 @@ fn address(port: u16) -> SocketAddr {
 }
 
 #[test]
+fn pending_setup_routes_only_full_frames_and_promotes_the_same_queue() {
+    let remote = address(1);
+    let mut router = PeerIngressRouter::new(4).unwrap();
+    let mut owner = router.register_pending_call(remote, 22, 7).unwrap();
+    assert!(router.contains_local_call(22));
+    assert_eq!(
+        router.route_remote_call(remote, 42, &[99]),
+        Err(PeerIngressRouterError::UnknownPeer)
+    );
+    let arrived = std::time::Instant::now();
+    router.route_call_at(remote, 22, 42, &[1], arrived).unwrap();
+    assert_eq!(
+        router.promote_pending_call(remote, 22, 42, 8),
+        Err(PeerIngressRouterError::UnknownPeer)
+    );
+    router.promote_pending_call(remote, 22, 42, 7).unwrap();
+    assert!(!router.unregister_pending_call(remote, 22, 7));
+    router.route_remote_call(remote, 42, &[2]).unwrap();
+    let first = owner.try_pop().unwrap();
+    assert_eq!(first.generation(), 7);
+    assert_eq!(first.arrived_at(), arrived);
+    assert_eq!(first.payload(), [1]);
+    assert_eq!(owner.try_pop().unwrap().payload(), [2]);
+    assert!(router.unregister_call(remote, 22, 42, 7));
+    assert!(!router.contains_local_call(22));
+    assert!(owner.try_pop().is_none());
+}
+
+#[test]
+fn pending_route_validation_collisions_and_exact_cleanup_preserve_other_owners() {
+    let remote = address(1);
+    let mut router = PeerIngressRouter::new(4).unwrap();
+    for local in [0, 0x8000] {
+        assert!(matches!(
+            router.register_pending_call(remote, local, 7),
+            Err(PeerIngressRouterError::InvalidCallNumbers)
+        ));
+    }
+    let mut pending = router.register_pending_call(remote, 22, 7).unwrap();
+    assert!(matches!(
+        router.register_pending_call(remote, 22, 8),
+        Err(PeerIngressRouterError::DuplicatePeer)
+    ));
+    for remote_call in [0, 0x8000] {
+        assert_eq!(
+            router.promote_pending_call(remote, 22, remote_call, 7),
+            Err(PeerIngressRouterError::InvalidCallNumbers)
+        );
+    }
+    let mut existing = router.register_call(remote, 22, 42, 8).unwrap();
+    assert_eq!(
+        router.promote_pending_call(remote, 22, 42, 7),
+        Err(PeerIngressRouterError::DuplicatePeer)
+    );
+    assert!(!router.unregister_setup_call(remote, 22, 9));
+    router.route_call(remote, 22, 42, &[1]).unwrap();
+    router.route_call(remote, 22, 43, &[2]).unwrap();
+    assert_eq!(existing.try_pop().unwrap().payload(), [1]);
+    assert_eq!(pending.try_pop().unwrap().payload(), [2]);
+    assert!(router.unregister_setup_call(remote, 22, 7));
+    assert!(router.contains_local_call(22));
+    router.route_remote_call(remote, 42, &[3]).unwrap();
+    assert_eq!(existing.try_pop().unwrap().payload(), [3]);
+    assert!(router.unregister_setup_call(remote, 22, 8));
+    assert!(!router.contains_local_call(22));
+    assert!(!router.unregister_setup_call(address(2), 22, 8));
+}
+
+#[test]
 fn ingress_datagram_bounds_cover_udp_without_reserving_maximum_bytes_per_slot() {
     use crate::ingress::{InboundDatagram, MAX_DATAGRAM_SIZE};
     assert_eq!(MAX_DATAGRAM_SIZE, 65527);
@@ -492,4 +561,22 @@ async fn wake_retains_backlog_after_coalesced_notifications() {
     assert_eq!(wake.pending(), 1, "a bounded drain must be rescheduled");
     assert_eq!(consumer.receive().await.unwrap().payload(), [2]);
     assert_eq!(wake.pending(), 0);
+}
+
+#[test]
+fn setup_retirement_does_not_remove_equal_generations_at_other_addresses_or_calls() {
+    let mut router = PeerIngressRouter::new(2).unwrap();
+    let first = address(10);
+    let second = address(11);
+    let mut pending = router.register_pending_call(first, 100, 7).unwrap();
+    let mut linked = router.register_call(second, 101, 201, 7).unwrap();
+    assert!(!router.unregister_setup_call(first, 999, 7));
+    assert!(!router.unregister_setup_call(address(12), 100, 7));
+    router.route_call(first, 100, 200, &[1]).unwrap();
+    router.route_call(second, 101, 201, &[2]).unwrap();
+    assert_eq!(pending.try_pop().unwrap().payload(), [1]);
+    assert_eq!(linked.try_pop().unwrap().payload(), [2]);
+    assert!(router.unregister_setup_call(first, 100, 7));
+    assert!(router.unregister_setup_call(second, 101, 7));
+    assert_eq!(router.route_count(), 0);
 }

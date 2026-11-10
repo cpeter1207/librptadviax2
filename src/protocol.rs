@@ -151,7 +151,7 @@ pub fn encode_subclass(value: i64) -> Result<u8, SubclassEncodeError> {
     Err(SubclassEncodeError::ValueOutOfRange { value })
 }
 
-/// IAX control commands used by current ASL3 call and link sessions.
+/// IAX control commands used by call, link, and provider registration sessions.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IaxCommand {
     /// Initiate a call.
@@ -178,6 +178,16 @@ pub enum IaxCommand {
     LagRq,
     /// Reply to lag measurement.
     LagRp,
+    /// Register or refresh a provider account.
+    RegReq,
+    /// Request registration authentication.
+    RegAuth,
+    /// Acknowledge registration or release.
+    RegAck,
+    /// Reject registration or release.
+    RegRej,
+    /// Release a provider registration.
+    RegRel,
     /// Request voice retransmission after a sequence gap.
     Vnak,
     /// Probe a peer without establishing a call.
@@ -206,6 +216,11 @@ impl IaxCommand {
             Self::Inval => 10,
             Self::LagRq => 11,
             Self::LagRp => 12,
+            Self::RegReq => 13,
+            Self::RegAuth => 14,
+            Self::RegAck => 15,
+            Self::RegRej => 16,
+            Self::RegRel => 17,
             Self::Vnak => 18,
             Self::Poke => 30,
             Self::Unsupport => 33,
@@ -236,6 +251,11 @@ pub fn decode_iax_command(
         10 => IaxCommand::Inval,
         11 => IaxCommand::LagRq,
         12 => IaxCommand::LagRp,
+        13 => IaxCommand::RegReq,
+        14 => IaxCommand::RegAuth,
+        15 => IaxCommand::RegAck,
+        16 => IaxCommand::RegRej,
+        17 => IaxCommand::RegRel,
         18 => IaxCommand::Vnak,
         30 => IaxCommand::Poke,
         33 => IaxCommand::Unsupport,
@@ -694,6 +714,32 @@ mod tests {
             encode_subclass(i64::MIN),
             Err(SubclassEncodeError::ValueOutOfRange { value: i64::MIN })
         );
+    }
+
+    #[test]
+    fn registration_commands_are_recognized_on_the_wire() {
+        // RFC 5456 section 8.6 assigns these independent registrar commands.
+        for subclass in 13..=17 {
+            let bytes = serialize_full_frame(
+                &FullFrameHeader {
+                    source_call_number: 42,
+                    destination_call_number: 0,
+                    retransmission: false,
+                    timestamp: 0,
+                    outgoing_sequence: 0,
+                    incoming_sequence: 0,
+                    frame_type: 6,
+                    subclass,
+                    subclass_is_log: false,
+                },
+                &[],
+            )
+            .unwrap();
+            let parsed = parse_full_frame_packet(&bytes).unwrap();
+            let command = decode_iax_command(&parsed.header).unwrap().unwrap();
+            assert_ne!(command, IaxCommand::Unknown(i64::from(subclass)));
+            assert_eq!(command.subclass_value(), i64::from(subclass));
+        }
     }
 
     #[test]

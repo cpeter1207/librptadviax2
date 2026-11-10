@@ -5,8 +5,12 @@ use crate::{
     client::{DialError, IaxPeer},
     information_elements::parse_information_elements,
     ingress::{PeerIngressRouter, PeerIngressRouterError},
-    network::UdpEndpoint,
+    network::{SharedSocket, UdpEndpoint},
     protocol::{parse_full_frame_packet, parse_mini_frame},
+    provider::{
+        Account, AccountConfig, AccountError, DialRequest, Life, MAX_ACCOUNTS, Ownership,
+        PreparedDial, PreparedRegistration, RegistrationRequest,
+    },
     session::{InboundNewAction, process_inbound_new},
 };
 use std::{
@@ -14,14 +18,18 @@ use std::{
     net::SocketAddr,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering},
     },
     time::Instant,
 };
 
 #[path = "server_async.rs"]
 mod async_ingress;
+pub(crate) use async_ingress::ListenerControl;
 use async_ingress::ListenerIngress;
+#[path = "server_provider.rs"]
+mod provider_admission;
+pub use provider_admission::{CompletedPoll, PreparedPoll};
 
 static NEXT_INBOUND_CALL: AtomicU32 = AtomicU32::new(0);
 
@@ -53,6 +61,8 @@ impl InboundPeer {
 pub enum ListenerEvent {
     /// A valid call passed token validation and product admission; ACCEPT and ANSWER were sent.
     Accepted(Box<InboundPeer>),
+    /// An authenticated configured provider call, never a numeric ASL identity.
+    Provider(Box<crate::provider::ProviderCall>),
     /// A challenge, reject, or protocol reply was sent; no peer was admitted.
     Replied,
     /// A malformed or unrelated datagram was safely ignored.
@@ -79,6 +89,8 @@ pub enum ListenerError {
     InvalidFrame,
     /// The response packet could not be sent completely.
     ShortSend,
+    /// A configured provider/control operation failed without admitting a peer.
+    Provider(AccountError),
 }
 
 impl std::fmt::Display for ListenerError {
@@ -87,6 +99,7 @@ impl std::fmt::Display for ListenerError {
             Self::Network(error) => write!(formatter, "IAX2 listener network error: {error}"),
             Self::InvalidFrame => formatter.write_str("invalid inbound IAX2 frame"),
             Self::ShortSend => formatter.write_str("incomplete inbound IAX2 response send"),
+            Self::Provider(error) => write!(formatter, "{error}"),
         }
     }
 }
@@ -111,6 +124,10 @@ pub struct InboundIaxListener {
     generation: u64,
     async_ingress: Option<ListenerIngress>,
     catalog: Option<Arc<crate::formats::FormatCatalog>>,
+    accounts: Vec<Arc<Account>>,
+    life: Arc<Life>,
+    legacy_admission: Arc<Life>,
+    pending_provider: Vec<provider_admission::PendingIncoming>,
     #[cfg(test)]
     fail_next_poll: bool,
     #[cfg(test)]
@@ -123,6 +140,132 @@ struct InboundRoute {
     remote_call: u16,
     generation: u64,
     released: Arc<AtomicBool>,
+    cleanup: Arc<AtomicU8>,
+    provider: bool,
+    new_call: Option<u16>,
+}
+
+pub(crate) struct PreparedRoute {
+    socket: Arc<SharedSocket>,
+    control: Option<ListenerControl>,
+    remote: SocketAddr,
+    pub(crate) local_call: u16,
+    pub(crate) generation: u64,
+    pub(crate) ownership: Ownership,
+    released: Arc<AtomicBool>,
+    ingress: Option<crate::ingress::IngressConsumer>,
+    transferred: bool,
+}
+
+impl PreparedRoute {
+    pub(crate) fn install(&mut self, deadline: Instant) -> Result<(), AccountError> {
+        self.ownership.check()?;
+        if self.ingress.is_some() {
+            return Ok(());
+        }
+        self.ingress = Some(
+            self.control
+                .as_ref()
+                .ok_or(AccountError::AsyncRequired)?
+                .register_pending(
+                    self.remote,
+                    self.local_call,
+                    self.generation,
+                    self.ownership.clone(),
+                    deadline,
+                )?,
+        );
+        Ok(())
+    }
+    fn promote(&self, remote_call: u16, deadline: Instant) -> Result<(), AccountError> {
+        match &self.control {
+            Some(control) => control.promote(
+                (self.remote, self.local_call, remote_call, self.generation),
+                self.ownership.clone(),
+                deadline,
+            ),
+            None => Ok(()), // Synchronous admission installed its exact call under listener control.
+        }
+    }
+    pub(crate) fn send(&self, bytes: &[u8], deadline: Instant) -> Result<(), AccountError> {
+        if let Some(control) = &self.control {
+            control.send(&self.socket, self.remote, bytes, &self.ownership, deadline)
+        } else {
+            self.ownership
+                .with_live(|| self.socket.send_to(bytes, self.remote))?
+                .map(|_| ())
+                .map_err(AccountError::Network)
+        }
+    }
+    pub(crate) fn try_receive(
+        &mut self,
+    ) -> Result<Option<crate::ingress::InboundDatagram>, AccountError> {
+        self.ownership.check()?;
+        let ingress = self
+            .ingress
+            .as_mut()
+            .expect("installed transaction retains its ingress");
+        match ingress.try_pop() {
+            Some(packet) => Ok(Some(packet)),
+            None if ingress.failed() => Err(AccountError::Retired),
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) fn dial(
+        &mut self,
+        options: crate::client::CallRequest<'_>,
+        elements: &[crate::information_elements::InformationElement<'_>],
+        catalog: Arc<crate::formats::FormatCatalog>,
+        deadline: Instant,
+    ) -> Result<IaxPeer, AccountError> {
+        self.install(deadline)?;
+        let control = self.control.clone().ok_or(AccountError::AsyncRequired)?;
+        let shared = crate::client::SharedDial {
+            control: control.clone(),
+            socket: self.socket.clone(),
+            ingress: self.ingress.take().expect("installed setup route"),
+            local: self.socket.local_addr().map_err(AccountError::Network)?,
+            released: self.released.clone(),
+            ownership: self.ownership.clone(),
+            deadline,
+        };
+        let ownership = self.ownership.clone();
+        let identity = (self.remote, self.local_call, self.generation);
+        let mut peer = crate::client::dial_new_transport(
+            options,
+            elements,
+            Some(catalog),
+            Some(shared),
+            |remote_call| {
+                control
+                    .promote(
+                        (identity.0, identity.1, remote_call, identity.2),
+                        ownership.clone(),
+                        deadline,
+                    )
+                    .map_err(AccountError::into_call)
+            },
+        )
+        .map_err(AccountError::Call)?;
+        #[cfg(test)]
+        tests::dial_checkpoint(&self.ownership);
+        if let Err(error) = self.ownership.check() {
+            let _ = peer.hangup();
+            return Err(error);
+        }
+        self.transferred = true;
+        Ok(peer)
+    }
+}
+
+impl Drop for PreparedRoute {
+    fn drop(&mut self) {
+        if !self.transferred {
+            self.ownership.operation.retire();
+            self.released.store(true, Ordering::Release);
+        }
+    }
 }
 
 impl InboundIaxListener {
@@ -133,7 +276,7 @@ impl InboundIaxListener {
 
     /// Bind one UDP endpoint that accepts calls addressed to any configured local node.
     pub fn bind_many(local: SocketAddr, local_nodes: &[String]) -> Result<Self, ListenerError> {
-        Self::bind_composed(local, local_nodes, None)
+        Self::bind_composed(local, local_nodes, None, &[])
     }
 
     /// Retain one composition catalog for all authorized incoming calls.
@@ -142,14 +285,30 @@ impl InboundIaxListener {
         local_nodes: &[String],
         catalog: Arc<crate::formats::FormatCatalog>,
     ) -> Result<Self, ListenerError> {
-        Self::bind_composed(local, local_nodes, Some(catalog))
+        Self::bind_composed(local, local_nodes, Some(catalog), &[])
     }
+
+    /// Bind mixed numeric and configured provider admission on one UDP endpoint.
+    /// Empty numeric nodes are valid only when at least one account is configured.
+    pub fn bind_accounts(
+        local: SocketAddr,
+        local_nodes: &[String],
+        accounts: &[AccountConfig],
+        catalog: Option<Arc<crate::formats::FormatCatalog>>,
+    ) -> Result<Self, ListenerError> {
+        Self::bind_composed(local, local_nodes, catalog, accounts)
+    }
+
     fn bind_composed(
         local: SocketAddr,
         local_nodes: &[String],
         catalog: Option<Arc<crate::formats::FormatCatalog>>,
+        accounts: &[AccountConfig],
     ) -> Result<Self, ListenerError> {
-        if !valid_local_nodes(local_nodes) {
+        if (!local_nodes.is_empty() && !valid_local_nodes(local_nodes))
+            || (local_nodes.is_empty() && accounts.is_empty())
+            || !valid_accounts(accounts)
+        {
             return Err(ListenerError::InvalidFrame);
         }
         let tokens = make_call_token_authority(|random| {
@@ -164,6 +323,19 @@ impl InboundIaxListener {
             generation: 0,
             async_ingress: None,
             catalog,
+            accounts: accounts
+                .iter()
+                .cloned()
+                .map(|config| {
+                    Arc::new(Account {
+                        config,
+                        life: Life::new(),
+                    })
+                })
+                .collect(),
+            life: Life::new(),
+            legacy_admission: Life::new(),
+            pending_provider: Vec::with_capacity(MAX_ACCOUNTS),
             #[cfg(test)]
             fail_next_poll: false,
             #[cfg(test)]
@@ -193,7 +365,12 @@ impl InboundIaxListener {
         // No fallible work remains before the sole router moves into its task.
         let empty = PeerIngressRouter::new(1).expect("nonzero placeholder limits");
         let router = std::mem::replace(&mut self.router, empty);
-        self.async_ingress = Some(ListenerIngress::start(runtime, socket, router));
+        self.async_ingress = Some(ListenerIngress::start(
+            runtime,
+            socket,
+            router,
+            Some(self.endpoint.shared_socket()),
+        ));
         Ok(())
     }
 
@@ -215,11 +392,193 @@ impl InboundIaxListener {
 
     /// Replace local identities for future calls; established peer routes remain active.
     pub fn set_local_nodes(&mut self, local_nodes: &[String]) -> Result<(), ListenerError> {
-        if !valid_local_nodes(local_nodes) {
+        if !(valid_local_nodes(local_nodes) || local_nodes.is_empty() && !self.accounts.is_empty())
+        {
             return Err(ListenerError::InvalidFrame);
         }
-        self.local_nodes = local_nodes.to_vec();
+        if self.local_nodes != local_nodes {
+            self.legacy_admission.retire();
+            self.legacy_admission = Life::new();
+            self.local_nodes = local_nodes.to_vec();
+        }
         Ok(())
+    }
+
+    /// Atomically replace validated copied accounts, retiring each changed owner.
+    /// Established provider peers retain their resources but become unusable
+    /// when their exact account retires; the product must close/destroy them.
+    pub fn configure_accounts(&mut self, configs: &[AccountConfig]) -> Result<(), AccountError> {
+        if !valid_accounts(configs)
+            || configs.iter().any(|config| {
+                self.accounts.iter().any(|old| {
+                    old.config.id == config.id
+                        && old.config.generation == config.generation
+                        && old.config != *config
+                })
+            })
+        {
+            return Err(AccountError::InvalidOptions);
+        }
+        let mut next = Vec::new();
+        next.try_reserve(configs.len())
+            .map_err(|_| AccountError::Busy)?;
+        for config in configs {
+            next.push(
+                self.accounts
+                    .iter()
+                    .find(|old| old.config == *config)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        Arc::new(Account {
+                            config: config.clone(),
+                            life: Life::new(),
+                        })
+                    }),
+            );
+        }
+        for old in &self.accounts {
+            if !next.iter().any(|new| Arc::ptr_eq(old, new)) {
+                old.life.retire();
+            }
+        }
+        self.accounts = next;
+        Ok(())
+    }
+
+    /// Snapshot an exact configured account and reserve a listener-local route.
+    /// Execute the returned owner after releasing all product/control locks.
+    pub fn prepare_registration(
+        &mut self,
+        account: &str,
+        generation: u64,
+        request: RegistrationRequest,
+    ) -> Result<PreparedRegistration, AccountError> {
+        if request.refresh == 0
+            || request.timeout.is_zero()
+            || Instant::now().checked_add(request.timeout).is_none()
+        {
+            return Err(AccountError::InvalidOptions);
+        }
+        let account = self
+            .accounts
+            .iter()
+            .find(|entry| entry.config.id == account && entry.config.generation == generation)
+            .cloned()
+            .ok_or(AccountError::InvalidOptions)?;
+        let route = self.prepare_account_route(&account)?;
+        Ok(PreparedRegistration::new(route, account, request))
+    }
+
+    /// Snapshot configured credentials and reserve a call on this listener port.
+    /// No network wait or foreign callback occurs while borrowing the listener.
+    pub fn prepare_dial(
+        &mut self,
+        id: &str,
+        generation: u64,
+        request: DialRequest,
+    ) -> Result<PreparedDial, AccountError> {
+        if !request.valid() {
+            return Err(AccountError::InvalidOptions);
+        }
+        let account = self
+            .accounts
+            .iter()
+            .find(|account| account.config.id == id && account.config.generation == generation)
+            .cloned()
+            .ok_or(AccountError::InvalidOptions)?;
+        let catalog = self.catalog.as_ref().ok_or(AccountError::InvalidOptions)?;
+        let phone = catalog.phone().ok_or_else(|| {
+            AccountError::Call(DialError::UnsupportedFormat(catalog.advertised_mask()))
+        })?;
+        let catalog = Arc::new(phone);
+        let route = self.prepare_account_route(&account)?;
+        Ok(PreparedDial {
+            route,
+            account,
+            request,
+            catalog,
+            started: false,
+        })
+    }
+
+    fn prepare_account_route(
+        &mut self,
+        account: &Arc<Account>,
+    ) -> Result<PreparedRoute, AccountError> {
+        if self.async_ingress.is_none() {
+            return Err(AccountError::AsyncRequired);
+        }
+        self.reserve_route(account.config.remote, None, account.life.clone(), true)
+    }
+
+    fn reserve_route(
+        &mut self,
+        remote: SocketAddr,
+        remote_call: Option<u16>,
+        admission: Arc<Life>,
+        provider: bool,
+    ) -> Result<PreparedRoute, AccountError> {
+        self.routes
+            .retain(|route| route.cleanup.load(Ordering::Acquire) != 2);
+        if provider && self.routes.iter().filter(|route| route.provider).count() >= MAX_ACCOUNTS {
+            return Err(AccountError::Busy);
+        }
+        let local_call = self.next_available_call().ok_or(AccountError::Busy)?;
+        let generation = self.generation.checked_add(1).ok_or(AccountError::Busy)?;
+        let reserved = self.routes.try_reserve(1).is_ok();
+        #[cfg(test)]
+        let reserved = reserved && !std::mem::take(&mut self.fail_next_reserve);
+        if !reserved {
+            return Err(AccountError::Busy);
+        }
+        let released = Arc::new(AtomicBool::new(false));
+        let ownership = Ownership {
+            server: self.life.clone(),
+            account: admission,
+            operation: Life::new(),
+        };
+        ownership.check()?;
+        let control = self.async_ingress.as_ref().map(ListenerIngress::control);
+        let ingress = if control.is_none() {
+            Some(
+                self.router
+                    .register_call(
+                        remote,
+                        local_call,
+                        remote_call.ok_or(AccountError::AsyncRequired)?,
+                        generation,
+                    )
+                    .map_err(|_| AccountError::Busy)?,
+            )
+        } else {
+            None
+        };
+        self.generation = generation;
+        self.routes.push(InboundRoute {
+            remote,
+            local_call,
+            remote_call: if control.is_none() {
+                remote_call.expect("synchronous exact route")
+            } else {
+                0
+            },
+            generation,
+            released: released.clone(),
+            cleanup: Arc::new(AtomicU8::new(0)),
+            provider,
+            new_call: remote_call,
+        });
+        Ok(PreparedRoute {
+            socket: self.endpoint.shared_socket(),
+            control,
+            remote,
+            local_call,
+            generation,
+            ownership,
+            released,
+            ingress,
+            transferred: false,
+        })
     }
 
     /// Return the actual bound endpoint, including an OS-assigned port when requested.
@@ -240,172 +599,9 @@ impl InboundIaxListener {
     pub fn poll_with_identity(
         &mut self,
         now_seconds: u32,
-        mut authorize: impl FnMut(&str, &str, SocketAddr) -> bool,
+        authorize: impl FnMut(&str, &str, SocketAddr) -> bool,
     ) -> Result<ListenerEvent, ListenerError> {
-        #[cfg(test)]
-        if std::mem::take(&mut self.fail_next_poll) {
-            return Err(ListenerError::Network(io::Error::other(
-                "injected poll failure",
-            )));
-        }
-        self.reap_released_routes()?;
-        let mut packet = [0_u8; crate::ingress::MAX_DATAGRAM_SIZE + 1];
-        let (length, remote) = if let Some(ingress) = &mut self.async_ingress {
-            let Some(received) = ingress.try_receive().map_err(ListenerError::Network)? else {
-                return Ok(ListenerEvent::None);
-            };
-            let length = received.payload().len();
-            packet[..length].copy_from_slice(received.payload());
-            (length, received.remote())
-        } else {
-            let Some((length, remote)) = self
-                .endpoint
-                .try_receive(&mut packet)
-                .map_err(ListenerError::Network)?
-            else {
-                return Ok(ListenerEvent::None);
-            };
-            if self.route_existing(remote, &packet[..length]) {
-                return Ok(ListenerEvent::None);
-            }
-            (length, remote)
-        };
-        let bytes = &packet[..length];
-        if length > crate::ingress::MAX_DATAGRAM_SIZE {
-            return Ok(ListenerEvent::Ignored);
-        }
-        let Ok(request) = parse_full_frame_packet(bytes) else {
-            return Ok(ListenerEvent::Ignored);
-        };
-        let Some(local_call) = self.next_available_call() else {
-            return self.reject_new(bytes, remote);
-        };
-        let local_node = called_node(bytes)
-            .filter(|called| self.local_nodes.iter().any(|node| node == called))
-            .unwrap_or(&self.local_nodes[0])
-            .to_owned();
-        let remote_address = remote;
-        let action = match process_inbound_new(
-            &self.tokens,
-            remote,
-            bytes,
-            (&local_node, local_call),
-            now_seconds,
-            self.catalog.as_deref(),
-            &mut |remote: &str| authorize(&local_node, remote, remote_address),
-        ) {
-            Ok(action) => action,
-            Err(_) => return Ok(ListenerEvent::Ignored),
-        };
-        match action {
-            InboundNewAction::Reply(reply) => {
-                send_reply(&self.endpoint, &reply, remote)?;
-                Ok(ListenerEvent::Replied)
-            }
-            InboundNewAction::Accept(accepted) => {
-                // Reserve before a router or peer can retain the new call identity.
-                let reserved = self.routes.try_reserve(1).is_ok();
-                #[cfg(test)]
-                let reserved = reserved && !std::mem::take(&mut self.fail_next_reserve);
-                if !reserved {
-                    return self.reject_new(bytes, remote);
-                }
-                self.generation = self.generation.wrapping_add(1).max(1);
-                let ingress = if let Some(ingress) = &self.async_ingress {
-                    ingress
-                        .register(
-                            remote,
-                            local_call,
-                            request.header.source_call_number,
-                            self.generation,
-                        )
-                        .map_err(ListenerError::Network)?
-                } else {
-                    self.router.register_call(
-                        remote,
-                        local_call,
-                        request.header.source_call_number,
-                        self.generation,
-                    )
-                };
-                let Ok(ingress) = ingress else {
-                    return self.reject_new(bytes, remote);
-                };
-                let local = self.endpoint.local_addr().map_err(ListenerError::Network)?;
-                let (mut peer, released) = IaxPeer::from_inbound(
-                    self.endpoint.shared_socket(),
-                    ingress,
-                    local,
-                    remote,
-                    local_call,
-                    request.header.source_call_number,
-                    accepted.format,
-                )
-                .map_err(|_| ListenerError::InvalidFrame)?;
-                if let Some(catalog) = &self.catalog {
-                    peer.compose_codec(catalog)
-                        .map_err(|_| ListenerError::InvalidFrame)?;
-                }
-                self.routes.push(InboundRoute {
-                    remote,
-                    local_call,
-                    remote_call: request.header.source_call_number,
-                    generation: self.generation,
-                    released,
-                });
-                peer.accept_inbound(accepted.packet)
-                    .map_err(map_inbound_peer_error)?;
-                Ok(ListenerEvent::Accepted(Box::new(InboundPeer {
-                    local_node,
-                    remote_node: accepted.remote_node,
-                    remote,
-                    local_call,
-                    remote_call: request.header.source_call_number,
-                    format: accepted.format,
-                    peer,
-                })))
-            }
-        }
-    }
-
-    fn reap_released_routes(&mut self) -> Result<(), ListenerError> {
-        let mut index = 0;
-        while index < self.routes.len() {
-            if self.routes[index]
-                .released
-                .load(std::sync::atomic::Ordering::Acquire)
-            {
-                let route = self.routes.swap_remove(index);
-                if let Some(ingress) = &self.async_ingress {
-                    ingress
-                        .unregister(
-                            route.remote,
-                            route.local_call,
-                            route.remote_call,
-                            route.generation,
-                        )
-                        .map_err(ListenerError::Network)?;
-                } else {
-                    self.router.unregister_call(
-                        route.remote,
-                        route.local_call,
-                        route.remote_call,
-                        route.generation,
-                    );
-                }
-            } else {
-                index += 1;
-            }
-        }
-        Ok(())
-    }
-
-    fn reject_new(&self, bytes: &[u8], remote: SocketAddr) -> Result<ListenerEvent, ListenerError> {
-        let Ok(reject) = self.tokens.reject_initial_new(bytes) else {
-            return Ok(ListenerEvent::Ignored);
-        };
-        send_reply(&self.endpoint, &reject, remote)?;
-        Ok(ListenerEvent::Replied)
+        self.poll_accounts(now_seconds, authorize, |_| false)
     }
 
     fn next_available_call(&self) -> Option<u16> {
@@ -424,7 +620,7 @@ impl InboundIaxListener {
     }
 
     fn route_existing(&mut self, remote: SocketAddr, packet: &[u8]) -> bool {
-        route_established(&mut self.router, remote, packet, Instant::now())
+        route_established(&mut self.router, remote, packet, Instant::now(), None)
     }
 }
 
@@ -433,6 +629,7 @@ fn route_established(
     remote: SocketAddr,
     packet: &[u8],
     arrived_at: Instant,
+    receipt: Option<crate::source_time::Receipt>,
 ) -> bool {
     if packet.first().is_some_and(|first| first & 0x80 != 0) {
         let Ok(frame) = parse_full_frame_packet(packet) else {
@@ -440,7 +637,14 @@ fn route_established(
         };
         let local_call = frame.header.destination_call_number;
         let remote_call = frame.header.source_call_number;
-        match router.route_call_at(remote, local_call, remote_call, packet, arrived_at) {
+        match router.route_call_at_received(
+            remote,
+            local_call,
+            remote_call,
+            packet,
+            arrived_at,
+            receipt,
+        ) {
             // Admission is not protocol validation: even HANGUP may be dropped
             // or rejected by its peer. Only released-generation reaping retires a route.
             Ok(()) | Err(PeerIngressRouterError::Full) => true,
@@ -451,11 +655,12 @@ fn route_established(
         let Ok(frame) = parse_mini_frame(packet) else {
             return false;
         };
-        match router.route_remote_call_at(
+        match router.route_remote_call_at_received(
             remote,
             frame.header.source_call_number,
             packet,
             arrived_at,
+            receipt,
         ) {
             Ok(()) | Err(PeerIngressRouterError::Full) => true,
             Err(PeerIngressRouterError::UnknownPeer) => false,
@@ -475,6 +680,27 @@ fn valid_local_nodes(nodes: &[String]) -> bool {
             .any(|(index, node)| nodes[..index].contains(node))
 }
 
+fn valid_accounts(accounts: &[AccountConfig]) -> bool {
+    accounts.len() <= MAX_ACCOUNTS
+        && accounts.iter().enumerate().all(|(index, account)| {
+            account.valid()
+                && !accounts[..index].iter().any(|previous| {
+                    previous.id == account.id
+                        || (previous.remote == account.remote
+                            && previous.username == account.username)
+                })
+        })
+}
+
+impl Drop for InboundIaxListener {
+    fn drop(&mut self) {
+        self.life.retire();
+        for account in &self.accounts {
+            account.life.retire();
+        }
+    }
+}
+
 fn called_node(packet: &[u8]) -> Option<&str> {
     let frame = parse_full_frame_packet(packet).ok()?;
     let elements = parse_information_elements(frame.payload).ok()?;
@@ -486,7 +712,7 @@ fn called_node(packet: &[u8]) -> Option<&str> {
 }
 
 fn send_reply(
-    endpoint: &UdpEndpoint,
+    endpoint: &SharedSocket,
     packet: &[u8],
     remote: SocketAddr,
 ) -> Result<(), ListenerError> {

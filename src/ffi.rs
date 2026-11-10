@@ -12,9 +12,13 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     path::PathBuf,
     ptr, slice, str,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
+
+#[path = "provider_ffi.rs"]
+mod provider;
+pub use provider::*;
 
 /// Exact C-client ABI revision.
 pub const RPTADV_IAX2_CLIENT_ABI_VERSION: u32 = 2;
@@ -42,6 +46,55 @@ pub const RPTADV_IAX2_EVENT_RADIO_UNKEY: u32 = 6;
 /// Ordered missing source samples; length is a count, not a PCM-buffer size.
 /// Only peers explicitly configured with the jitter capability emit this event.
 pub const RPTADV_IAX2_EVENT_GAP: u32 = 7;
+/// No fresh PCM/gap until actual previous owners retire and acknowledge the target epoch.
+pub const RPTADV_IAX2_EVENT_DISCONTINUITY: u32 = 8;
+/// born_ns is genuine, qualified original kernel receipt mapped to the supplied Host clock.
+pub const RPTADV_IAX2_TIMED_BIRTH: u32 = 1;
+/// media_epoch is a pending retirement TARGET; private control may still be returned.
+pub const RPTADV_IAX2_TIMED_DISCONTINUITY: u32 = 2;
+
+/// Sized ABI1 in/out timing record. Inputs are retained, all output fields cleared on entry.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct rptadv_iax2_timed_event_v1 {
+    /// Readable/writable size, at least72 on native64. Larger tails remain untouched.
+    pub struct_size: u32,
+    /// One.
+    pub abi_version: u32,
+    /// INPUT stable nonzero Host monotonic clock identity.
+    pub host_clock_epoch: u64,
+    /// INPUT Host time captured BEFORE provider entry; never consumer-now restamped.
+    pub reference_now_ns: u64,
+    /// INPUT TARGET epoch acknowledged only after actual previous media owners retire.
+    pub acknowledged_media_epoch: u64,
+    /// OUTPUT ordinary event or discontinuity.
+    pub event_kind: u32,
+    /// OUTPUT optional qualified birth and/or pending discontinuity bits.
+    pub flags: u32,
+    /// OUTPUT PCM/gap samples, text bytes, or required PCM capacity on return1.
+    pub event_length: usize,
+    /// OUTPUT media epoch or pending retirement target; stale ack never releases a newer one.
+    pub media_epoch: u64,
+    /// OUTPUT per-epoch playout PCM cursor, including gaps/insertion; not a wire/DTMF interval.
+    pub source_start: u64,
+    /// OUTPUT immutable conservative original birth. Valid ONLY with TIMED_BIRTH.
+    pub born_ns: u64,
+}
+
+/// Immutable ABI1 prepared-packet expiry, retained unchanged across WouldBlock.
+#[repr(C)]
+pub struct rptadv_iax2_timed_send_v1 {
+    /// Complete readable record, at least24 bytes on native64.
+    pub struct_size: u32,
+    /// One.
+    pub abi_version: u32,
+    /// Exact completed egress retirement token, independent of receive epochs.
+    pub egress_epoch: u64,
+    /// Absolute deadline in peer elapsed milliseconds; saturation never qualifies.
+    pub deadline_ms: u32,
+    /// Zero.
+    pub reserved: u32,
+}
 
 /// One explicit bidirectional neutral profile and its trusted provider path.
 #[repr(C)]
@@ -204,6 +257,32 @@ pub struct rptadv_iax2_client_descriptor_v2 {
     pub dial_account: Option<
         unsafe extern "C" fn(*const rptadv_iax2_account_dial_options_v1, *mut *mut c_void) -> i32,
     >,
+    /// Optional tail offset136/full144 on native64. Old136byte descriptors remain valid.
+    /// Exclusive peer owner only; use this OR legacy poll, never alternate after activation.
+    pub poll_timed: Option<
+        unsafe extern "C" fn(
+            *mut c_void,
+            *mut f32,
+            usize,
+            *mut u8,
+            usize,
+            *mut rptadv_iax2_timed_event_v1,
+        ) -> i32,
+    >,
+    /// Optional offset144/full152:0 Accepted,1 WouldBlock,2 Expired; negative failure.
+    pub send_prepared_audio_timed: Option<
+        unsafe extern "C" fn(
+            *mut c_void,
+            *const u8,
+            usize,
+            u32,
+            u32,
+            *const rptadv_iax2_timed_send_v1,
+        ) -> i32,
+    >,
+    /// Optional offset152/full160:0 completed local retirement/new epoch,1 Pending.
+    /// Clears epoch output on failure/Pending; no remote delivery/ACK is claimed.
+    pub retire_egress: Option<unsafe extern "C" fn(*mut c_void, *mut u64) -> i32>,
 }
 
 /// Caller-owned options for a single UDP endpoint serving configured local nodes.
@@ -223,6 +302,10 @@ pub struct rptadv_iax2_server_options_v2 {
     pub local_nodes_length: usize,
     /// Catalog retained independently by the listener and admitted codec contexts.
     pub catalog: *const c_void,
+    /// Optional tail: copied provider account array; requires the full64byte options.
+    pub accounts: *const rptadv_iax2_provider_account_v1,
+    /// Provider account count, bounded by the library's documented maximum64.
+    pub account_count: usize,
 }
 
 /// Product callback allowing one authenticated inbound node/source pair.
@@ -274,6 +357,29 @@ pub struct rptadv_iax2_server_descriptor_v2 {
     pub set_local_nodes: Option<unsafe extern "C" fn(*mut c_void, *const u8, usize) -> i32>,
     /// Destroy one uniquely owned listener.
     pub destroy: Option<unsafe extern "C" fn(*mut c_void)>,
+    /// Optional tail: atomically copy/reconfigure provider accounts.
+    pub configure_accounts: Option<
+        unsafe extern "C" fn(*mut c_void, *const rptadv_iax2_provider_account_v1, usize) -> i32,
+    >,
+    /// Optional tail: register, refresh or release using this listener's socket.
+    pub register_account: Option<
+        unsafe extern "C" fn(
+            *mut c_void,
+            *const rptadv_iax2_registration_options_v1,
+            *mut rptadv_iax2_registration_result_v1,
+        ) -> i32,
+    >,
+    /// Optional tail: mixed numeric/provider poll with distinct admission callbacks.
+    pub poll_accounts: Option<RptadvIax2PollAccountsV1>,
+    /// Optional tail: select a configured account/generation, not replacement credentials.
+    pub dial_provider_account: Option<
+        unsafe extern "C" fn(
+            *mut c_void,
+            *const rptadv_iax2_provider_dial_options_v1,
+            *mut *mut c_void,
+            *mut rptadv_iax2_provider_call_receipt_v1,
+        ) -> i32,
+    >,
 }
 
 const DESCRIPTOR: rptadv_iax2_client_descriptor_v2 = rptadv_iax2_client_descriptor_v2 {
@@ -294,6 +400,9 @@ const DESCRIPTOR: rptadv_iax2_client_descriptor_v2 = rptadv_iax2_client_descript
     send_prepared_audio: Some(send_prepared_audio),
     elapsed_ms: Some(elapsed_ms),
     dial_account: Some(dial_account),
+    poll_timed: Some(poll_timed),
+    send_prepared_audio_timed: Some(send_prepared_audio_timed),
+    retire_egress: Some(retire_egress),
 };
 
 const SERVER_DESCRIPTOR: rptadv_iax2_server_descriptor_v2 = rptadv_iax2_server_descriptor_v2 {
@@ -304,6 +413,10 @@ const SERVER_DESCRIPTOR: rptadv_iax2_server_descriptor_v2 = rptadv_iax2_server_d
     poll: Some(server_poll),
     set_local_nodes: Some(server_set_local_nodes),
     destroy: Some(server_destroy),
+    configure_accounts: Some(provider::configure_accounts),
+    register_account: Some(provider::register_account),
+    poll_accounts: Some(provider::poll_accounts),
+    dial_provider_account: Some(provider::dial_provider_account),
 };
 
 #[cfg(test)]
@@ -322,7 +435,7 @@ pub extern "C" fn rptadv_iax2_server_descriptor_v2() -> *const rptadv_iax2_serve
     &SERVER_DESCRIPTOR
 }
 
-struct ServerHandle(crate::server::InboundIaxListener);
+struct ServerHandle(Mutex<crate::server::InboundIaxListener>);
 
 unsafe extern "C" fn open_catalog(
     selections: *const rptadv_iax2_codec_selection_v2,
@@ -407,10 +520,13 @@ pub(crate) unsafe fn server_enable_async(
     runtime: std::sync::Arc<tokio::runtime::Runtime>,
 ) -> i32 {
     boundary(-1, || {
-        let Some(server) = (unsafe { handle.cast::<ServerHandle>().as_mut() }) else {
+        let Some(server) = (unsafe { handle.cast::<ServerHandle>().as_ref() }) else {
             return -1;
         };
-        async_enable_status(server.0.enable_async(runtime))
+        let Ok(mut listener) = server.0.lock() else {
+            return -1;
+        };
+        async_enable_status(listener.enable_async(runtime))
     })
 }
 
@@ -425,36 +541,7 @@ unsafe extern "C" fn server_bind(
     options: *const rptadv_iax2_server_options_v2,
     output: *mut *mut c_void,
 ) -> i32 {
-    boundary(-1, || {
-        let Some(output) = (unsafe { output.as_mut() }) else {
-            return -1;
-        };
-        *output = ptr::null_mut();
-        let Some(options) = (unsafe { sized_ref(options) }) else {
-            return -1;
-        };
-        if options.abi_version != RPTADV_IAX2_SERVER_ABI_VERSION {
-            return -1;
-        }
-        let Some(catalog) = (unsafe { clone_catalog(options.catalog) }) else {
-            return -1;
-        };
-        let (Some(address), Some(nodes)) = (
-            unsafe { utf8(options.bind_address, options.bind_address_length) }
-                .and_then(|text| text.parse::<SocketAddr>().ok()),
-            unsafe { utf8(options.local_nodes, options.local_nodes_length) },
-        ) else {
-            return -1;
-        };
-        let local_nodes = nodes.split(',').map(str::to_owned).collect::<Vec<_>>();
-        match crate::server::InboundIaxListener::bind_with_catalog(address, &local_nodes, catalog) {
-            Ok(listener) => {
-                *output = Box::into_raw(Box::new(ServerHandle(listener))).cast();
-                0
-            }
-            Err(_) => -1,
-        }
-    })
+    boundary(-1, || unsafe { provider::bind(options, output) })
 }
 
 unsafe extern "C" fn server_poll(
@@ -464,58 +551,7 @@ unsafe extern "C" fn server_poll(
     accept: Option<RptadvIax2AcceptV1>,
     context: *mut c_void,
 ) -> i32 {
-    boundary(-1, || {
-        let Some(server) = (unsafe { handle.cast::<ServerHandle>().as_mut() }) else {
-            return -1;
-        };
-        let accepted = accept.is_some();
-        let event = server
-            .0
-            .poll_with_identity(now_seconds, |local, remote, remote_address| {
-                let Some(authorize) = authorize.filter(|_| accepted) else {
-                    return false;
-                };
-                let source = remote_address.ip().to_string();
-                unsafe {
-                    authorize(
-                        context,
-                        local.as_ptr(),
-                        local.len(),
-                        remote.as_ptr(),
-                        remote.len(),
-                        source.as_ptr(),
-                        source.len(),
-                    ) == 0
-                }
-            });
-        let Ok(event) = event else {
-            return -1;
-        };
-        let had_datagram = !matches!(&event, crate::server::ListenerEvent::None);
-        if let crate::server::ListenerEvent::Accepted(peer) = event {
-            let accept = accept.expect("admission requires an accept callback");
-            let local = peer.local_node.clone();
-            let remote = peer.remote_node.clone();
-            let source = peer.remote.ip().to_string();
-            let peer = Box::into_raw(Box::new((*peer).into_peer())).cast();
-            let result = unsafe {
-                accept(
-                    context,
-                    local.as_ptr(),
-                    local.len(),
-                    remote.as_ptr(),
-                    remote.len(),
-                    source.as_ptr(),
-                    source.len(),
-                    peer,
-                )
-            };
-            if result != 0 {
-                unsafe { drop(Box::from_raw(peer.cast::<IaxPeer>())) };
-            }
-        }
-        i32::from(had_datagram)
-    })
+    unsafe { provider::poll_accounts(handle, now_seconds, authorize, accept, None, None, context) }
 }
 
 unsafe extern "C" fn server_destroy(handle: *mut c_void) {
@@ -533,14 +569,20 @@ unsafe extern "C" fn server_set_local_nodes(
 ) -> i32 {
     boundary(-1, || {
         let (Some(server), Some(nodes)) =
-            (unsafe { handle.cast::<ServerHandle>().as_mut() }, unsafe {
+            (unsafe { handle.cast::<ServerHandle>().as_ref() }, unsafe {
                 utf8(nodes, length)
             })
         else {
             return -1;
         };
-        let nodes = nodes.split(',').map(str::to_owned).collect::<Vec<_>>();
-        server.0.set_local_nodes(&nodes).map_or_else(|_| -1, |_| 0)
+        let nodes = if nodes.is_empty() {
+            Vec::new()
+        } else {
+            nodes.split(',').map(str::to_owned).collect::<Vec<_>>()
+        };
+        server.0.lock().map_or(-1, |mut listener| {
+            listener.set_local_nodes(&nodes).map_or_else(|_| -1, |_| 0)
+        })
     })
 }
 
@@ -799,58 +841,199 @@ unsafe extern "C" fn poll(
         else {
             return -1;
         };
-        match peer.poll_event(samples, text) {
-            Ok(IaxPeerEvent::None) => 0,
-            Ok(IaxPeerEvent::Audio(count)) => {
-                *event_kind = RPTADV_IAX2_EVENT_AUDIO;
-                *event_length = count;
-                0
-            }
-            Ok(IaxPeerEvent::Gap(count)) => {
-                *event_kind = RPTADV_IAX2_EVENT_GAP;
-                *event_length = count;
-                0
-            }
-            Ok(IaxPeerEvent::Text(count)) => {
-                *event_kind = RPTADV_IAX2_EVENT_TEXT;
-                *event_length = count;
-                0
-            }
-            Ok(IaxPeerEvent::Digit(digit)) => {
-                *text
-                    .first_mut()
-                    .expect("IAX peer only returns digits when text storage is available") = digit;
-                *event_kind = RPTADV_IAX2_EVENT_DIGIT;
-                *event_length = 1;
-                0
-            }
-            Ok(IaxPeerEvent::Hangup) => {
-                report_poll_error(peer, &DialError::Hangup);
-                *event_kind = RPTADV_IAX2_EVENT_HANGUP;
-                0
-            }
-            Ok(IaxPeerEvent::RadioKey) => {
-                *event_kind = RPTADV_IAX2_EVENT_RADIO_KEY;
-                0
-            }
-            Ok(IaxPeerEvent::RadioUnkey) => {
-                *event_kind = RPTADV_IAX2_EVENT_RADIO_UNKEY;
-                0
-            }
-            Err(DialError::Provider(error))
-                if error.status == crate::codec::providers::Status::OutputFull =>
-            {
-                // The pending native decode/PLC operation has not consumed its
-                // source span. Let the owner retry with sufficient storage.
-                *event_length = error.required_capacity;
-                1
-            }
-            Err(error) => {
-                report_poll_error(peer, &error);
-                -1
-            }
+        let event = peer.poll_event(samples, text);
+        render_poll(peer, event, text, event_kind, event_length)
+    })
+}
+
+unsafe extern "C" fn send_prepared_audio_timed(
+    peer: *mut c_void,
+    bytes: *const u8,
+    count: usize,
+    packet_frames: u32,
+    timestamp_ms: u32,
+    timing: *const rptadv_iax2_timed_send_v1,
+) -> i32 {
+    boundary(-1, || {
+        if timing.is_null()
+            || unsafe { timing.cast::<u32>().read() }
+                < size_of::<rptadv_iax2_timed_send_v1>() as u32
+        {
+            return -1;
+        }
+        let timing = unsafe { &*timing };
+        if timing.abi_version != 1 || timing.reserved != 0 {
+            return -1;
+        }
+        let (Some(peer), Some(bytes)) = (unsafe { peer.cast::<IaxPeer>().as_mut() }, unsafe {
+            input_slice(bytes, count)
+        }) else {
+            return -1;
+        };
+        match peer.send_prepared_audio_timed(
+            bytes,
+            packet_frames,
+            timestamp_ms,
+            crate::client::EgressTime {
+                epoch: timing.egress_epoch,
+                deadline_ms: timing.deadline_ms,
+            },
+        ) {
+            Ok(crate::client::TimedMediaSend::Accepted) => 0,
+            Ok(crate::client::TimedMediaSend::WouldBlock) => 1,
+            Ok(crate::client::TimedMediaSend::Expired) => 2,
+            Err(_) => -1,
         }
     })
+}
+unsafe extern "C" fn retire_egress(peer: *mut c_void, epoch: *mut u64) -> i32 {
+    boundary(-1, || {
+        let Some(epoch) = (unsafe { epoch.as_mut() }) else {
+            return -1;
+        };
+        *epoch = 0;
+        let Some(peer) = (unsafe { peer.cast::<IaxPeer>().as_mut() }) else {
+            return -1;
+        };
+        match peer.retire_egress() {
+            Ok(crate::client::EgressRetirement::Complete(completed)) => {
+                *epoch = completed;
+                0
+            }
+            Ok(crate::client::EgressRetirement::Pending) => 1,
+            Err(_) => -1,
+        }
+    })
+}
+
+unsafe extern "C" fn poll_timed(
+    peer: *mut c_void,
+    samples: *mut f32,
+    sample_capacity: usize,
+    text: *mut u8,
+    text_capacity: usize,
+    record: *mut rptadv_iax2_timed_event_v1,
+) -> i32 {
+    boundary(-1, || {
+        // Read only the physical size prefix before ever forming a full record reference.
+        if record.is_null()
+            || unsafe { record.cast::<u32>().read() }
+                < size_of::<rptadv_iax2_timed_event_v1>() as u32
+        {
+            return -1;
+        }
+        let record = unsafe { &mut *record };
+        record.event_kind = RPTADV_IAX2_EVENT_NONE;
+        record.flags = 0;
+        record.event_length = 0;
+        record.media_epoch = 0;
+        record.source_start = 0;
+        record.born_ns = 0;
+        if record.abi_version != 1 {
+            return -1;
+        }
+        let (Some(peer), Some(samples), Some(text)) = (
+            unsafe { peer.cast::<IaxPeer>().as_mut() },
+            unsafe { output_slice(samples, sample_capacity) },
+            unsafe { output_slice(text, text_capacity) },
+        ) else {
+            return -1;
+        };
+        let input = crate::client::SourceTimeInput {
+            host_clock_epoch: record.host_clock_epoch,
+            reference_now_ns: record.reference_now_ns,
+            acknowledged_media_epoch: record.acknowledged_media_epoch,
+        };
+        let event = match peer.poll_timed(samples, text, input) {
+            Ok(event) => {
+                record.media_epoch = event.media_epoch;
+                record.source_start = event.source_start;
+                if let Some(birth) = event.born_ns {
+                    record.born_ns = birth;
+                    record.flags |= RPTADV_IAX2_TIMED_BIRTH;
+                }
+                if event.discontinuity {
+                    record.flags |= RPTADV_IAX2_TIMED_DISCONTINUITY;
+                }
+                Ok(event.event)
+            }
+            Err(error) => Err(error),
+        };
+        let result = render_poll(
+            peer,
+            event,
+            text,
+            &mut record.event_kind,
+            &mut record.event_length,
+        );
+        if result == 0
+            && record.event_kind == RPTADV_IAX2_EVENT_NONE
+            && record.flags & RPTADV_IAX2_TIMED_DISCONTINUITY != 0
+        {
+            record.event_kind = RPTADV_IAX2_EVENT_DISCONTINUITY;
+        }
+        result
+    })
+}
+
+fn render_poll(
+    peer: &mut IaxPeer,
+    event: Result<IaxPeerEvent, DialError>,
+    text: &mut [u8],
+    event_kind: &mut u32,
+    event_length: &mut usize,
+) -> i32 {
+    match event {
+        Ok(IaxPeerEvent::None) => 0,
+        Ok(IaxPeerEvent::Audio(count)) => {
+            *event_kind = RPTADV_IAX2_EVENT_AUDIO;
+            *event_length = count;
+            0
+        }
+        Ok(IaxPeerEvent::Gap(count)) => {
+            *event_kind = RPTADV_IAX2_EVENT_GAP;
+            *event_length = count;
+            0
+        }
+        Ok(IaxPeerEvent::Text(count)) => {
+            *event_kind = RPTADV_IAX2_EVENT_TEXT;
+            *event_length = count;
+            0
+        }
+        Ok(IaxPeerEvent::Digit(digit)) => {
+            *text
+                .first_mut()
+                .expect("IAX peer only returns digits when text storage is available") = digit;
+            *event_kind = RPTADV_IAX2_EVENT_DIGIT;
+            *event_length = 1;
+            0
+        }
+        Ok(IaxPeerEvent::Hangup) => {
+            report_poll_error(peer, &DialError::Hangup);
+            *event_kind = RPTADV_IAX2_EVENT_HANGUP;
+            0
+        }
+        Ok(IaxPeerEvent::RadioKey) => {
+            *event_kind = RPTADV_IAX2_EVENT_RADIO_KEY;
+            0
+        }
+        Ok(IaxPeerEvent::RadioUnkey) => {
+            *event_kind = RPTADV_IAX2_EVENT_RADIO_UNKEY;
+            0
+        }
+        Err(DialError::Provider(error))
+            if error.status == crate::codec::providers::Status::OutputFull =>
+        {
+            // The pending native decode/PLC operation has not consumed its
+            // source span. Let the owner retry with sufficient storage.
+            *event_length = error.required_capacity;
+            1
+        }
+        Err(error) => {
+            report_poll_error(peer, &error);
+            -1
+        }
+    }
 }
 
 /// Log the first terminal cause unless local hangup already suppressed it.

@@ -21,6 +21,13 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "client_timed.rs"]
+mod timed;
+pub use timed::{SourceTimeInput, TimedPeerEvent};
+#[path = "client_egress.rs"]
+mod egress;
+pub use egress::{EgressRetirement, EgressTime, TimedMediaSend};
+
 const IE_CALLED_NUMBER: u8 = 1;
 const IE_CALLING_NUMBER: u8 = 2;
 const IE_CALLING_ANI: u8 = 3;
@@ -46,6 +53,7 @@ struct PendingEvent {
 struct PacketPcm {
     samples: Vec<f32>,
     position: usize,
+    span: crate::source_time::Span,
 }
 impl PacketPcm {
     fn remaining(&self) -> usize {
@@ -152,9 +160,13 @@ pub struct IaxPeer {
     pending_replies: VecDeque<Vec<u8>>,
     pending_events: VecDeque<PendingEvent>,
     direct_pcm: PacketPcm,
+    incoming_receipt: Option<crate::source_time::Receipt>,
+    timed: timed::State,
+    egress: egress::State,
     answered: bool,
     voice_epoch: Option<u32>,
     release_on_drop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    provider_ownership: Option<crate::provider::Ownership>,
     async_attached: bool,
     // None preserves polling for callers that never supply scheduling deadlines.
     product_deadline: Option<Option<Instant>>,
@@ -173,6 +185,13 @@ struct SendStatistics {
     retries: u64,
 }
 
+type ReceivedPacket = (
+    usize,
+    SocketAddr,
+    Instant,
+    Option<crate::source_time::Receipt>,
+);
+
 enum PeerEndpoint {
     Dedicated(UdpEndpoint),
     Shared {
@@ -182,13 +201,30 @@ enum PeerEndpoint {
     },
 }
 
+pub(crate) struct SharedDial {
+    pub control: crate::server::ListenerControl,
+    pub(crate) socket: std::sync::Arc<SharedSocket>,
+    pub(crate) ingress: IngressConsumer,
+    pub(crate) local: SocketAddr,
+    pub(crate) released: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) ownership: crate::provider::Ownership,
+    pub(crate) deadline: Instant,
+}
+
 /// Receive ownership transferred once from a dedicated socket to its Tokio pump.
 type SocketIngress = (
     std::sync::Arc<tokio::net::UdpSocket>,
     crate::ingress::IngressProducer,
+    std::sync::Arc<SharedSocket>,
 );
 
 impl PeerEndpoint {
+    fn clock_revoked(&self) -> bool {
+        match self {
+            Self::Dedicated(endpoint) => endpoint.shared_socket().source_clock.revoked(),
+            Self::Shared { socket, .. } => socket.source_clock.revoked(),
+        }
+    }
     fn send_to(&self, packet: &[u8], remote: SocketAddr) -> io::Result<usize> {
         #[cfg(test)]
         unit_tests::send_fault(remote)?;
@@ -205,11 +241,23 @@ impl PeerEndpoint {
         }
     }
 
-    fn receive(&mut self, buffer: &mut [u8]) -> io::Result<Option<(usize, SocketAddr, Instant)>> {
+    fn receive(&mut self, buffer: &mut [u8]) -> io::Result<Option<ReceivedPacket>> {
         match self {
-            Self::Dedicated(endpoint) => endpoint
-                .try_receive(buffer)
-                .map(|packet| packet.map(|(length, address)| (length, address, Instant::now()))),
+            Self::Dedicated(endpoint) => {
+                endpoint
+                    .shared_socket()
+                    .receive_timed(buffer)
+                    .map(|packet| {
+                        packet.map(|(length, address, receipt)| {
+                            (
+                                length,
+                                address,
+                                receipt.map_or_else(Instant::now, |receipt| receipt.instant),
+                                receipt,
+                            )
+                        })
+                    })
+            }
             Self::Shared { ingress, .. } => {
                 let Some(datagram) = ingress.try_pop() else {
                     if ingress.failed() {
@@ -232,6 +280,7 @@ impl PeerEndpoint {
                     payload.len(),
                     datagram.remote(),
                     datagram.arrived_at(),
+                    datagram.receipt(),
                 )))
             }
         }
@@ -311,6 +360,14 @@ pub struct IaxPeerObservation {
 }
 
 impl IaxPeer {
+    pub(crate) fn ensure_provider_live(&self) -> Result<(), DialError> {
+        if let Some(ownership) = &self.provider_ownership {
+            ownership
+                .check()
+                .map_err(|_| DialError::Protocol(CallSetupError::CallFinished))?;
+        }
+        Ok(())
+    }
     pub(crate) fn begin_turn(&self) {
         // An expired uncommitted item must not leave stale writable interest.
         self.send_stats.blocked.set(false);
@@ -323,7 +380,7 @@ impl IaxPeer {
             .pending_reliable
             .iter()
             .map(|frame| {
-                if blocked {
+                if blocked || (self.egress.active && egress::payload_voice(&frame.packet)) {
                     frame.expires_at
                 } else {
                     frame.next_retry.min(frame.expires_at)
@@ -336,13 +393,18 @@ impl IaxPeer {
             .and_then(|playout| playout.deadline(now));
         // A due provider item left unconsumed by the bounded product turn means
         // inbound PCM backpressure, not idle work. Retry that work at 10 ms.
-        let provider = protocol.into_iter().chain(playout).min().map(|deadline| {
-            if deadline <= now {
-                now + crate::async_driver::TIMER_INTERVAL
-            } else {
-                deadline
-            }
-        });
+        let provider = protocol
+            .into_iter()
+            .chain(playout)
+            .chain(self.timed_deadline())
+            .min()
+            .map(|deadline| {
+                if deadline <= now {
+                    now + crate::async_driver::TIMER_INTERVAL
+                } else {
+                    deadline
+                }
+            });
         let product = self
             .product_deadline
             .unwrap_or(Some(now + crate::async_driver::TIMER_INTERVAL));
@@ -429,8 +491,16 @@ impl IaxPeer {
             .codecs
             .as_ref()
             .map_or(rate / 100, |codecs| codecs.loss_unit);
-        let jitter = unsafe { crate::jitter::Jitter::new_at_rate(descriptor, rate, loss_unit) }
-            .map_err(|_| DialError::InvalidOptions)?;
+        let jitter = if self.provider_ownership.is_some() {
+            // Both provider constructors use FormatCatalog::phone before NEW/
+            // AUTHREQ. Its verified 8 kHz G.711 coding unit divides160, so the
+            // retained Stream's20 ms packet is exactly160 frames. Identity and
+            // codec fields are private and immutable through this lifecycle.
+            unsafe { crate::jitter::Jitter::phone(descriptor) }
+        } else {
+            unsafe { crate::jitter::Jitter::new_at_rate(descriptor, rate, loss_unit) }
+        }
+        .map_err(|_| DialError::InvalidOptions)?;
         self.playout = Some(Playout::new_at_rate(jitter, self.connected_at, rate));
         Ok(())
     }
@@ -464,12 +534,12 @@ impl IaxPeer {
             .map_err(|_| io::Error::other("invalid IAX ingress capacity"))?;
         let wake = ingress.wake();
         self.endpoint = PeerEndpoint::Shared {
-            socket: shared,
+            socket: shared.clone(),
             ingress,
             local,
         };
         self.async_attached = true;
-        Ok((wake, Some((socket, producer))))
+        Ok((wake, Some((socket, producer, shared))))
     }
 
     pub(crate) fn from_inbound(
@@ -501,9 +571,13 @@ impl IaxPeer {
             pending_replies: VecDeque::new(),
             pending_events: VecDeque::new(),
             direct_pcm: PacketPcm::default(),
+            incoming_receipt: None,
+            timed: timed::State::default(),
+            egress: egress::State::default(),
             answered: true,
             voice_epoch: None,
             release_on_drop: Some(std::sync::Arc::clone(&released)),
+            provider_ownership: None,
             async_attached: false,
             product_deadline: None,
             send_stats: SendStatistics::default(),
@@ -533,6 +607,22 @@ impl IaxPeer {
             .map_err(DialError::Protocol)?;
         self.send_reliable(accept)?;
         self.send_reliable(answer)
+    }
+
+    pub(crate) fn authenticated_inbound(&mut self) -> Result<(), DialError> {
+        self.setup =
+            OutboundCallSetup::for_authenticated_inbound(self.local_call, self.remote_call)
+                .map_err(DialError::Protocol)?;
+        Ok(())
+    }
+
+    pub(crate) fn retain_route(
+        &mut self,
+        released: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        ownership: Option<crate::provider::Ownership>,
+    ) {
+        self.release_on_drop = Some(released);
+        self.provider_ownership = ownership;
     }
 
     /// Negotiated IAX codec-format bit.
@@ -607,6 +697,8 @@ impl IaxPeer {
         encoded: &mut [u8],
         flush: bool,
     ) -> Result<crate::codec::providers::EncodeResult, DialError> {
+        self.ensure_provider_live()?;
+        self.ensure_egress_preparation()?;
         self.codecs
             .as_mut()
             .ok_or(DialError::InvalidOptions)?
@@ -633,6 +725,7 @@ impl IaxPeer {
         packet_frames: u32,
         timestamp_ms: u32,
     ) -> Result<MediaSend, DialError> {
+        self.ensure_provider_live()?;
         let codecs = self.codecs.as_ref().ok_or(DialError::InvalidOptions)?;
         let span = if payload.is_empty() {
             0
@@ -654,6 +747,11 @@ impl IaxPeer {
         payload: &[u8],
         timestamp_ms: u32,
     ) -> Result<MediaSend, DialError> {
+        self.ensure_provider_live()?;
+        if self.egress.active {
+            return Err(DialError::InvalidOptions);
+        }
+        self.validate_phone_payload(payload)?;
         if payload.len() > self.maximum_datagram() - 12 {
             return Err(DialError::InvalidOptions);
         }
@@ -681,6 +779,7 @@ impl IaxPeer {
             &packet[..4 + payload.len()],
             self.remote,
             &self.send_stats,
+            self.provider_ownership.as_ref(),
         )
     }
 
@@ -689,6 +788,7 @@ impl IaxPeer {
     /// The peer retains the frame until a cumulative IAX ACK covers its sequence number and
     /// retransmits it using the bounded Asterisk-compatible retry schedule if the ACK is lost.
     pub fn send_text(&mut self, payload: &[u8]) -> Result<(), DialError> {
+        self.ensure_provider_live()?;
         self.ensure_reliable_capacity()?;
         if payload.len() > self.maximum_datagram() - 12 {
             return Err(DialError::InvalidOptions);
@@ -710,6 +810,7 @@ impl IaxPeer {
 
     /// Send one completed DTMF digit as a sequenced IAX full frame and retain it until ACKed.
     pub fn send_dtmf(&mut self, digit: u8) -> Result<(), DialError> {
+        self.ensure_provider_live()?;
         self.ensure_reliable_capacity()?;
         let packet = self
             .setup
@@ -720,6 +821,16 @@ impl IaxPeer {
 
     /// Send and retain a reliable HANGUP frame until the peer acknowledges it.
     pub fn hangup(&mut self) -> Result<(), DialError> {
+        if self
+            .provider_ownership
+            .as_ref()
+            .is_some_and(|owner| owner.check().is_err())
+        {
+            // Retirement gates retained programme/control payloads too. Only
+            // the new protocol HANGUP may leave this retired transport owner.
+            self.pending_reliable.clear();
+            self.pending_replies.clear();
+        }
         self.ensure_reliable_capacity()?;
         let packet = self
             .setup
@@ -740,7 +851,20 @@ impl IaxPeer {
         pcm: &mut [f32],
         text: &mut [u8],
     ) -> Result<IaxPeerEvent, DialError> {
+        if self.timed.enabled {
+            return Err(DialError::InvalidOptions);
+        }
+        self.poll_event_inner(pcm, text)
+    }
+
+    fn poll_event_inner(
+        &mut self,
+        pcm: &mut [f32],
+        text: &mut [u8],
+    ) -> Result<IaxPeerEvent, DialError> {
+        self.ensure_provider_live()?;
         if let Some(pending) = self.pending_events.front_mut() {
+            self.timed.last_span = pending.pcm.span.clone();
             if let Some(count) = pending.pcm.render(pcm)? {
                 if pending.pcm.remaining() == 0 {
                     self.pending_events.pop_front();
@@ -781,6 +905,7 @@ impl IaxPeer {
                                 _ => Vec::new(),
                             },
                             position: 0,
+                            span: self.timed.last_span.clone(),
                         },
                         text: match event {
                             IaxPeerEvent::Text(count) => text[..count].to_vec(),
@@ -798,8 +923,10 @@ impl IaxPeer {
         pcm: &mut [f32],
         text: &mut [u8],
     ) -> Result<IaxPeerEvent, DialError> {
+        self.ensure_provider_live()?;
         self.retry_reliable_frames()?;
         self.flush_replies()?;
+        self.timed.last_span = self.direct_pcm.span.clone();
         if let Some(count) = self.direct_pcm.render(pcm)? {
             return Ok(IaxPeerEvent::Audio(count));
         }
@@ -810,7 +937,7 @@ impl IaxPeer {
                 break;
             }
             let mut packet = [0_u8; MAX_PACKET_SIZE];
-            let Some((length, address, arrived_at)) = self
+            let Some((length, address, arrived_at, receipt)) = self
                 .endpoint
                 .receive(&mut packet)
                 .map_err(DialError::Network)?
@@ -818,7 +945,10 @@ impl IaxPeer {
                 break;
             };
             let event = if address == self.remote {
-                self.receive_event(&packet[..length], arrived_at, pcm, text)?
+                {
+                    self.incoming_receipt = receipt;
+                    self.receive_event(&packet[..length], arrived_at, pcm, text)?
+                }
             } else {
                 IaxPeerEvent::None
             };
@@ -827,11 +957,15 @@ impl IaxPeer {
             }
         }
         match &mut self.playout {
-            Some(playout) => playout.poll_with_codec(
-                Instant::now(),
-                pcm,
-                self.codecs.as_mut().map(|codecs| &mut codecs.decoder),
-            ),
+            Some(playout) => {
+                let event = playout.poll_with_codec(
+                    Instant::now(),
+                    pcm,
+                    self.codecs.as_mut().map(|codecs| &mut codecs.decoder),
+                )?;
+                self.timed.last_span = playout.last_span().clone();
+                Ok(event)
+            }
             None => Ok(IaxPeerEvent::None),
         }
     }
@@ -870,6 +1004,7 @@ impl IaxPeer {
                         .iter()
                         .filter(|pending| {
                             pending.sent
+                                && !(self.egress.active && egress::payload_voice(&pending.packet))
                                 && pending
                                     .outgoing_sequence
                                     .wrapping_sub(frame.header.incoming_sequence)
@@ -1002,13 +1137,22 @@ impl IaxPeer {
         if payload.is_empty() {
             return Ok(IaxPeerEvent::None);
         }
+        self.validate_phone_payload(payload)?;
+        if !self.accept_timed_receipt()? {
+            return Ok(IaxPeerEvent::None);
+        }
+        self.timed.last_span = crate::source_time::Span::new(self.incoming_receipt);
         if let Some(playout) = &mut self.playout {
-            playout.put_with_codec(
+            playout.put_received(
                 timestamp,
                 mini,
                 arrived_at,
                 payload,
                 self.codecs.as_ref().map(|codecs| &codecs.decoder),
+                self.timed
+                    .enabled
+                    .then_some(self.incoming_receipt)
+                    .flatten(),
             )?;
             return Ok(IaxPeerEvent::None);
         }
@@ -1032,6 +1176,7 @@ impl IaxPeer {
                         .map_err(DialError::Provider)?;
                     self.direct_pcm.samples.truncate(frames);
                     self.direct_pcm.position = 0;
+                    self.direct_pcm.span = self.timed.last_span.clone();
                     match self.direct_pcm.render(pcm)? {
                         Some(count) => Ok(IaxPeerEvent::Audio(count)),
                         None => Ok(IaxPeerEvent::Gap(required)),
@@ -1043,6 +1188,17 @@ impl IaxPeer {
                 .map(IaxPeerEvent::Audio)
                 .map_err(DialError::Decode),
         }
+    }
+
+    fn validate_phone_payload(&self, payload: &[u8]) -> Result<(), DialError> {
+        if self.provider_ownership.is_some() && !payload.is_empty() && payload.len() != 160 {
+            return Err(DialError::Provider(crate::codec::providers::Error {
+                status: crate::codec::providers::Status::Malformed,
+                required_capacity: 0,
+                operation: "phone profile requires PCMU/PCMA 8 kHz 20 ms packets",
+            }));
+        }
+        Ok(())
     }
 
     fn ensure_reliable_capacity(&self) -> Result<(), DialError> {
@@ -1066,8 +1222,13 @@ impl IaxPeer {
 
     fn flush_replies(&mut self) -> Result<(), DialError> {
         while let Some(packet) = self.pending_replies.front() {
-            if send_media(&self.endpoint, packet, self.remote, &self.send_stats)?
-                == MediaSend::WouldBlock
+            if send_media(
+                &self.endpoint,
+                packet,
+                self.remote,
+                &self.send_stats,
+                self.provider_ownership.as_ref(),
+            )? == MediaSend::WouldBlock
             {
                 break;
             }
@@ -1105,6 +1266,9 @@ impl IaxPeer {
             if now >= frame.expires_at {
                 return Err(DialError::Timeout);
             }
+            if self.egress.active && egress::payload_voice(&frame.packet) {
+                continue;
+            }
             if now < frame.next_retry {
                 continue;
             }
@@ -1121,8 +1285,13 @@ impl IaxPeer {
             } else {
                 &frame.packet
             };
-            if send_media(&self.endpoint, packet, self.remote, &self.send_stats)?
-                == MediaSend::WouldBlock
+            if send_media(
+                &self.endpoint,
+                packet,
+                self.remote,
+                &self.send_stats,
+                self.provider_ownership.as_ref(),
+            )? == MediaSend::WouldBlock
             {
                 break; // Still process inbound ACKs and control while the socket is full.
             }
@@ -1174,8 +1343,18 @@ fn send_media(
     packet: &[u8],
     remote: SocketAddr,
     stats: &SendStatistics,
+    ownership: Option<&crate::provider::Ownership>,
 ) -> Result<MediaSend, DialError> {
-    match endpoint.send_to(packet, remote) {
+    let cleanup = parse_full_frame_packet(packet)
+        .ok()
+        .is_some_and(|frame| decode_iax_command(&frame.header) == Ok(Some(IaxCommand::Hangup)));
+    let sent = match ownership.filter(|_| !cleanup) {
+        Some(owner) => owner
+            .with_live(|| endpoint.send_to(packet, remote))
+            .map_err(|_| DialError::Protocol(CallSetupError::CallFinished))?,
+        None => endpoint.send_to(packet, remote),
+    };
+    match sent {
         Ok(_) => {
             stats.datagrams.set(stats.datagrams.get().saturating_add(1));
             Ok(MediaSend::Accepted)
@@ -1193,6 +1372,9 @@ fn send_media(
 
 impl Drop for IaxPeer {
     fn drop(&mut self) {
+        if let Some(ownership) = &self.provider_ownership {
+            ownership.operation.retire();
+        }
         if let Some(released) = &self.release_on_drop {
             released.store(true, std::sync::atomic::Ordering::Release);
         }
@@ -1282,6 +1464,16 @@ pub(crate) fn dial_new(
     elements: &[InformationElement<'_>],
     catalog: Option<std::sync::Arc<FormatCatalog>>,
 ) -> Result<IaxPeer, DialError> {
+    dial_new_transport(options, elements, catalog, None, |_| Ok(()))
+}
+
+pub(crate) fn dial_new_transport(
+    options: CallRequest<'_>,
+    elements: &[InformationElement<'_>],
+    catalog: Option<std::sync::Arc<FormatCatalog>>,
+    shared: Option<SharedDial>,
+    mut promote: impl FnMut(u16) -> Result<(), DialError>,
+) -> Result<IaxPeer, DialError> {
     let started = Instant::now();
     let deadline = started
         .checked_add(options.timeout)
@@ -1289,8 +1481,46 @@ pub(crate) fn dial_new(
             options.local_call != 0 && options.local_call <= 0x7fff && !options.timeout.is_zero()
         })
         .ok_or(DialError::InvalidOptions)?;
-    let endpoint =
-        UdpEndpoint::bind(wildcard_for(options.remote.ip())).map_err(DialError::Network)?;
+    let deadline = shared
+        .as_ref()
+        .map_or(deadline, |shared| deadline.min(shared.deadline));
+    if deadline <= started {
+        return Err(DialError::Timeout);
+    }
+    let setup_sender = shared.as_ref().map(|shared| {
+        (
+            shared.control.clone(),
+            shared.socket.clone(),
+            shared.ownership.clone(),
+        )
+    });
+    let (mut endpoint, release_on_drop, provider_ownership) = match shared {
+        Some(shared) => (
+            PeerEndpoint::Shared {
+                socket: shared.socket,
+                ingress: shared.ingress,
+                local: shared.local,
+            },
+            Some(shared.released),
+            Some(shared.ownership),
+        ),
+        None => (
+            PeerEndpoint::Dedicated(
+                UdpEndpoint::bind(wildcard_for(options.remote.ip())).map_err(DialError::Network)?,
+            ),
+            None,
+            None,
+        ),
+    };
+    let send_setup = |endpoint: &PeerEndpoint, bytes: &[u8]| {
+        if let Some((control, socket, ownership)) = &setup_sender {
+            control
+                .send(socket, options.remote, bytes, ownership, deadline)
+                .map_err(crate::provider::AccountError::into_call)
+        } else {
+            send(endpoint, bytes, options.remote)
+        }
+    };
     let mut payload = serialize_information_elements(elements)
         .map_err(|error| DialError::Protocol(CallSetupError::InformationElements(error)))?;
     let capability = catalog
@@ -1310,7 +1540,7 @@ pub(crate) fn dial_new(
     let mut setup =
         OutboundCallSetup::new(options.local_call, 0, &elements).map_err(DialError::Protocol)?;
     let mut pending_packet = setup.initial_packet().to_vec();
-    send(&endpoint, &pending_packet, options.remote)?;
+    send_setup(&endpoint, &pending_packet)?;
 
     let mut retry_interval = INITIAL_RETRY;
     let mut retry_at = Instant::now() + retry_interval;
@@ -1318,9 +1548,13 @@ pub(crate) fn dial_new(
     let mut acknowledged = false;
     let mut packet = [0_u8; MAX_PACKET_SIZE];
     while Instant::now() < deadline {
-        let Some((length, address)) = endpoint
-            .try_receive(&mut packet)
-            .map_err(DialError::Network)?
+        if let Some(owner) = &provider_ownership {
+            owner
+                .check()
+                .map_err(|_| DialError::Protocol(CallSetupError::CallFinished))?;
+        }
+        let Some((length, address, _arrived_at, _receipt)) =
+            endpoint.receive(&mut packet).map_err(DialError::Network)?
         else {
             let now = Instant::now();
             if !acknowledged && now >= retry_at {
@@ -1330,7 +1564,7 @@ pub(crate) fn dial_new(
                 pending_packet = setup
                     .retransmit(&pending_packet)
                     .map_err(DialError::Protocol)?;
-                send(&endpoint, &pending_packet, options.remote)?;
+                send_setup(&endpoint, &pending_packet)?;
                 transmissions += 1;
                 retry_interval = (retry_interval * 10).min(MAX_RETRY);
                 retry_at = now + retry_interval;
@@ -1350,7 +1584,7 @@ pub(crate) fn dial_new(
             OutboundSetupResponse::NoAction => acknowledged = true,
             OutboundSetupResponse::Send(response) => {
                 acknowledged = false;
-                send(&endpoint, &response, options.remote)?;
+                send_setup(&endpoint, &response)?;
                 pending_packet = response;
                 retry_interval = INITIAL_RETRY;
                 retry_at = Instant::now() + retry_interval;
@@ -1361,7 +1595,8 @@ pub(crate) fn dial_new(
                 format,
                 acknowledgement,
             } => {
-                send(&endpoint, &acknowledgement, options.remote)?;
+                promote(remote_call)?;
+                send_setup(&endpoint, &acknowledgement)?;
                 let codecs = catalog
                     .as_ref()
                     .map(|catalog| {
@@ -1375,7 +1610,7 @@ pub(crate) fn dial_new(
                     .transpose()
                     .map_err(DialError::Provider)?;
                 let mut peer = IaxPeer {
-                    endpoint: PeerEndpoint::Dedicated(endpoint),
+                    endpoint,
                     remote: options.remote,
                     local_call: options.local_call,
                     remote_call,
@@ -1387,9 +1622,13 @@ pub(crate) fn dial_new(
                     pending_replies: VecDeque::new(),
                     pending_events: VecDeque::new(),
                     direct_pcm: PacketPcm::default(),
+                    incoming_receipt: None,
+                    timed: timed::State::default(),
+                    egress: egress::State::default(),
                     answered: false,
                     voice_epoch: None,
-                    release_on_drop: None,
+                    release_on_drop,
+                    provider_ownership,
                     async_attached: false,
                     product_deadline: None,
                     send_stats: SendStatistics::default(),
@@ -1400,7 +1639,7 @@ pub(crate) fn dial_new(
                 return Ok(peer);
             }
             OutboundSetupResponse::Rejected { acknowledgement } => {
-                send(&endpoint, &acknowledgement, options.remote)?;
+                send_setup(&endpoint, &acknowledgement)?;
                 return Err(DialError::Rejected);
             }
         }
@@ -1423,7 +1662,10 @@ fn wildcard_for(address: IpAddr) -> SocketAddr {
     )
 }
 
-fn send(endpoint: &UdpEndpoint, packet: &[u8], remote: SocketAddr) -> Result<(), DialError> {
+// This fallback is dedicated-only: SharedDial creates setup_sender and uses
+// ListenerControl::send with the exact owner/deadline above. None constructs
+// provider_ownership=None, so no provider lifetime may arrive at this helper.
+fn send(endpoint: &PeerEndpoint, packet: &[u8], remote: SocketAddr) -> Result<(), DialError> {
     endpoint
         .send_to(packet, remote)
         .map(|_| ())

@@ -159,6 +159,81 @@ fn accepted_call_without_answer_times_out() {
 }
 
 #[test]
+fn actual_early_audio_preserves_original_age_and_private_control_across_retirement() {
+    let _probe = crate::source_time::tests::timestamp_probe();
+    let (server, client, result) = dialing(Duration::from_secs(2));
+    send_acked(&server, client, &accept());
+    send_acked(&server, client, &packet(1, 2, 4, &[0xff; 160]));
+    send_acked(&server, client, &packet(2, 7, 0, b"private survives"));
+    send_acked(&server, client, &packet(3, 4, 4, &[]));
+    let mut peer = result
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap()
+        .unwrap();
+    let input = crate::client::SourceTimeInput {
+        host_clock_epoch: 1,
+        reference_now_ns: 5_000_000_000,
+        acknowledged_media_epoch: 1,
+    };
+    let first = peer
+        .poll_timed(&mut [0.0; 40], &mut [0; 32], input)
+        .unwrap();
+    assert_eq!(first.event, IaxPeerEvent::Audio(40));
+    let birth = first.born_ns.expect("actual early RX receipt");
+    let suffix = peer
+        .poll_timed(&mut [0.0; 40], &mut [0; 32], input)
+        .unwrap();
+    assert_eq!(suffix.born_ns, Some(birth));
+    assert!(peer.wait_state().deadline.is_some());
+    thread::sleep(Duration::from_millis(510));
+    let mut text = [0; 32];
+    let reset = peer.poll_timed(&mut [0.0; 160], &mut text, input).unwrap();
+    assert_eq!(
+        (reset.media_epoch, reset.event, reset.discontinuity),
+        (2, IaxPeerEvent::Text(16), true)
+    );
+    assert_eq!(&text[..16], b"private survives");
+    assert_eq!(reset.born_ns, None);
+}
+
+#[test]
+fn unexposed_early_audio_expires_at_its_original_socket_receipt_before_first_timed_poll() {
+    let _probe = crate::source_time::tests::timestamp_probe();
+    let (server, client, result) = dialing(Duration::from_secs(2));
+    send_acked(&server, client, &accept());
+    send_acked(&server, client, &packet(1, 2, 4, &[0xff; 160]));
+    send_acked(&server, client, &packet(2, 7, 0, b"private survives"));
+    thread::sleep(Duration::from_millis(510));
+    send_acked(&server, client, &packet(3, 4, 4, &[]));
+    let mut peer = result
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap()
+        .unwrap();
+    let mut text = [0; 32];
+    let event = peer
+        .poll_timed(
+            &mut [0.0; 160],
+            &mut text,
+            crate::client::SourceTimeInput {
+                host_clock_epoch: 1,
+                reference_now_ns: 5_000_000_000,
+                acknowledged_media_epoch: 1,
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        (
+            event.media_epoch,
+            event.event,
+            event.born_ns,
+            event.discontinuity
+        ),
+        (2, IaxPeerEvent::Text(16), None, true)
+    );
+    assert_eq!(&text[..16], b"private survives");
+}
+
+#[test]
 fn hangup_before_answer_never_returns_a_peer() {
     let (server, client, result) = dialing(Duration::from_secs(1));
     send_acked(&server, client, &accept());

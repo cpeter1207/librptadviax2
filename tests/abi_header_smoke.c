@@ -26,6 +26,13 @@ _Static_assert(offsetof(struct rptadv_iax2_client_descriptor_v2, elapsed_ms) ==
     24 + 12 * sizeof(void (*)(void)), "call clock tail order changed");
 _Static_assert(offsetof(struct rptadv_iax2_client_descriptor_v2, dial_account) ==
     24 + 13 * sizeof(void (*)(void)), "provider dial tail must preserve prefix");
+_Static_assert(offsetof(struct rptadv_iax2_client_descriptor_v2, poll_timed) ==
+    136, "timed poll must preserve released136 prefix");
+_Static_assert(sizeof(struct rptadv_iax2_timed_event_v1) == 72,
+    "timed source record layout differs");
+_Static_assert(offsetof(struct rptadv_iax2_client_descriptor_v2, send_prepared_audio_timed) == 144, "timed send tail order");
+_Static_assert(offsetof(struct rptadv_iax2_client_descriptor_v2, retire_egress) == 152, "egress retirement tail order");
+_Static_assert(sizeof(struct rptadv_iax2_timed_send_v1) == 24, "timed send record layout");
 
 static void *open_catalog(void)
 {

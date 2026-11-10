@@ -45,12 +45,29 @@ pub(crate) fn fail_next_receive(local: SocketAddr) {
 pub(crate) async fn receive_datagram(
     socket: &tokio::net::UdpSocket,
     bytes: &mut [u8],
-) -> io::Result<(usize, SocketAddr)> {
+    owner: Option<&crate::network::SharedSocket>,
+) -> io::Result<(usize, SocketAddr, Option<crate::source_time::Receipt>)> {
     #[cfg(test)]
     if let Some(result) = crate::network::injected_receive(socket.local_addr()?) {
-        return result;
+        return result.map(|(length, remote)| (length, remote, None));
     }
-    socket.recv_from(bytes).await
+    match owner {
+        Some(owner) => {
+            use std::os::fd::AsRawFd;
+            let ipv6 = socket.local_addr()?.is_ipv6();
+            socket
+                .async_io(tokio::io::Interest::READABLE, || {
+                    owner
+                        .source_clock
+                        .receive_fd(socket.as_raw_fd(), ipv6, bytes)
+                })
+                .await
+        }
+        None => socket
+            .recv_from(bytes)
+            .await
+            .map(|(length, remote)| (length, remote, None)),
+    }
 }
 
 /// Retains one callback until off-executor detach has observed its final completion.
@@ -198,6 +215,7 @@ impl DatagramPump {
             Arc::new(socket),
             remote,
             producer,
+            None,
         ))
     }
 
@@ -206,6 +224,7 @@ impl DatagramPump {
         socket: Arc<tokio::net::UdpSocket>,
         remote: SocketAddr,
         mut producer: IngressProducer,
+        owner: Option<Arc<crate::network::SharedSocket>>,
     ) -> Self {
         let (stop, mut stopping) = watch::channel(false);
         let task = runtime.spawn(async move {
@@ -214,13 +233,15 @@ impl DatagramPump {
             while !*stopping.borrow() {
                 tokio::select! {
                     _ = stopping.changed() => break,
-                    received = receive_datagram(&socket, &mut bytes) => {
+                    received = receive_datagram(&socket, &mut bytes, owner.as_deref()) => {
                         let arrived_at = Instant::now();
                         match received {
-                            Ok((length, source)) if source == remote => {
-                                let _ = producer.try_push_at(source, &bytes[..length], arrived_at);
+                            Ok((length, source, receipt)) if source == remote => {
+                                let arrived_at = receipt.map_or(arrived_at, |receipt| receipt.instant);
+                                let _ = producer.try_push_received(source, &bytes[..length], arrived_at, receipt);
                             }
                             Ok(_) => (),
+                            Err(error) if error.kind() == io::ErrorKind::InvalidData => (),
                             Err(_) => { producer.fail(); break; }
                         }
                     }

@@ -21,8 +21,10 @@ pub mod media;
 pub mod network;
 mod playout;
 pub mod protocol;
+pub mod provider;
 pub mod server;
 pub mod session;
+mod source_time;
 pub mod text;
 
 #[cfg(test)]
@@ -33,3 +35,6 @@ mod client_answer_tests;
 mod client_tests;
 #[cfg(test)]
 mod inbound_tests;
+
+#[cfg(test)]
+mod provider_tests;

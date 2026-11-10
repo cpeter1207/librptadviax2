@@ -23,6 +23,13 @@ impl Jitter {
         unsafe { Self::new_at_rate(descriptor, CLOCK_RATE_HZ, CONCEALMENT_SPAN) }
     }
 
+    /// Use the shared 20/40/100 ms, 160-byte profile only for phone G.711/20 ms.
+    /// # Safety
+    /// The descriptor and implementing DSO must remain valid through this context's drop.
+    pub(crate) unsafe fn phone(descriptor: *const c_void) -> Result<Self, Error> {
+        unsafe { rptadv_jitter_client::Jitter::phone(descriptor) }.map(Self)
+    }
+
     /// Apply the unchanged 160/180/500 ms policy and IAX-specific payload budget.
     /// # Safety
     /// The descriptor and implementing DSO must remain valid through this context's drop.

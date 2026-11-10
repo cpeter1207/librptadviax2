@@ -1,3 +1,17 @@
+librptadviax2 (0.1.0~alpha11) unstable; urgency=medium
+
+  * Add configured provider registration, authenticated incoming calls and
+    outgoing calls on the same listener, with exact account-generation ownership.
+  * Preserve genuine receive age through bounded media queues and expose a sized
+    timed-poll tail with explicit downstream media-retirement acknowledgments.
+  * Add deadline-bound G.711 phone transmission using Mini frames and reliable
+    empty codec markers, with independent egress retirement and expiry results.
+  * Preserve numeric ASL behavior and verify the public C ABI, both G.711 modes,
+    registration, rejection, media and cleanup against an independent Asterisk.
+  * Update the pinned Tokio dependency to 1.54.1 while retaining Rust 1.85.
+
+ -- Chris Peterson <cpeter1207@users.noreply.github.com>  Tue, 10 Nov 2026 12:40:00 +0000
+
 librptadviax2 (0.1.0~alpha10) unstable; urgency=medium
 
   * Add a sized optional provider-account dial tail with distinct credentials.

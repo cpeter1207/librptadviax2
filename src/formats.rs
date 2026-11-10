@@ -141,6 +141,32 @@ impl FormatCatalog {
         preference.sort_by_key(|id| *id != ProfileId::G711Mu);
         Ok(Self { codecs, preference })
     }
+    /// Configured phone providers deliberately expose only PCMU/PCMA at 8 kHz.
+    /// Numeric ASL and the independent generic client retain their original catalog.
+    pub(crate) fn phone(&self) -> Option<Self> {
+        use crate::codec::providers::ProfileId::{G711A, G711Mu};
+        let preference: Vec<_> = self
+            .preference
+            .iter()
+            .copied()
+            .filter(|profile| {
+                matches!(profile, G711Mu | G711A)
+                    && 160
+                        % self
+                            .codecs
+                            .profile(*profile)
+                            .expect("selected verified profile")
+                            .modes[0]
+                            .frame_samples
+                        == 0
+            })
+            .collect();
+        (!preference.is_empty()).then(|| Self {
+            codecs: self.codecs.clone(),
+            preference,
+        })
+    }
+
     /// Retained neutral provider catalog; codec state remains per connection.
     pub fn codecs(&self) -> &CodecCatalog {
         &self.codecs

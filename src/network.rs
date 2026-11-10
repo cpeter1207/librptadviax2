@@ -67,16 +67,35 @@ pub struct UdpEndpoint {
 pub(crate) struct SharedSocket {
     socket: UdpSocket,
     registered: OnceLock<Arc<tokio::net::UdpSocket>>,
+    pub(crate) source_clock: crate::source_time::SourceClock,
 }
 
 impl SharedSocket {
     pub(crate) fn new(socket: UdpSocket) -> Self {
+        let source_clock = crate::source_time::SourceClock::new();
+        // Initial timestamp capability failure leaves private control usable.
+        let _ = source_clock.enable(&socket);
         Self {
             socket,
             registered: OnceLock::new(),
+            source_clock,
         }
     }
 
+    pub(crate) fn receive_timed(
+        &self,
+        bytes: &mut [u8],
+    ) -> io::Result<Option<(usize, SocketAddr, Option<crate::source_time::Receipt>)>> {
+        #[cfg(test)]
+        if let Some(result) = injected_receive(self.local_addr()?) {
+            return result.map(|(length, remote)| Some((length, remote, None)));
+        }
+        match self.source_clock.receive(&self.socket, bytes) {
+            Ok(packet) => Ok(Some(packet)),
+            Err(error) if error.kind() == ErrorKind::WouldBlock => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
     pub(crate) fn local_addr(&self) -> io::Result<SocketAddr> {
         self.socket.local_addr()
     }
