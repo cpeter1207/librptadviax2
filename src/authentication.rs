@@ -121,7 +121,7 @@ pub fn verify_md5_authrep(challenge: &str, secrets: &str, response: &[u8]) -> bo
         .any(|secret| md5_result(challenge, secret).eq_ignore_ascii_case(response))
 }
 
-fn md5_result(challenge: &str, secret: &str) -> [u8; MD5_HEX_LENGTH] {
+pub(crate) fn md5_result(challenge: &str, secret: &str) -> [u8; MD5_HEX_LENGTH] {
     let mut hasher = Md5::new();
     hasher.update(challenge.as_bytes());
     hasher.update(secret.as_bytes());

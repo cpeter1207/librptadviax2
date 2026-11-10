@@ -556,6 +556,18 @@ impl OutboundCallSetup {
         })
     }
 
+    pub(crate) fn for_authenticated_inbound(
+        local_call: u16,
+        remote_call: u16,
+    ) -> Result<Self, CallSetupError> {
+        let mut setup = Self::for_inbound_call(local_call, remote_call)?;
+        // NEW/AUTHREP and AUTHREQ/ACCEPT each consumed two actual sequence
+        // positions. ANSWER and linked traffic continue from this exchange.
+        setup.next_outgoing = 2;
+        setup.next_incoming = 2;
+        Ok(setup)
+    }
+
     /// Construct setup state and its initial NEW packet.
     pub fn new(
         local_call: u16,

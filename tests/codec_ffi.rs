@@ -84,6 +84,8 @@ fn catalog_v2_lifetime_and_listener_reject_old_options() {
         local_nodes: b"524950".as_ptr(),
         local_nodes_length: 6,
         catalog,
+        accounts: ptr::null(),
+        account_count: 0,
     };
     let mut listener = ptr::dangling_mut::<std::ffi::c_void>();
     unsafe {

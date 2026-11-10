@@ -236,7 +236,112 @@ struct rptadv_iax2_client_descriptor_v2 {
  */
 const struct rptadv_iax2_client_descriptor_v2 *rptadv_iax2_client_descriptor_v2(void);
 
-/** Borrowed options for one UDP listener serving configured local nodes. */
+/** Borrowed UTF-8 bytes, without NUL. No input pointer is retained. */
+struct rptadv_iax2_bytes_v1 {
+    const uint8_t *data; /**< NULL only when length is zero. */
+    size_t length;       /**< Exact readable byte count. */
+};
+
+/** Fixed address value: family0 absent,4 IPv4,6 IPv6. */
+struct rptadv_iax2_endpoint_v1 {
+    uint16_t family;       /**< Independent of platform AF_* values. */
+    uint16_t port;         /**< Host-order UDP port. */
+    uint8_t address[16];   /**< Network-order IPv4 first4 or IPv6 all16 octets. */
+    uint32_t flowinfo;     /**< IPv6 flow information, otherwise zero. */
+    uint32_t scope_id;     /**< IPv6 interface scope, otherwise zero. */
+};
+
+/** Copied provider configuration. Arrays use this exact ABI1 record stride.
+ * No controls/NUL are accepted in text. Secrets are literal, including semicolons.
+ * Transport authentication never grants mailbox, command or RF authorization.
+ */
+struct rptadv_iax2_provider_account_v1 {
+    uint32_t struct_size; /**< Exactly sizeof this ABI1 record. */
+    uint32_t abi_version; /**< Exactly1. */
+    uint64_t generation; /**< Nonzero; changed settings require a new value. */
+    struct rptadv_iax2_bytes_v1 account; /**< Opaque nonempty label, at most64 bytes. */
+    struct rptadv_iax2_bytes_v1 local_binding; /**< Configured binding, at most63 bytes. */
+    struct rptadv_iax2_bytes_v1 remote_address; /**< Numeric endpoint, at most64 bytes. */
+    struct rptadv_iax2_bytes_v1 username; /**< Nonempty login, at most255 bytes. */
+    struct rptadv_iax2_bytes_v1 secret; /**< Nonempty MD5 secret, at most255 bytes. */
+    uint32_t authentication_timeout_ms; /**< Nonzero incoming authentication lifetime. */
+    uint32_t reserved; /**< Must be zero. */
+};
+
+/** Explicit registration, refresh or authenticated release; no automatic refresh. */
+struct rptadv_iax2_registration_options_v1 {
+    uint32_t struct_size; /**< Complete readable record size. */
+    uint32_t abi_version; /**< Exactly1. */
+    struct rptadv_iax2_bytes_v1 account; /**< Exact configured label. */
+    uint64_t generation; /**< Exact configured generation. */
+    uint16_t refresh; /**< Nonzero requested interval in seconds. */
+    uint16_t release; /**< Zero register/refresh, one REGREL. */
+    uint32_t timeout_ms; /**< Nonzero total operation timeout. */
+};
+
+/** Caller-sized output, cleared on failure after size validation. */
+struct rptadv_iax2_registration_result_v1 {
+    uint32_t struct_size; /**< Supplied writable size, returned provider record size. */
+    uint32_t abi_version; /**< Returned ABI1. */
+    uint16_t refresh; /**< Granted seconds; absent REFRESH defaults to60. */
+    uint16_t reserved; /**< Zero. */
+    struct rptadv_iax2_endpoint_v1 local; /**< Actual bound listener socket. */
+    struct rptadv_iax2_endpoint_v1 apparent; /**< Registrar address, family0 if absent. */
+};
+
+/** Outgoing call using configured identity, endpoint and secret. */
+struct rptadv_iax2_provider_dial_options_v1 {
+    uint32_t struct_size; /**< Complete readable record size. */
+    uint32_t abi_version; /**< Exactly1. */
+    uint64_t generation; /**< Exact configured generation. */
+    struct rptadv_iax2_bytes_v1 account; /**< Exact configured label, at most64 bytes. */
+    struct rptadv_iax2_bytes_v1 destination; /**< Nonempty, at most255 bytes. */
+    struct rptadv_iax2_bytes_v1 caller_number; /**< Optional untrusted number, at most255 bytes. */
+    struct rptadv_iax2_bytes_v1 caller_name; /**< Optional untrusted name, at most255 bytes. */
+    struct rptadv_iax2_bytes_v1 context; /**< Optional context, at most255 bytes. */
+    uint32_t timeout_ms; /**< Nonzero total setup/answer timeout. */
+    uint32_t reserved; /**< Must be zero. */
+};
+
+/** Copied-value call receipt, with no borrowed text or credentials. */
+struct rptadv_iax2_provider_call_receipt_v1 {
+    uint32_t struct_size; /**< Complete readable/writable record size. */
+    uint32_t abi_version; /**< Exactly1. */
+    uint64_t account_generation; /**< Exact configured generation. */
+    uint64_t call_generation; /**< Nonzero listener-local call ownership generation. */
+    uint64_t format; /**< Negotiated codec bit. */
+    uint16_t local_call; /**< Local15-bit call number. */
+    uint16_t remote_call; /**< Remote15-bit call number. */
+    uint32_t reserved; /**< Zero. */
+    struct rptadv_iax2_endpoint_v1 local; /**< Actual bound listener endpoint. */
+    struct rptadv_iax2_endpoint_v1 remote; /**< Actual resolved provider endpoint. */
+};
+
+/** Metadata borrowed only during one incoming callback. Caller fields are untrusted. */
+struct rptadv_iax2_provider_incoming_v1 {
+    uint32_t struct_size; /**< Complete readable record size. */
+    uint32_t abi_version; /**< Exactly1. */
+    struct rptadv_iax2_provider_call_receipt_v1 receipt; /**< Exact transport receipt. */
+    struct rptadv_iax2_bytes_v1 account; /**< Configured account. */
+    struct rptadv_iax2_bytes_v1 local_binding; /**< Configured local admission binding. */
+    struct rptadv_iax2_bytes_v1 username; /**< Authenticated transport login. */
+    struct rptadv_iax2_bytes_v1 called; /**< Untrusted called number. */
+    struct rptadv_iax2_bytes_v1 caller_number; /**< Untrusted caller, never an ASL node. */
+    struct rptadv_iax2_bytes_v1 caller_name; /**< Untrusted display name. */
+    struct rptadv_iax2_bytes_v1 context; /**< Untrusted context. */
+};
+
+/** Zero permits transport-authenticated admission; no callback pointer is retained. */
+typedef int32_t (*rptadv_iax2_provider_authorize_v1)(void *context,
+    const struct rptadv_iax2_provider_incoming_v1 *metadata);
+/** Zero transfers the unique peer, nonzero leaves provider ownership for destruction.
+ * Metadata is borrowed only during the callback. A transferred peer retains its
+ * actual server/account generation fence even if retirement races this callback.
+ */
+typedef int32_t (*rptadv_iax2_provider_accept_v1)(void *context,
+    const struct rptadv_iax2_provider_incoming_v1 *metadata, void *peer);
+
+/** Borrowed options for one UDP listener serving configured local nodes/accounts. */
 struct rptadv_iax2_server_options_v2 {
     uint32_t struct_size;             /**< Complete readable option size. */
     uint32_t abi_version;             /**< RPTADV_IAX2_SERVER_ABI_VERSION. */
@@ -245,6 +350,10 @@ struct rptadv_iax2_server_options_v2 {
     const uint8_t *local_nodes;       /**< Comma-separated decimal node numbers. */
     size_t local_nodes_length;       /**< Node-list byte count, excluding NUL. */
     const void *catalog;             /**< Catalog retained independently by listener. */
+    /** Optional tail. Old48byte options remain accepted; partial tails reject.
+     * Empty local_nodes is valid only with a nonempty valid account array. */
+    const struct rptadv_iax2_provider_account_v1 *accounts;
+    size_t account_count; /**< At most64 accounts, copied before bind returns. */
 };
 
 /** Authorize an inbound node/source pair; zero permits admission.
@@ -264,7 +373,11 @@ typedef int32_t (*rptadv_iax2_accept_v1)(void *context,
     const uint8_t *remote, size_t remote_length,
     const uint8_t *source, size_t source_length, void *peer);
 
-/** Existing one-owner synchronous listener operations; no callback is retained. */
+/** Synchronous control operations; no callback is retained. Optional operations
+ * share this listener's socket/router and source port. No control mutex is held
+ * across foreign callbacks or network/route waits, so policy may reconfigure
+ * this listener. Each peer still has one serialized media owner.
+ */
 struct rptadv_iax2_server_descriptor_v2 {
     uint32_t struct_size;    /**< Complete readable descriptor size. */
     uint32_t abi_version;    /**< RPTADV_IAX2_SERVER_ABI_VERSION. */
@@ -273,14 +386,40 @@ struct rptadv_iax2_server_descriptor_v2 {
     int32_t (*bind)(const struct rptadv_iax2_server_options_v2 *options, void **listener);
     /** Service at most one datagram; return 1 for work, 0 if idle, negative on error.
      * Both callbacks must be present to admit new calls. now_seconds is Unix time
-     * for existing call-token validation. All calls on one handle are serialized.
+     * for existing call-token validation. Provider calls cannot reach numeric policy.
      */
     int32_t (*poll)(void *listener, uint32_t now_seconds,
         rptadv_iax2_authorize_v1 authorize, rptadv_iax2_accept_v1 accept, void *context);
     /** Replace the comma-separated node list without dropping established calls. */
     int32_t (*set_local_nodes)(void *listener, const uint8_t *nodes, size_t length);
-    /** Destroy once after poll returns; NULL is harmless. */
+    /** Destroy once after all in-flight entries and callbacks return; NULL is harmless.
+     * Stop/destroy all peer owners before unloading this DSO. Retained peers keep
+     * their actual socket resources; timeout alone is not a teardown receipt. */
     void (*destroy)(void *listener);
+    /** Optional tail: check struct_size through each required function slot.
+     * Atomically validate/copy the whole replacement. Changed owners retire;
+     * their retained peers reject media until the product closes/destroys them. */
+    int32_t (*configure_accounts)(void *listener,
+        const struct rptadv_iax2_provider_account_v1 *accounts, size_t count);
+    /** Explicit register/refresh/release on this listener's source socket.
+     * Requires async server_enable. Run off-executor without a product control lock.
+     * The product drives refresh using the actual granted interval. */
+    int32_t (*register_account)(void *listener,
+        const struct rptadv_iax2_registration_options_v1 *options,
+        struct rptadv_iax2_registration_result_v1 *result);
+    /** Mixed numeric/provider admission, distinct policy and ownership callbacks.
+     * MD5 verifies before provider_authorize. Missing callbacks reject the call.
+     * Poll drives bounded pending-auth retries/expiry and released-route cleanup. */
+    int32_t (*poll_accounts)(void *listener, uint32_t now_seconds,
+        rptadv_iax2_authorize_v1 authorize, rptadv_iax2_accept_v1 accept,
+        rptadv_iax2_provider_authorize_v1 provider_authorize,
+        rptadv_iax2_provider_accept_v1 provider_accept, void *context);
+    /** Outgoing configured-account call, on the same source port as registration.
+     * Requires async server_enable. Clears peer/result on failure after validation.
+     * Existing client dial_account remains unchanged, with its own dedicated socket. */
+    int32_t (*dial_provider_account)(void *listener,
+        const struct rptadv_iax2_provider_dial_options_v1 *options, void **peer,
+        struct rptadv_iax2_provider_call_receipt_v1 *receipt);
 };
 
 /** Borrow the immutable listener table while this shared library remains loaded. */

@@ -213,6 +213,10 @@ struct PeerRoute {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum PeerRouteKey {
     Address(SocketAddr),
+    Pending {
+        remote: SocketAddr,
+        local_call: u16,
+    },
     Call {
         remote: SocketAddr,
         local_call: u16,
@@ -274,6 +278,84 @@ impl PeerIngressRouter {
         )
     }
 
+    /// Register a full-frame-only setup/control route before the remote call is known.
+    ///
+    /// Mini frames never enter this queue. The setup owner validates the full
+    /// frame identity and may promote this same queue after learning the peer call.
+    pub fn register_pending_call(
+        &mut self,
+        remote: SocketAddr,
+        local_call: u16,
+        generation: u64,
+    ) -> Result<IngressConsumer, PeerIngressRouterError> {
+        if local_call == 0 || local_call > 0x7fff {
+            return Err(PeerIngressRouterError::InvalidCallNumbers);
+        }
+        self.register_route(PeerRouteKey::Pending { remote, local_call }, generation)
+    }
+
+    /// Promote an exact pending generation without replacing its producer or consumer.
+    pub fn promote_pending_call(
+        &mut self,
+        remote: SocketAddr,
+        local_call: u16,
+        remote_call: u16,
+        generation: u64,
+    ) -> Result<(), PeerIngressRouterError> {
+        if remote_call == 0 || remote_call > 0x7fff {
+            return Err(PeerIngressRouterError::InvalidCallNumbers);
+        }
+        let pending = PeerRouteKey::Pending { remote, local_call };
+        if self
+            .routes
+            .get(&pending)
+            .is_none_or(|route| route.generation != generation)
+        {
+            return Err(PeerIngressRouterError::UnknownPeer);
+        }
+        let established = PeerRouteKey::Call {
+            remote,
+            local_call,
+            remote_call,
+        };
+        if self.routes.contains_key(&established) {
+            return Err(PeerIngressRouterError::DuplicatePeer);
+        }
+        // Removing one entry leaves capacity for its replacement. No second
+        // queue or packet copy can reorder the already received setup traffic.
+        let route = self.routes.remove(&pending).expect("checked pending route");
+        self.routes.insert(established, route);
+        Ok(())
+    }
+
+    /// Retire only the full-frame route owned by this pending generation.
+    pub fn unregister_pending_call(
+        &mut self,
+        remote: SocketAddr,
+        local_call: u16,
+        generation: u64,
+    ) -> bool {
+        self.unregister_route(PeerRouteKey::Pending { remote, local_call }, generation)
+    }
+
+    /// Retire a setup generation after either pending admission or promotion.
+    pub fn unregister_setup_call(
+        &mut self,
+        remote: SocketAddr,
+        local_call: u16,
+        generation: u64,
+    ) -> bool {
+        let before = self.routes.len();
+        self.routes.retain(|key, route| {
+            !(route.generation == generation
+                && matches!(key,
+                PeerRouteKey::Pending { remote: address, local_call: call }
+                | PeerRouteKey::Call { remote: address, local_call: call, .. }
+                    if *address == remote && *call == local_call))
+        });
+        before != self.routes.len()
+    }
+
     /// Remove one established call route after its terminal datagram was queued.
     pub fn remove_call(&mut self, remote: SocketAddr, local_call: u16, remote_call: u16) -> bool {
         self.routes
@@ -287,9 +369,11 @@ impl PeerIngressRouter {
 
     /// Whether any current peer owns this local call number.
     pub fn contains_local_call(&self, local_call: u16) -> bool {
-        self.routes.keys().any(
-            |key| matches!(key, PeerRouteKey::Call { local_call: call, .. } if *call == local_call),
-        )
+        self.routes.keys().any(|key| {
+            matches!(key,
+                PeerRouteKey::Call { local_call: call, .. }
+                | PeerRouteKey::Pending { local_call: call, .. } if *call == local_call)
+        })
     }
 
     fn register_route(
@@ -359,6 +443,10 @@ impl PeerIngressRouter {
         if self.routes.contains_key(&key) {
             return self.route_key(key, remote, payload, arrived_at);
         }
+        let pending = PeerRouteKey::Pending { remote, local_call };
+        if self.routes.contains_key(&pending) {
+            return self.route_key(pending, remote, payload, arrived_at);
+        }
         if self.has_call_routes(remote) {
             Err(PeerIngressRouterError::UnknownPeer)
         } else {
@@ -405,9 +493,11 @@ impl PeerIngressRouter {
     }
 
     fn has_call_routes(&self, remote: SocketAddr) -> bool {
-        self.routes.keys().any(
-            |key| matches!(key, PeerRouteKey::Call { remote: address, .. } if *address == remote),
-        )
+        self.routes.keys().any(|key| {
+            matches!(key,
+                PeerRouteKey::Call { remote: address, .. }
+                | PeerRouteKey::Pending { remote: address, .. } if *address == remote)
+        })
     }
 
     fn route_key(

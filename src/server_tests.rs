@@ -20,7 +20,7 @@ use std::{
     net::SocketAddr,
     sync::{Arc, atomic::AtomicBool},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 #[test]
@@ -347,9 +347,14 @@ fn reaping_keeps_an_unreleased_call_route_untouched() {
         remote_call: 42,
         generation: 7,
         released: Arc::new(AtomicBool::new(false)),
+        cleanup: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+        provider: false,
+        new_call: None,
     });
 
-    listener.reap_released_routes().unwrap();
+    listener
+        .poll(100, |_| panic!("no admission datagram"))
+        .unwrap();
 
     assert_eq!(listener.routes.len(), 1);
     assert!(listener.router.call_stats(remote, 22, 42).is_some());
@@ -367,6 +372,9 @@ fn poll_routes_established_frames_before_new_call_admission() {
         remote_call: 42,
         generation: 7,
         released: Arc::new(AtomicBool::new(false)),
+        cleanup: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+        provider: false,
+        new_call: None,
     });
     client
         .send_to(
@@ -487,6 +495,165 @@ fn finish_inbound_handshake(
     })
 }
 
+#[test]
+fn abandoned_owned_completion_hangs_up_the_actual_answered_peer() {
+    let mut listener = InboundIaxListener::bind("127.0.0.1:0".parse().unwrap(), "524950").unwrap();
+    let server = listener.local_addr().unwrap();
+    let (client, initial) = initial_new("127.0.0.1:0".parse().unwrap(), server);
+    assert!(matches!(
+        send_until_event(|| match listener.poll(100, |_| true).unwrap() {
+            ListenerEvent::None => None,
+            event => Some(event),
+        }),
+        ListenerEvent::Replied
+    ));
+    let mut bytes = [0; 1500];
+    let (length, _) = send_until_event(|| client.try_receive(&mut bytes).unwrap());
+    let retry = retry_new_call_with_token(&initial, &bytes[..length], 8).unwrap();
+    client.send_to(&retry, server).unwrap();
+    let completed = listener
+        .prepare_poll(100)
+        .unwrap()
+        .run(|_, _, _| true, |_| false)
+        .unwrap();
+    let (length, _) = send_until_event(|| client.try_receive(&mut bytes).unwrap());
+    let accepted = parse_full_frame_packet(&bytes[..length]).unwrap();
+    assert_eq!(
+        decode_iax_command(&accepted.header),
+        Ok(Some(IaxCommand::Accept))
+    );
+    assert_eq!(accepted.header.outgoing_sequence, 0);
+    let (length, _) = send_until_event(|| client.try_receive(&mut bytes).unwrap());
+    let answered = parse_full_frame_packet(&bytes[..length]).unwrap();
+    assert_eq!(
+        (
+            answered.header.frame_type,
+            answered.header.subclass,
+            answered.header.outgoing_sequence
+        ),
+        (4, 4, 1)
+    );
+    // A caller can unwind or fail to reacquire its outer control mutex after
+    // answer. This owned completion still owes cleanup until final transfer.
+    drop(completed);
+    let deadline = Instant::now() + Duration::from_millis(100);
+    let hung_up = loop {
+        if let Some((length, _)) = client.try_receive(&mut bytes).unwrap() {
+            break parse_full_frame_packet(&bytes[..length]).unwrap().header;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "answered completion dropped without HANGUP"
+        );
+        std::thread::yield_now();
+    };
+    assert_eq!(decode_iax_command(&hung_up), Ok(Some(IaxCommand::Hangup)));
+    assert_eq!(hung_up.outgoing_sequence, 2);
+    listener.poll(100, |_| false).unwrap();
+    assert!(listener.routes.is_empty());
+    assert_eq!(listener.ingress_stats().active_routes, 0);
+}
+
+#[test]
+fn provider_generation_terminal_boundary_never_reuses_a_completed_call_identity() {
+    use crate::provider::{AccountError, DialRequest};
+    use crate::provider_tests::{account, catalog, reply, runtime};
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    let mut config = account(socket.local_addr().unwrap());
+    let mut listener = InboundIaxListener::bind_accounts(
+        "127.0.0.1:0".parse().unwrap(),
+        &[],
+        std::slice::from_ref(&config),
+        Some(catalog()),
+    )
+    .unwrap();
+    listener.enable_async(runtime()).unwrap();
+    let provider = thread::spawn(move || {
+        let mut bytes = [0; 2048];
+        let (length, source) = socket.recv_from(&mut bytes).unwrap();
+        let initial = parse_full_frame_packet(&bytes[..length]).unwrap();
+        let local = initial.header.source_call_number;
+        reply(
+            &socket,
+            source,
+            local,
+            IaxCommand::Accept,
+            0,
+            1,
+            &[9, 4, 0, 0, 0, 4],
+        );
+        socket.recv_from(&mut bytes).unwrap();
+        let answer = serialize_full_frame(
+            &FullFrameHeader {
+                source_call_number: 77,
+                destination_call_number: local,
+                retransmission: false,
+                timestamp: 1,
+                outgoing_sequence: 1,
+                incoming_sequence: 1,
+                frame_type: 4,
+                subclass: 4,
+                subclass_is_log: false,
+            },
+            &[],
+        )
+        .unwrap();
+        socket.send_to(&answer, source).unwrap();
+        socket.recv_from(&mut bytes).unwrap();
+        socket
+    });
+    let request = DialRequest {
+        destination: "999".into(),
+        caller_number: "KG0BP".into(),
+        caller_name: String::new(),
+        context: String::new(),
+        timeout: Duration::from_secs(1),
+    };
+    let mut prepared = listener
+        .prepare_dial("provider-one", 7, request.clone())
+        .unwrap();
+    let call = prepared.run().unwrap();
+    assert_eq!(call.metadata.call_generation, 1);
+    let mut peer = call.into_peer();
+    let socket = provider.join().unwrap();
+    peer.hangup().unwrap();
+    drop(peer);
+    drop(prepared);
+    let mut bytes = [0; 2048];
+    let (length, _) = socket.recv_from(&mut bytes).unwrap();
+    assert_eq!(
+        decode_iax_command(&parse_full_frame_packet(&bytes[..length]).unwrap().header),
+        Ok(Some(IaxCommand::Hangup))
+    );
+    listener
+        .poll_accounts(100, |_, _, _| false, |_| false)
+        .unwrap();
+    assert!(listener.routes.is_empty());
+    // Isolated actual counter boundary, after a genuine configured call. No
+    // admission permission, route registry, or account lifetime is fabricated.
+    listener.generation = u64::MAX;
+    assert!(matches!(
+        listener.prepare_dial("provider-one", 7, request.clone()),
+        Err(AccountError::Busy)
+    ));
+    config.generation = 8;
+    listener.configure_accounts(&[config]).unwrap();
+    assert!(matches!(
+        listener.prepare_dial("provider-one", 8, request),
+        Err(AccountError::Busy)
+    ));
+    assert_eq!(listener.generation, u64::MAX);
+    assert_eq!(listener.ingress_stats().active_routes, 0);
+    socket.set_nonblocking(true).unwrap();
+    assert_eq!(
+        socket.recv_from(&mut bytes).unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+}
+
 fn full_packet(source: u16, destination: u16, subclass: u8) -> Vec<u8> {
     serialize_full_frame(
         &FullFrameHeader {
@@ -575,6 +742,9 @@ fn full_queue_hangup_keeps_route_for_retransmission_until_peer_release() {
             remote_call: 42,
             generation: 7,
             released: released.clone(),
+            cleanup: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            provider: false,
+            new_call: None,
         });
         let ack = full_packet(42, 22, IaxCommand::Ack.subclass_value() as u8);
         listener.router.route_call(remote, 22, 42, &ack).unwrap();
@@ -616,7 +786,9 @@ fn full_queue_hangup_keeps_route_for_retransmission_until_peer_release() {
         ));
         assert_eq!(listener.ingress_stats().active_routes, 1);
         released.store(true, std::sync::atomic::Ordering::Release);
-        listener.reap_released_routes().unwrap();
+        listener
+            .poll(100, |_| panic!("no admission datagram"))
+            .unwrap();
         send_until_event(|| (listener.ingress_stats().active_routes == 0).then_some(()));
         assert!(listener.routes.is_empty());
     }
@@ -633,6 +805,9 @@ fn future_sequence_hangup_cannot_retire_an_unreleased_peer_route() {
         remote_call: 42,
         generation: 7,
         released: Arc::new(AtomicBool::new(false)),
+        cleanup: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+        provider: false,
+        new_call: None,
     });
     let hangup = full_packet(42, 22, IaxCommand::Hangup.subclass_value() as u8);
     let mut header = parse_full_frame_packet(&hangup).unwrap().header;
@@ -650,7 +825,9 @@ fn future_sequence_hangup_cannot_retire_an_unreleased_peer_route() {
         decode_iax_command(&parse_full_frame_packet(&reply).unwrap().header),
         Ok(Some(IaxCommand::Vnak))
     );
-    listener.reap_released_routes().unwrap();
+    listener
+        .poll(100, |_| panic!("no admission datagram"))
+        .unwrap();
     assert_eq!(listener.ingress_stats().active_routes, 1);
     assert_eq!(listener.routes.len(), 1);
     let ping = full_packet(42, 22, IaxCommand::Ping.subclass_value() as u8);
@@ -674,6 +851,9 @@ fn existing_full_frame_and_hangup_are_routed_until_peer_release() {
         remote_call: 42,
         generation: 7,
         released: Arc::new(AtomicBool::new(false)),
+        cleanup: Arc::new(std::sync::atomic::AtomicU8::new(0)),
+        provider: false,
+        new_call: None,
     });
 
     let ack = full_packet(42, 22, IaxCommand::Ack.subclass_value() as u8);
@@ -1098,4 +1278,139 @@ fn egress_admission_router_reservation_failure_keeps_existing_peers() {
         decode_iax_command(&parse_full_frame_packet(&response[..length]).unwrap().header),
         Ok(Some(IaxCommand::Reject))
     );
+}
+
+#[test]
+fn original_outgoing_deadline_cannot_be_renewed_after_the_actual_route_install() {
+    use crate::provider::{AccountError, DialRequest};
+    let remote = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    remote.set_nonblocking(true).unwrap();
+    let config = crate::provider_tests::account(remote.local_addr().unwrap());
+    let mut listener = InboundIaxListener::bind_accounts(
+        "127.0.0.1:0".parse().unwrap(),
+        &[],
+        &[config],
+        Some(crate::provider_tests::catalog()),
+    )
+    .unwrap();
+    listener
+        .enable_async(crate::provider_tests::runtime())
+        .unwrap();
+    let mut prepared = listener
+        .prepare_dial(
+            "provider-one",
+            7,
+            DialRequest {
+                destination: "999".into(),
+                caller_number: "".into(),
+                caller_name: "".into(),
+                context: "".into(),
+                timeout: Duration::from_secs(1),
+            },
+        )
+        .unwrap();
+    prepared
+        .route
+        .install(Instant::now() + Duration::from_secs(1))
+        .unwrap();
+    // This is the same legal scheduling gap between a completed route install
+    // and common setup: the original absolute call deadline has already passed.
+    assert!(matches!(
+        prepared.route.dial(
+            crate::client::CallRequest {
+                remote: remote.local_addr().unwrap(),
+                local_call: prepared.route.local_call,
+                secret: "fixture-secret",
+                timeout: Duration::from_secs(1)
+            },
+            &[],
+            prepared.catalog.clone(),
+            Instant::now() - Duration::from_secs(1)
+        ),
+        Err(AccountError::Call(crate::client::DialError::Timeout))
+    ));
+    assert_eq!(
+        remote.recv_from(&mut [0; 2048]).unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+    drop(prepared);
+    listener
+        .poll_accounts(1000, |_, _, _| false, |_| false)
+        .unwrap();
+    assert_eq!(listener.ingress_stats().active_routes, 0);
+}
+
+type DialPublication = Box<dyn FnOnce()>;
+thread_local! { static DIAL_PUBLICATION:std::cell::RefCell<Option<(std::sync::Arc<crate::provider::Life>,DialPublication)>>=const{std::cell::RefCell::new(None)}; }
+pub(super) fn dial_checkpoint(ownership: &crate::provider::Ownership) {
+    let action = DIAL_PUBLICATION.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot
+            .as_ref()
+            .is_some_and(|(operation, _)| std::sync::Arc::ptr_eq(operation, &ownership.operation))
+        {
+            slot.take().map(|(_, action)| action)
+        } else {
+            None
+        }
+    });
+    if let Some(action) = action {
+        action();
+    }
+}
+#[test]
+fn real_account_retirement_after_answer_but_before_owned_dial_return_sends_cleanup() {
+    use crate::provider::{AccountError, DialRequest};
+    let remote = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let config = crate::provider_tests::account(remote.local_addr().unwrap());
+    let mut owner = InboundIaxListener::bind_accounts(
+        "127.0.0.1:0".parse().unwrap(),
+        &[],
+        &[config],
+        Some(crate::provider_tests::catalog()),
+    )
+    .unwrap();
+    owner
+        .enable_async(crate::provider_tests::runtime())
+        .unwrap();
+    let listener = std::sync::Arc::new(std::sync::Mutex::new(owner));
+    let mut prepared = listener
+        .lock()
+        .unwrap()
+        .prepare_dial(
+            "provider-one",
+            7,
+            DialRequest {
+                destination: "999".into(),
+                caller_number: "".into(),
+                caller_name: "".into(),
+                context: "".into(),
+                timeout: Duration::from_secs(3),
+            },
+        )
+        .unwrap();
+    let control = listener.clone();
+    DIAL_PUBLICATION.with(|slot| {
+        *slot.borrow_mut() = Some((
+            prepared.route.ownership.operation.clone(),
+            Box::new(move || control.lock().unwrap().configure_accounts(&[]).unwrap()),
+        ))
+    });
+    let (answered, _) = crate::provider_tests::answer_outgoing(remote);
+    assert!(matches!(prepared.run(), Err(AccountError::Retired)));
+    assert!(DIAL_PUBLICATION.with(|slot| slot.borrow().is_none()));
+    let socket = answered.join().unwrap();
+    let mut bytes = [0; 2048];
+    let (length, _) = socket.recv_from(&mut bytes).unwrap();
+    assert_eq!(
+        decode_iax_command(&parse_full_frame_packet(&bytes[..length]).unwrap().header),
+        Ok(Some(IaxCommand::Hangup))
+    );
+    drop(prepared);
+    listener
+        .lock()
+        .unwrap()
+        .poll_accounts(1000, |_, _, _| false, |_| false)
+        .unwrap();
+    assert_eq!(listener.lock().unwrap().ingress_stats().active_routes, 0);
 }

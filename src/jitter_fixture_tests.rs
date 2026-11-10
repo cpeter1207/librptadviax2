@@ -10,6 +10,7 @@ use std::{
 struct State {
     rate: u32,
     loss_unit: u32,
+    policy: (u32, u32, u32, u32),
     puts: Vec<(u64, u32, u64, Vec<u8>)>,
     admission: i32,
     decisions: VecDeque<(RawDecision, Vec<u8>)>,
@@ -39,6 +40,9 @@ impl Fixture {
             },
             payload.to_vec(),
         ));
+    }
+    pub(crate) fn policy(&self) -> (u32, u32, u32, u32) {
+        self.0.lock().unwrap().policy
     }
     pub(crate) fn puts(&self) -> Vec<(u64, u32, u64, Vec<u8>)> {
         self.0.lock().unwrap().puts.clone()
@@ -75,6 +79,13 @@ unsafe extern "C" fn create(config: *const Config, output: *mut *mut c_void) -> 
     let mut values = state.lock().unwrap();
     values.rate = unsafe { (*config).clock_rate_hz };
     values.loss_unit = unsafe { (*config).concealment_span };
+    let config = unsafe { &*config };
+    values.policy = (
+        config.minimum_delay,
+        config.initial_delay,
+        config.maximum_delay,
+        config.maximum_payload_bytes,
+    );
     drop(values);
     unsafe { *output = Box::into_raw(Box::new(state)).cast() };
     0

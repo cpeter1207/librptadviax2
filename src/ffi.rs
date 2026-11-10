@@ -12,9 +12,13 @@ use std::{
     panic::{AssertUnwindSafe, catch_unwind},
     path::PathBuf,
     ptr, slice, str,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
+
+#[path = "provider_ffi.rs"]
+mod provider;
+pub use provider::*;
 
 /// Exact C-client ABI revision.
 pub const RPTADV_IAX2_CLIENT_ABI_VERSION: u32 = 2;
@@ -223,6 +227,10 @@ pub struct rptadv_iax2_server_options_v2 {
     pub local_nodes_length: usize,
     /// Catalog retained independently by the listener and admitted codec contexts.
     pub catalog: *const c_void,
+    /// Optional tail: copied provider account array; requires the full64byte options.
+    pub accounts: *const rptadv_iax2_provider_account_v1,
+    /// Provider account count, bounded by the library's documented maximum64.
+    pub account_count: usize,
 }
 
 /// Product callback allowing one authenticated inbound node/source pair.
@@ -274,6 +282,29 @@ pub struct rptadv_iax2_server_descriptor_v2 {
     pub set_local_nodes: Option<unsafe extern "C" fn(*mut c_void, *const u8, usize) -> i32>,
     /// Destroy one uniquely owned listener.
     pub destroy: Option<unsafe extern "C" fn(*mut c_void)>,
+    /// Optional tail: atomically copy/reconfigure provider accounts.
+    pub configure_accounts: Option<
+        unsafe extern "C" fn(*mut c_void, *const rptadv_iax2_provider_account_v1, usize) -> i32,
+    >,
+    /// Optional tail: register, refresh or release using this listener's socket.
+    pub register_account: Option<
+        unsafe extern "C" fn(
+            *mut c_void,
+            *const rptadv_iax2_registration_options_v1,
+            *mut rptadv_iax2_registration_result_v1,
+        ) -> i32,
+    >,
+    /// Optional tail: mixed numeric/provider poll with distinct admission callbacks.
+    pub poll_accounts: Option<RptadvIax2PollAccountsV1>,
+    /// Optional tail: select a configured account/generation, not replacement credentials.
+    pub dial_provider_account: Option<
+        unsafe extern "C" fn(
+            *mut c_void,
+            *const rptadv_iax2_provider_dial_options_v1,
+            *mut *mut c_void,
+            *mut rptadv_iax2_provider_call_receipt_v1,
+        ) -> i32,
+    >,
 }
 
 const DESCRIPTOR: rptadv_iax2_client_descriptor_v2 = rptadv_iax2_client_descriptor_v2 {
@@ -304,6 +335,10 @@ const SERVER_DESCRIPTOR: rptadv_iax2_server_descriptor_v2 = rptadv_iax2_server_d
     poll: Some(server_poll),
     set_local_nodes: Some(server_set_local_nodes),
     destroy: Some(server_destroy),
+    configure_accounts: Some(provider::configure_accounts),
+    register_account: Some(provider::register_account),
+    poll_accounts: Some(provider::poll_accounts),
+    dial_provider_account: Some(provider::dial_provider_account),
 };
 
 #[cfg(test)]
@@ -322,7 +357,7 @@ pub extern "C" fn rptadv_iax2_server_descriptor_v2() -> *const rptadv_iax2_serve
     &SERVER_DESCRIPTOR
 }
 
-struct ServerHandle(crate::server::InboundIaxListener);
+struct ServerHandle(Mutex<crate::server::InboundIaxListener>);
 
 unsafe extern "C" fn open_catalog(
     selections: *const rptadv_iax2_codec_selection_v2,
@@ -407,10 +442,13 @@ pub(crate) unsafe fn server_enable_async(
     runtime: std::sync::Arc<tokio::runtime::Runtime>,
 ) -> i32 {
     boundary(-1, || {
-        let Some(server) = (unsafe { handle.cast::<ServerHandle>().as_mut() }) else {
+        let Some(server) = (unsafe { handle.cast::<ServerHandle>().as_ref() }) else {
             return -1;
         };
-        async_enable_status(server.0.enable_async(runtime))
+        let Ok(mut listener) = server.0.lock() else {
+            return -1;
+        };
+        async_enable_status(listener.enable_async(runtime))
     })
 }
 
@@ -425,36 +463,7 @@ unsafe extern "C" fn server_bind(
     options: *const rptadv_iax2_server_options_v2,
     output: *mut *mut c_void,
 ) -> i32 {
-    boundary(-1, || {
-        let Some(output) = (unsafe { output.as_mut() }) else {
-            return -1;
-        };
-        *output = ptr::null_mut();
-        let Some(options) = (unsafe { sized_ref(options) }) else {
-            return -1;
-        };
-        if options.abi_version != RPTADV_IAX2_SERVER_ABI_VERSION {
-            return -1;
-        }
-        let Some(catalog) = (unsafe { clone_catalog(options.catalog) }) else {
-            return -1;
-        };
-        let (Some(address), Some(nodes)) = (
-            unsafe { utf8(options.bind_address, options.bind_address_length) }
-                .and_then(|text| text.parse::<SocketAddr>().ok()),
-            unsafe { utf8(options.local_nodes, options.local_nodes_length) },
-        ) else {
-            return -1;
-        };
-        let local_nodes = nodes.split(',').map(str::to_owned).collect::<Vec<_>>();
-        match crate::server::InboundIaxListener::bind_with_catalog(address, &local_nodes, catalog) {
-            Ok(listener) => {
-                *output = Box::into_raw(Box::new(ServerHandle(listener))).cast();
-                0
-            }
-            Err(_) => -1,
-        }
-    })
+    boundary(-1, || unsafe { provider::bind(options, output) })
 }
 
 unsafe extern "C" fn server_poll(
@@ -464,58 +473,7 @@ unsafe extern "C" fn server_poll(
     accept: Option<RptadvIax2AcceptV1>,
     context: *mut c_void,
 ) -> i32 {
-    boundary(-1, || {
-        let Some(server) = (unsafe { handle.cast::<ServerHandle>().as_mut() }) else {
-            return -1;
-        };
-        let accepted = accept.is_some();
-        let event = server
-            .0
-            .poll_with_identity(now_seconds, |local, remote, remote_address| {
-                let Some(authorize) = authorize.filter(|_| accepted) else {
-                    return false;
-                };
-                let source = remote_address.ip().to_string();
-                unsafe {
-                    authorize(
-                        context,
-                        local.as_ptr(),
-                        local.len(),
-                        remote.as_ptr(),
-                        remote.len(),
-                        source.as_ptr(),
-                        source.len(),
-                    ) == 0
-                }
-            });
-        let Ok(event) = event else {
-            return -1;
-        };
-        let had_datagram = !matches!(&event, crate::server::ListenerEvent::None);
-        if let crate::server::ListenerEvent::Accepted(peer) = event {
-            let accept = accept.expect("admission requires an accept callback");
-            let local = peer.local_node.clone();
-            let remote = peer.remote_node.clone();
-            let source = peer.remote.ip().to_string();
-            let peer = Box::into_raw(Box::new((*peer).into_peer())).cast();
-            let result = unsafe {
-                accept(
-                    context,
-                    local.as_ptr(),
-                    local.len(),
-                    remote.as_ptr(),
-                    remote.len(),
-                    source.as_ptr(),
-                    source.len(),
-                    peer,
-                )
-            };
-            if result != 0 {
-                unsafe { drop(Box::from_raw(peer.cast::<IaxPeer>())) };
-            }
-        }
-        i32::from(had_datagram)
-    })
+    unsafe { provider::poll_accounts(handle, now_seconds, authorize, accept, None, None, context) }
 }
 
 unsafe extern "C" fn server_destroy(handle: *mut c_void) {
@@ -533,14 +491,20 @@ unsafe extern "C" fn server_set_local_nodes(
 ) -> i32 {
     boundary(-1, || {
         let (Some(server), Some(nodes)) =
-            (unsafe { handle.cast::<ServerHandle>().as_mut() }, unsafe {
+            (unsafe { handle.cast::<ServerHandle>().as_ref() }, unsafe {
                 utf8(nodes, length)
             })
         else {
             return -1;
         };
-        let nodes = nodes.split(',').map(str::to_owned).collect::<Vec<_>>();
-        server.0.set_local_nodes(&nodes).map_or_else(|_| -1, |_| 0)
+        let nodes = if nodes.is_empty() {
+            Vec::new()
+        } else {
+            nodes.split(',').map(str::to_owned).collect::<Vec<_>>()
+        };
+        server.0.lock().map_or(-1, |mut listener| {
+            listener.set_local_nodes(&nodes).map_or_else(|_| -1, |_| 0)
+        })
     })
 }
 

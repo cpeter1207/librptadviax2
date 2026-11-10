@@ -710,6 +710,7 @@ fn linked_peer(remote: SocketAddr) -> IaxPeer {
         answered: true,
         voice_epoch: None,
         release_on_drop: None,
+        provider_ownership: None,
         async_attached: false,
         product_deadline: None,
         send_stats: super::SendStatistics::default(),
@@ -1184,6 +1185,10 @@ fn jitter_composition_is_once_before_attach_and_requires_gap_aware_polling() {
     ));
     let fixture = crate::jitter::fixture::Fixture::new();
     unsafe { peer.configure_jitter(fixture.descriptor()) }.unwrap();
+    assert_eq!(
+        fixture.policy(),
+        (1280, 1440, 4000, crate::jitter::MAX_PAYLOAD as u32)
+    );
     assert!(matches!(
         unsafe { peer.configure_jitter(std::ptr::null()) },
         Err(DialError::InvalidOptions)

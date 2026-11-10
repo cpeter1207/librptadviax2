@@ -1,4 +1,326 @@
 use super::*;
+
+#[test]
+fn server_account_operations_extend_the_released_table_prefix() {
+    let descriptor = unsafe { &*rptadv_iax2_server_descriptor_v2() };
+    assert_eq!(descriptor.struct_size as usize, 88);
+    assert_eq!(
+        std::mem::offset_of!(rptadv_iax2_server_descriptor_v2, bind),
+        24
+    );
+    assert_eq!(
+        std::mem::offset_of!(rptadv_iax2_server_descriptor_v2, destroy),
+        48
+    );
+    assert_eq!(descriptor.abi_version, 2);
+    assert_eq!(DESCRIPTOR.struct_size as usize, 136);
+    assert_eq!(size_of::<rptadv_iax2_server_options_v2>(), 64);
+    assert!(descriptor.configure_accounts.is_some());
+    assert!(descriptor.register_account.is_some());
+    assert!(descriptor.poll_accounts.is_some());
+    assert!(descriptor.dial_provider_account.is_some());
+}
+
+#[test]
+fn released_48byte_bind_options_remain_readable_and_partial_account_tails_reject() {
+    #[repr(C)]
+    struct Released {
+        size: u32,
+        version: u32,
+        address: *const u8,
+        address_len: usize,
+        nodes: *const u8,
+        nodes_len: usize,
+        catalog: *const c_void,
+    }
+    let released = Released {
+        size: 48,
+        version: 2,
+        address: b"127.0.0.1:0".as_ptr(),
+        address_len: 11,
+        nodes: b"524950".as_ptr(),
+        nodes_len: 6,
+        catalog: test_catalog(),
+    };
+    assert_eq!(size_of::<Released>(), 48);
+    let mut handle = ptr::dangling_mut::<c_void>();
+    assert_eq!(
+        unsafe { server_bind(ptr::from_ref(&released).cast(), &mut handle) },
+        0
+    );
+    unsafe { server_destroy(handle) };
+    for size in 49..64 {
+        let mut options = server_options(b"127.0.0.1:0", b"524950");
+        options.struct_size = size;
+        handle = ptr::dangling_mut::<c_void>();
+        assert_eq!(unsafe { server_bind(&options, &mut handle) }, -1);
+        assert!(handle.is_null());
+    }
+}
+
+fn byte_span(value: &[u8]) -> rptadv_iax2_bytes_v1 {
+    rptadv_iax2_bytes_v1 {
+        data: value.as_ptr(),
+        length: value.len(),
+    }
+}
+
+#[test]
+fn legacy_policy_can_reconfigure_its_listener_without_deadlock_or_late_acceptance() {
+    struct State {
+        handle: *mut c_void,
+        authorized: usize,
+        accepted: usize,
+    }
+    unsafe extern "C" fn reconfigure(
+        context: *mut c_void,
+        _: *const u8,
+        _: usize,
+        _: *const u8,
+        _: usize,
+        _: *const u8,
+        _: usize,
+    ) -> i32 {
+        let state = unsafe { &mut *context.cast::<State>() };
+        state.authorized += 1;
+        unsafe { server_set_local_nodes(state.handle, b"524951".as_ptr(), 6) }
+    }
+    unsafe extern "C" fn accepted(
+        context: *mut c_void,
+        _: *const u8,
+        _: usize,
+        _: *const u8,
+        _: usize,
+        _: *const u8,
+        _: usize,
+        peer: *mut c_void,
+    ) -> i32 {
+        unsafe { &mut *context.cast::<State>() }.accepted += 1;
+        unsafe { destroy(peer) };
+        0
+    }
+    let options = server_options(b"127.0.0.1:0", b"524950");
+    let mut handle = ptr::null_mut();
+    assert_eq!(unsafe { server_bind(&options, &mut handle) }, 0);
+    let address = unsafe { &*handle.cast::<ServerHandle>() }
+        .0
+        .lock()
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
+    let setup = inbound_setup(42);
+    client.send_to(setup.initial_packet(), address).unwrap();
+    assert_eq!(
+        unsafe { server_poll(handle, 100, None, None, ptr::null_mut()) },
+        1
+    );
+    let mut bytes = [0; 2048];
+    let (length, _) = client.recv_from(&mut bytes).unwrap();
+    let retry = retry_new_call_with_token(setup.initial_packet(), &bytes[..length], 0).unwrap();
+    client.send_to(&retry, address).unwrap();
+    let mut state = State {
+        handle,
+        authorized: 0,
+        accepted: 0,
+    };
+    assert_eq!(
+        unsafe {
+            server_poll(
+                handle,
+                100,
+                Some(reconfigure),
+                Some(accepted),
+                ptr::from_mut(&mut state).cast(),
+            )
+        },
+        -1
+    );
+    assert_eq!((state.authorized, state.accepted), (1, 0));
+    client.set_nonblocking(true).unwrap();
+    assert_eq!(
+        client.recv_from(&mut bytes).unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+    assert_eq!(
+        unsafe { server_poll(handle, 100, None, None, ptr::null_mut()) },
+        0
+    );
+    assert_eq!(
+        unsafe { &*handle.cast::<ServerHandle>() }
+            .0
+            .lock()
+            .unwrap()
+            .ingress_stats()
+            .active_routes,
+        0
+    );
+    unsafe { server_destroy(handle) };
+}
+
+#[test]
+fn provider_registration_copies_credentials_and_releases_control_for_concurrent_poll() {
+    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    let address = socket.local_addr().unwrap().to_string();
+    let mut login = b"provider-login".to_vec();
+    let mut secret = b"fixture-secret".to_vec();
+    let account = rptadv_iax2_provider_account_v1 {
+        struct_size: size_of::<rptadv_iax2_provider_account_v1>() as u32,
+        abi_version: 1,
+        generation: 7,
+        account: byte_span(b"provider-one"),
+        local_binding: byte_span(b"operator-west"),
+        remote_address: byte_span(address.as_bytes()),
+        username: byte_span(&login),
+        secret: byte_span(&secret),
+        authentication_timeout_ms: 1000,
+        reserved: 0,
+    };
+    let mut options = server_options(b"127.0.0.1:0", b"");
+    options.accounts = &account;
+    options.account_count = 1;
+    let mut handle = ptr::null_mut();
+    assert_eq!(unsafe { server_bind(&options, &mut handle) }, 0);
+    let bound = unsafe { &*handle.cast::<ServerHandle>() }
+        .0
+        .lock()
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let runtime = Arc::new(
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap(),
+    );
+    assert_eq!(unsafe { server_enable_async(handle, runtime) }, 0);
+    login.fill(b'X');
+    secret.fill(b'Y');
+    drop(login);
+    drop(secret);
+    drop(address);
+    let (received, waiting) = std::sync::mpsc::channel();
+    let (continue_reply, permit_reply) = std::sync::mpsc::channel();
+    let registrar = thread::spawn(move || {
+        let mut bytes = [0; 2048];
+        let (length, source) = socket.recv_from(&mut bytes).unwrap();
+        assert_eq!(source, bound);
+        let first = crate::protocol::parse_full_frame_packet(&bytes[..length]).unwrap();
+        let local_call = first.header.source_call_number;
+        let ies = crate::information_elements::parse_information_elements(first.payload).unwrap();
+        assert_eq!(
+            ies.iter().find(|ie| ie.kind == 6).unwrap().data,
+            b"provider-login"
+        );
+        received.send(()).unwrap();
+        permit_reply.recv_timeout(Duration::from_secs(1)).unwrap();
+        let auth = crate::information_elements::serialize_information_elements(&[
+            InformationElement {
+                kind: 6,
+                data: b"provider-login",
+            },
+            InformationElement {
+                kind: 14,
+                data: &[0, 2],
+            },
+            InformationElement {
+                kind: 15,
+                data: b"nonce",
+            },
+        ])
+        .unwrap();
+        let header = FullFrameHeader {
+            source_call_number: 77,
+            destination_call_number: local_call,
+            retransmission: false,
+            timestamp: 0,
+            outgoing_sequence: 0,
+            incoming_sequence: 1,
+            frame_type: 6,
+            subclass: 14,
+            subclass_is_log: false,
+        };
+        socket
+            .send_to(&serialize_full_frame(&header, &auth).unwrap(), source)
+            .unwrap();
+        let (length, _) = socket.recv_from(&mut bytes).unwrap();
+        let packet = crate::protocol::parse_full_frame_packet(&bytes[..length]).unwrap();
+        let ies = crate::information_elements::parse_information_elements(packet.payload).unwrap();
+        assert!(crate::authentication::verify_md5_authrep(
+            "nonce",
+            "fixture-secret",
+            ies.iter().find(|ie| ie.kind == 16).unwrap().data
+        ));
+        let header = FullFrameHeader {
+            outgoing_sequence: 1,
+            incoming_sequence: 2,
+            subclass: 15,
+            ..header
+        };
+        socket
+            .send_to(
+                &serialize_full_frame(&header, &[19, 2, 0, 42]).unwrap(),
+                source,
+            )
+            .unwrap();
+        socket.recv_from(&mut bytes).unwrap();
+    });
+    let shared_handle = handle as usize;
+    let registration = thread::spawn(move || {
+        let request = rptadv_iax2_registration_options_v1 {
+            struct_size: size_of::<rptadv_iax2_registration_options_v1>() as u32,
+            abi_version: 1,
+            account: byte_span(b"provider-one"),
+            generation: 7,
+            refresh: 60,
+            release: 0,
+            timeout_ms: 2000,
+        };
+        let mut result = rptadv_iax2_registration_result_v1 {
+            struct_size: size_of::<rptadv_iax2_registration_result_v1>() as u32,
+            ..Default::default()
+        };
+        let code = unsafe {
+            SERVER_DESCRIPTOR.register_account.unwrap()(
+                shared_handle as *mut c_void,
+                &request,
+                &mut result,
+            )
+        };
+        (code, result.refresh, result.local.port)
+    });
+    waiting.recv_timeout(Duration::from_secs(1)).unwrap();
+    let started = std::time::Instant::now();
+    assert_eq!(
+        unsafe { server_poll(handle, 100, None, None, ptr::null_mut()) },
+        0
+    );
+    assert!(started.elapsed() < Duration::from_millis(500));
+    continue_reply.send(()).unwrap();
+    assert_eq!(registration.join().unwrap(), (0, 42, bound.port()));
+    registrar.join().unwrap();
+    assert_eq!(
+        unsafe { server_poll(handle, 100, None, None, ptr::null_mut()) },
+        0
+    );
+    assert_eq!(
+        unsafe { &*handle.cast::<ServerHandle>() }
+            .0
+            .lock()
+            .unwrap()
+            .ingress_stats()
+            .active_routes,
+        0
+    );
+    unsafe { server_destroy(handle) };
+}
 use crate::{
     call_token::retry_new_call_with_token,
     codec::CodecError,
@@ -230,10 +552,12 @@ fn server_options<'a>(address: &'a [u8], local_nodes: &'a [u8]) -> rptadv_iax2_s
         local_nodes: local_nodes.as_ptr(),
         local_nodes_length: local_nodes.len(),
         catalog: test_catalog(),
+        accounts: ptr::null(),
+        account_count: 0,
     }
 }
 
-fn inbound_setup(local_call: u16) -> OutboundCallSetup {
+pub(crate) fn inbound_setup(local_call: u16) -> OutboundCallSetup {
     OutboundCallSetup::new(
         local_call,
         7,
@@ -518,11 +842,13 @@ fn inbound_product_callbacks_receive_source_ip_without_udp_port() {
         local_nodes: local_nodes.as_ptr(),
         local_nodes_length: local_nodes.len(),
         catalog: test_catalog(),
+        accounts: ptr::null(),
+        account_count: 0,
     };
     let mut handle = ptr::null_mut();
     assert_eq!(unsafe { server_bind(&options, &mut handle) }, 0);
     let server = unsafe { &mut *handle.cast::<ServerHandle>() };
-    let server_address = server.0.local_addr().unwrap();
+    let server_address = server.0.lock().unwrap().local_addr().unwrap();
     let client = UdpSocket::bind("127.0.0.1:0").unwrap();
     client
         .set_read_timeout(Some(Duration::from_secs(1)))
@@ -756,7 +1082,7 @@ fn server_poll_reports_listener_errors_to_the_caller() {
     let mut handle = ptr::null_mut();
     assert_eq!(unsafe { server_bind(&options, &mut handle) }, 0);
     let server = unsafe { &mut *handle.cast::<ServerHandle>() };
-    server.0.force_poll_error();
+    server.0.lock().unwrap().force_poll_error();
     assert_eq!(
         unsafe { server_poll(handle, 0, None, None, ptr::null_mut()) },
         -1

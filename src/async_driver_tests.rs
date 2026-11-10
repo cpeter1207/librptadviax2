@@ -290,6 +290,8 @@ fn async_descriptor_enables_server_idempotently_and_retains_its_runtime() {
         local_nodes: nodes.as_ptr(),
         local_nodes_length: nodes.len(),
         catalog: ffi::test_catalog(),
+        accounts: ptr::null(),
+        account_count: 0,
     };
     let mut runtime = ptr::null_mut();
     let mut server = ptr::null_mut();

@@ -11,8 +11,56 @@ provider calls with a separate account username, caller identity, destination an
 context. Check `struct_size` through that field before access. These calls reuse
 the same codec/media, async owner and teardown operations; the existing numeric
 AllStarLink dial path is unchanged. Destinations retain short numbers and telephone
-symbols without a second cost/emergency-number policy. Provider registration and
-incoming provider-account admission remain separate integration work.
+symbols without a second cost/emergency-number policy.
+
+## Configured provider accounts
+
+The optional server ABI2 tail adds `configure_accounts`, `register_account`,
+`poll_accounts`, and `dial_provider_account`. Check `struct_size` through each
+required slot: the released 56-byte table prefix is unchanged; the complete table
+is 88 bytes. Bind options retain their 48-byte prefix and have a 64-byte complete
+record. Account arrays use the exact ABI1 record stride declared in the header.
+
+Configure an opaque account label, nonzero configuration generation, resolved
+provider endpoint, username, literal secret, and local admission binding.
+A binding may contain a nondecimal configured local name, up to 63 UTF-8 bytes.
+Changed settings require a new generation. Validated replacements retire changed
+owners atomically; unchanged accounts retain their existing lifetime. Provider
+caller/display/context fields are untrusted data and never become an ASL node or
+mailbox authorization. The consumer applies mailbox/PIN and command policy.
+
+After `server_enable`, registration, refresh, authenticated REGREL, incoming
+MD5 authentication, and `dial_provider_account` share the listener's source port
+and existing router. The consumer refreshes using the actual granted interval;
+absent REFRESH means 60 seconds. The registration primitive performs one bounded
+transaction and does not schedule refresh. Provider transport uses UDP and MD5
+challenge authentication; it provides no media/signaling encryption.
+
+`poll_accounts` applies configured endpoint/account matching and CALLTOKEN before
+MD5 authentication, then invokes the separate provider policy/ownership callbacks.
+Metadata is borrowed only during the callback. Accept returning zero transfers
+one peer; a nonzero result retains library ownership and sends best-effort HANGUP
+before release. Rust `prepare_*`/`Prepared*::run`/`finish_poll` split permits network
+waits and foreign callbacks outside the short listener/control lock. Execute
+blocking work off the shared executor. Retirements fence late route installs,
+returns, and media. A timeout requests no teardown acknowledgment: retained call
+and operation owners still retain their actual socket resources. Destroy the
+server only after in-flight entries/callbacks are quiescent; close/drop every peer
+before unloading its DSO. Route capacity returns only after actual receiver cleanup.
+
+One listener admits at most 64 configured accounts and 64 provider reservations,
+including calls, registration operations, and pending authentication. Existing
+NEW, route-command, and per-peer ingress queues remain bounded at 64 items.
+Configured phone providers offer only verified PCMU/PCMA at 8 kHz with 20 ms packets
+(160 encoded bytes/samples). Unsupported offers or packet shapes fail closed.
+Their composed neutral jitter profile is 20/40/100 ms; generic/numeric IAX and the
+independent client `dial_account` retain their existing codec and jitter policy.
+Retain the borrowed neutral jitter descriptor's DSO until the peer is destroyed.
+
+This callable account/media layer still requires product configuration and host
+composition. Its current public media poll has no genuine kernel receive-time
+record, so it does not qualify phone PCM for age-bounded RF admission. Mailbox/PIN,
+radio attachment, and live-provider acceptance are separate consumer work.
 
 Codec providers supply ULAW, ALAW, GSM, G.723.1, G.726 AAL2, Dialogic ADPCM,
 SLIN, LPC10, G.729, Speex, iLBC, G.726, G.722, SLIN16, Speex16, and Opus.
@@ -75,8 +123,8 @@ Debian 13 release assets provide `librptadv-iax2-client2` and
 release tag and use the versioned dynamic library. Packages are also available
 from the [shared signed APT repository](https://cpeter1207.github.io/USBRadioPlus/).
 
-Packet-jitter buffering starts at 180 ms, with a 160 ms minimum and a 500 ms
-maximum. Valid voice resumes playout after a radio-unkey event even when the
+Generic/numeric packet-jitter buffering starts at 180 ms, with a 160 ms minimum
+and a 500 ms maximum. Valid voice resumes playout after a radio-unkey event even when the
 peer does not send another radio-key event.
 
 Validated empty voice packets do not enter audio playout. Unexpected peer

@@ -3,10 +3,10 @@
 use super::{ListenerIngressStats, route_established};
 use crate::{
     ingress::{
-        InboundDatagram, IngressConsumer, MAX_DATAGRAM_SIZE, PeerIngressRouter,
-        PeerIngressRouterError, producer_ingress,
+        InboundDatagram, IngressConsumer, MAX_DATAGRAM_SIZE, PeerIngressRouter, producer_ingress,
     },
     protocol::{IaxCommand, decode_iax_command, parse_full_frame_packet},
+    provider::{AccountError, Ownership},
 };
 use std::{
     io,
@@ -25,18 +25,27 @@ use tokio::{
 };
 
 enum RouteCommand {
-    Register {
+    Promote {
         remote: SocketAddr,
         local_call: u16,
         remote_call: u16,
         generation: u64,
-        reply: oneshot::Sender<Result<IngressConsumer, PeerIngressRouterError>>,
+        ownership: Ownership,
+        reply: oneshot::Sender<Result<(), AccountError>>,
+    },
+    Pending {
+        remote: SocketAddr,
+        local_call: u16,
+        generation: u64,
+        ownership: Ownership,
+        reply: oneshot::Sender<Result<IngressConsumer, AccountError>>,
     },
     Unregister {
         remote: SocketAddr,
         local_call: u16,
         remote_call: u16,
         generation: u64,
+        reply: oneshot::Sender<()>,
     },
 }
 
@@ -47,6 +56,126 @@ pub(super) struct ListenerIngress {
     stop: watch::Sender<bool>,
     task: JoinHandle<()>,
     active_routes: Arc<AtomicUsize>,
+}
+
+#[derive(Clone)]
+pub(crate) struct ListenerControl {
+    runtime: Arc<Runtime>,
+    commands: mpsc::Sender<RouteCommand>,
+}
+
+impl ListenerControl {
+    pub(crate) fn send(
+        &self,
+        socket: &crate::network::SharedSocket,
+        remote: SocketAddr,
+        bytes: &[u8],
+        ownership: &Ownership,
+        deadline: Instant,
+    ) -> Result<(), AccountError> {
+        let socket = socket
+            .register(self.runtime.handle())
+            .map_err(AccountError::Network)?;
+        self.runtime.block_on(async {
+            tokio::time::timeout_at(deadline.into(), async {
+                loop {
+                    if Instant::now() >= deadline {
+                        return Err(AccountError::Timeout);
+                    }
+                    // The short life guards end before readiness is awaited.
+                    // Recheck the exact owner on every nonblocking commit.
+                    match ownership.with_live(|| socket.try_send_to(bytes, remote))? {
+                        Ok(_) => return Ok(()),
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            socket.writable().await.map_err(AccountError::Network)?;
+                        }
+                        Err(error) => return Err(AccountError::Network(error)),
+                    }
+                }
+            })
+            .await
+            .map_err(|_| AccountError::Timeout)?
+        })
+    }
+    pub(super) fn unregister(
+        &self,
+        identity: (SocketAddr, u16, u16, u64),
+        deadline: Instant,
+    ) -> Result<(), AccountError> {
+        let (reply, response) = oneshot::channel();
+        let (remote, local_call, remote_call, generation) = identity;
+        self.runtime.block_on(async {
+            tokio::time::timeout_at(deadline.into(), async {
+                self.commands
+                    .send(RouteCommand::Unregister {
+                        remote,
+                        local_call,
+                        remote_call,
+                        generation,
+                        reply,
+                    })
+                    .await
+                    .map_err(|_| AccountError::Retired)?;
+                response.await.map_err(|_| AccountError::Retired)
+            })
+            .await
+            .map_err(|_| AccountError::Timeout)?
+        })
+    }
+    pub(super) fn promote(
+        &self,
+        identity: (SocketAddr, u16, u16, u64),
+        ownership: Ownership,
+        deadline: Instant,
+    ) -> Result<(), AccountError> {
+        let (reply, response) = oneshot::channel();
+        let (remote, local_call, remote_call, generation) = identity;
+        self.runtime.block_on(async {
+            tokio::time::timeout_at(deadline.into(), async {
+                self.commands
+                    .send(RouteCommand::Promote {
+                        remote,
+                        local_call,
+                        remote_call,
+                        generation,
+                        ownership,
+                        reply,
+                    })
+                    .await
+                    .map_err(|_| AccountError::Retired)?;
+                response.await.map_err(|_| AccountError::Retired)?
+            })
+            .await
+            .map_err(|_| AccountError::Timeout)?
+        })
+    }
+    pub(super) fn register_pending(
+        &self,
+        remote: SocketAddr,
+        local_call: u16,
+        generation: u64,
+        ownership: Ownership,
+        deadline: Instant,
+    ) -> Result<IngressConsumer, AccountError> {
+        let (reply, response) = oneshot::channel();
+        self.runtime.block_on(async {
+            tokio::time::timeout_at(deadline.into(), async {
+                self.commands
+                    .send(RouteCommand::Pending {
+                        remote,
+                        local_call,
+                        generation,
+                        ownership,
+                        reply,
+                    })
+                    .await
+                    .map_err(|_| AccountError::Retired)?;
+                response.await.map_err(|_| AccountError::Retired)?
+            })
+            .await
+            .map_err(|_| AccountError::Timeout)?
+        })
+    }
 }
 
 impl ListenerIngress {
@@ -67,14 +196,39 @@ impl ListenerIngress {
                     _ = stopping.changed() => break,
                     // The owner retains this sender until its task is joined.
                     Some(command) = updates.recv() => match command {
-                        RouteCommand::Register { remote, local_call, remote_call, generation, reply } => {
-                            let registered = router.register_call(remote, local_call, remote_call, generation);
+                        RouteCommand::Promote { remote, local_call, remote_call, generation, ownership, reply } => {
+                            let promoted = ownership.with_live(|| router.promote_pending_call(remote, local_call, remote_call, generation));
+                            let promoted = match promoted {
+                                Ok(Ok(())) => Ok(()),
+                                Ok(Err(_)) => Err(AccountError::Retired),
+                                Err(error) => Err(error),
+                            };
+                            if reply.send(promoted).is_err() {
+                                router.unregister_setup_call(remote, local_call, generation);
+                            }
                             route_count.store(router.route_count(), Ordering::Relaxed);
-                            let _ = reply.send(registered);
                         }
-                        RouteCommand::Unregister { remote, local_call, remote_call, generation } => {
-                            router.unregister_call(remote, local_call, remote_call, generation);
+                        RouteCommand::Pending { remote, local_call, generation, ownership, reply } => {
+                            let registered = ownership.with_live(|| router.register_pending_call(remote, local_call, generation));
+                            let registered = match registered {
+                                Ok(Ok(ingress)) => Ok(ingress),
+                                Ok(Err(_)) => Err(AccountError::Busy),
+                                Err(error) => Err(error),
+                            };
+                            // A timed-out control caller cannot leave a late installed route.
+                            if reply.send(registered).is_err() {
+                                router.unregister_setup_call(remote, local_call, generation);
+                            }
                             route_count.store(router.route_count(), Ordering::Relaxed);
+                        }
+                        RouteCommand::Unregister { remote, local_call, remote_call, generation, reply } => {
+                            if remote_call == 0 {
+                                router.unregister_setup_call(remote, local_call, generation);
+                            } else {
+                                router.unregister_call(remote, local_call, remote_call, generation);
+                            }
+                            route_count.store(router.route_count(), Ordering::Relaxed);
+                            let _ = reply.send(());
                         }
                     },
                     received = crate::async_driver::receive_datagram(&socket, &mut bytes) => {
@@ -110,41 +264,11 @@ impl ListenerIngress {
         }
     }
 
-    pub(super) fn register(
-        &self,
-        remote: SocketAddr,
-        local_call: u16,
-        remote_call: u16,
-        generation: u64,
-    ) -> io::Result<Result<IngressConsumer, PeerIngressRouterError>> {
-        let (reply, response) = oneshot::channel();
-        self.commands
-            .blocking_send(RouteCommand::Register {
-                remote,
-                local_call,
-                remote_call,
-                generation,
-                reply,
-            })
-            .map_err(|_| stopped())?;
-        response.blocking_recv().map_err(|_| stopped())
-    }
-
-    pub(super) fn unregister(
-        &self,
-        remote: SocketAddr,
-        local_call: u16,
-        remote_call: u16,
-        generation: u64,
-    ) -> io::Result<()> {
-        self.commands
-            .blocking_send(RouteCommand::Unregister {
-                remote,
-                local_call,
-                remote_call,
-                generation,
-            })
-            .map_err(|_| stopped())
+    pub(super) fn control(&self) -> ListenerControl {
+        ListenerControl {
+            runtime: self.runtime.clone(),
+            commands: self.commands.clone(),
+        }
     }
 
     pub(super) fn try_receive(&mut self) -> io::Result<Option<InboundDatagram>> {
@@ -182,6 +306,167 @@ mod tests {
     use super::*;
     use crate::protocol::{FullFrameHeader, serialize_full_frame};
     use std::{thread, time::Duration};
+
+    fn account_listener(
+        runtime: Arc<Runtime>,
+        fail_allocation: bool,
+    ) -> (crate::server::InboundIaxListener, std::net::UdpSocket) {
+        let remote = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let account = crate::provider::AccountConfig {
+            id: "provider".into(),
+            generation: 7,
+            local_binding: "operator-west".into(),
+            remote: remote.local_addr().unwrap(),
+            username: "login".into(),
+            secret: "fixture-secret".into(),
+            pending_auth_timeout: Duration::from_secs(1),
+        };
+        let mut listener = crate::server::InboundIaxListener::bind_accounts(
+            "127.0.0.1:0".parse().unwrap(),
+            &[],
+            &[account],
+            None,
+        )
+        .unwrap();
+        listener.router.fail_next_reserve = fail_allocation;
+        listener.enable_async(runtime).unwrap();
+        (listener, remote)
+    }
+
+    fn request() -> crate::provider::RegistrationRequest {
+        crate::provider::RegistrationRequest {
+            refresh: 60,
+            release: false,
+            timeout: Duration::from_secs(1),
+        }
+    }
+
+    #[test]
+    fn queued_pending_route_rechecks_actual_account_retirement_before_installing() {
+        let runtime = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let (mut listener, _remote) = account_listener(runtime.clone(), false);
+        let prepared = listener
+            .prepare_registration("provider", 7, request())
+            .unwrap();
+        let control = prepared.route.control.as_ref().unwrap().clone();
+        let (reply, response) = oneshot::channel();
+        control
+            .commands
+            .try_send(RouteCommand::Pending {
+                remote: prepared.route.remote,
+                local_call: prepared.route.local_call,
+                generation: prepared.route.generation,
+                ownership: prepared.route.ownership.clone(),
+                reply,
+            })
+            .unwrap_or_else(|_| panic!("owned empty control queue"));
+        // This current-thread executor has not driven the real queued command yet.
+        listener.configure_accounts(&[]).unwrap();
+        assert!(matches!(
+            runtime.block_on(response).unwrap(),
+            Err(AccountError::Retired)
+        ));
+        assert_eq!(listener.ingress_stats().active_routes, 0);
+        drop(prepared);
+        listener
+            .poll_accounts(100, |_, _, _| false, |_| false)
+            .unwrap();
+        assert!(listener.routes.is_empty());
+    }
+
+    #[test]
+    fn canceled_pending_and_promotion_results_remove_only_their_actual_route() {
+        for promote in [false, true] {
+            let runtime = Arc::new(
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap(),
+            );
+            let (mut listener, _remote) = account_listener(runtime, false);
+            let mut prepared = listener
+                .prepare_registration("provider", 7, request())
+                .unwrap();
+            let route = &mut prepared.route;
+            let control = route.control.as_ref().unwrap().clone();
+            if promote {
+                route
+                    .install(Instant::now() + Duration::from_secs(1))
+                    .unwrap();
+                let (reply, response) = oneshot::channel();
+                drop(response);
+                control
+                    .commands
+                    .try_send(RouteCommand::Promote {
+                        remote: route.remote,
+                        local_call: route.local_call,
+                        remote_call: 77,
+                        generation: route.generation,
+                        ownership: route.ownership.clone(),
+                        reply,
+                    })
+                    .unwrap_or_else(|_| panic!("owned empty control queue"));
+            } else {
+                let (reply, response) = oneshot::channel();
+                drop(response);
+                control
+                    .commands
+                    .try_send(RouteCommand::Pending {
+                        remote: route.remote,
+                        local_call: route.local_call,
+                        generation: route.generation,
+                        ownership: route.ownership.clone(),
+                        reply,
+                    })
+                    .unwrap_or_else(|_| panic!("owned empty control queue"));
+            }
+            // Its acknowledged FIFO successor proves the canceled command was
+            // processed, rather than sampling zero before admission happened.
+            control
+                .unregister(
+                    (route.remote, route.local_call, 0, route.generation),
+                    Instant::now() + Duration::from_secs(1),
+                )
+                .unwrap();
+            assert_eq!(listener.ingress_stats().active_routes, 0);
+            drop(prepared);
+            listener
+                .poll_accounts(100, |_, _, _| false, |_| false)
+                .unwrap();
+            assert!(listener.routes.is_empty());
+        }
+    }
+
+    #[test]
+    fn actual_router_allocation_failure_returns_no_consumer_or_registration_datagram() {
+        let runtime = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let (mut listener, remote) = account_listener(runtime, true);
+        let mut prepared = listener
+            .prepare_registration("provider", 7, request())
+            .unwrap();
+        assert!(matches!(prepared.run(), Err(AccountError::Busy)));
+        assert_eq!(listener.ingress_stats().active_routes, 0);
+        remote.set_nonblocking(true).unwrap();
+        assert_eq!(
+            remote.recv_from(&mut [0; 2048]).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        drop(prepared);
+        listener
+            .poll_accounts(100, |_, _, _| false, |_| false)
+            .unwrap();
+        assert!(listener.routes.is_empty());
+    }
 
     #[test]
     fn oversized_receive_does_not_stop_other_peers_or_admission() {
@@ -340,8 +625,26 @@ mod tests {
             pump.try_receive().unwrap_err().kind(),
             io::ErrorKind::ConnectionAborted
         );
-        assert!(pump.register(remote, 23, 43, 8).is_err());
-        assert!(pump.unregister(remote, 22, 42, 7).is_err());
+        let ownership = Ownership {
+            server: crate::provider::Life::new(),
+            account: crate::provider::Life::new(),
+            operation: crate::provider::Life::new(),
+        };
+        assert!(matches!(
+            pump.control().register_pending(
+                remote,
+                23,
+                8,
+                ownership,
+                Instant::now() + Duration::from_secs(1)
+            ),
+            Err(AccountError::Retired)
+        ));
+        assert!(matches!(
+            pump.control()
+                .unregister((remote, 22, 42, 7), Instant::now() + Duration::from_secs(1)),
+            Err(AccountError::Retired)
+        ));
     }
 
     #[test]
@@ -375,5 +678,67 @@ mod tests {
             pump.try_receive().unwrap_err().kind(),
             io::ErrorKind::ConnectionAborted
         );
+    }
+    #[test]
+    fn real_pending_promotion_rejects_stale_generation_and_queued_retirement_without_reusing_route()
+    {
+        let runtime = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let (mut listener, _remote) = account_listener(runtime.clone(), false);
+        let mut prepared = listener
+            .prepare_registration("provider", 7, request())
+            .unwrap();
+        prepared
+            .route
+            .install(Instant::now() + Duration::from_secs(1))
+            .unwrap();
+        let route = &prepared.route;
+        let control = route.control.as_ref().unwrap().clone();
+        assert!(matches!(
+            control.promote(
+                (route.remote, route.local_call, 77, route.generation + 1),
+                route.ownership.clone(),
+                Instant::now() + Duration::from_secs(1)
+            ),
+            Err(AccountError::Retired)
+        ));
+        assert_eq!(listener.ingress_stats().active_routes, 1);
+        let expired = route
+            .send(
+                b"never committed after its deadline",
+                Instant::now() - Duration::from_secs(1),
+            )
+            .expect_err("the original deadline is already past");
+        assert!(matches!(
+            expired.into_call(),
+            crate::client::DialError::Timeout
+        ));
+        let (reply, response) = oneshot::channel();
+        control
+            .commands
+            .try_send(RouteCommand::Promote {
+                remote: route.remote,
+                local_call: route.local_call,
+                remote_call: 77,
+                generation: route.generation,
+                ownership: route.ownership.clone(),
+                reply,
+            })
+            .unwrap_or_else(|_| panic!("owned empty queue"));
+        listener.configure_accounts(&[]).unwrap();
+        assert!(matches!(
+            runtime.block_on(response).unwrap(),
+            Err(AccountError::Retired)
+        ));
+        assert_eq!(listener.ingress_stats().active_routes, 1);
+        drop(prepared);
+        listener
+            .poll_accounts(1000, |_, _, _| false, |_| false)
+            .unwrap();
+        assert_eq!(listener.ingress_stats().active_routes, 0);
     }
 }

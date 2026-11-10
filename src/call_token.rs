@@ -293,6 +293,27 @@ pub fn retry_new_call_with_token(
     response_frame: &[u8],
     timestamp_ms: u32,
 ) -> Result<Vec<u8>, CallTokenRetryError> {
+    retry_initial_with_token(initial_frame, response_frame, timestamp_ms, |command| {
+        command == Some(IaxCommand::New)
+    })
+}
+
+pub(crate) fn retry_registration_with_token(
+    initial_frame: &[u8],
+    response_frame: &[u8],
+    timestamp_ms: u32,
+) -> Result<Vec<u8>, CallTokenRetryError> {
+    retry_initial_with_token(initial_frame, response_frame, timestamp_ms, |command| {
+        matches!(command, Some(IaxCommand::RegReq | IaxCommand::RegRel))
+    })
+}
+
+fn retry_initial_with_token(
+    initial_frame: &[u8],
+    response_frame: &[u8],
+    timestamp_ms: u32,
+    accepts: impl FnOnce(Option<IaxCommand>) -> bool,
+) -> Result<Vec<u8>, CallTokenRetryError> {
     let initial =
         parse_full_frame_packet(initial_frame).map_err(|_| CallTokenRetryError::InvalidFrame)?;
     let response =
@@ -300,7 +321,10 @@ pub fn retry_new_call_with_token(
 
     if initial.header.source_call_number == 0
         || initial.header.destination_call_number != 0
-        || decode_iax_command(&initial.header) != Ok(Some(IaxCommand::New))
+        || !accepts(
+            decode_iax_command(&initial.header)
+                .map_err(|_| CallTokenRetryError::InvalidExchange)?,
+        )
         || response.header.destination_call_number != initial.header.source_call_number
         || decode_iax_command(&response.header) != Ok(Some(IaxCommand::CallToken))
     {
