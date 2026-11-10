@@ -63,14 +63,14 @@ separate consumer work.
 
 ## Original receive time
 
-The optional client ABI2 `poll_timed` slot preserves the released136-byte prefix;
-check through its144-byte table prefix before accessing it. Its caller-sized ABI1 record is
-72 bytes on supported native64 Linux. The ordinary `poll` remains untimed. Use one
+The optional client ABI 2 `poll_timed` slot preserves the released 136-byte prefix;
+check through its 144-byte table prefix before accessing it. Its caller-sized ABI 1 record is
+72 bytes on supported native 64-bit Linux. The ordinary `poll` remains untimed. Use one
 poll mode per exclusive peer owner; legacy polling rejects after timed activation.
 
 Capture a stable Host clock epoch and `reference_now_ns` **before** provider entry.
 Only `TIMED_BIRTH` grants original-time qualification. At first exposure, the
-provider subtracts genuine kernel RX age plus a conservative5ms uncertainty from
+provider subtracts genuine kernel RX age plus a conservative 5 ms uncertainty from
 that fixed reference. It caches the result for the whole original span, including
 every PCM partial/retry/suffix. Underflow, missing/future/unrepresentable receipt,
 legacy caller-supplied ingress time, concealment and gaps never supply a fresh birth.
@@ -82,12 +82,12 @@ Owned UDP sockets request `SO_TIMESTAMPING` software RX stamps, without the
 `SO_TIMESTAMP[NS]` options that can synthesize a missing stamp during dequeue.
 Linux timestamp activation may be deferred; packets without an actual RX record
 remain unqualified. One nonblocking CLOEXEC `timerfd` monitors realtime steps with
-`CANCEL_ON_SET`, plus a fixed realtime/monotonic anchor. Its checked absolute2262
-deadline fits signed64 native ktime and is never rearmed. Initial unavailable
+`CANCEL_ON_SET`, plus a fixed realtime/monotonic anchor. Its checked absolute 2262
+deadline fits signed 64-bit native ktime and is never rearmed. Initial unavailable
 qualification leaves private control/media usable. Later clock qualification loss
 is sticky and revokes retained epochs; protocol teardown continues without rebase.
 
-Retained source media older than500ms retires actual packet jitter, decoded PCM
+Retained source media older than 500 ms retires actual packet jitter, decoded PCM
 and codec history. `TIMED_DISCONTINUITY` names the new **target** epoch. No fresh
 Audio/Gap is exposed until the consumer acknowledges that exact target **after**
 its prior ring, DSP and RF owners actually retire; stale acknowledgments cannot
@@ -98,10 +98,10 @@ does not itself authorize mailbox access or RF.
 ## Timed prepared transmission
 
 The optional client slots `send_prepared_audio_timed` and `retire_egress` extend
-the table to160 bytes, preserving both released136 and timed-RX144-byte prefixes.
+the table to 160 bytes, preserving both released 136 and timed RX 144-byte prefixes.
 Only these explicitly negotiated phone operations implement the transmit age
 contract; ordinary numeric and independent generic prepared-send behavior remains.
-The first profile is PCMU/PCMA8k20ms, exactly160 encoded bytes/source frames.
+The first profile is PCMU/PCMA at 8 kHz and 20 ms, exactly 160 encoded bytes/source frames.
 
 Retire egress before its first timed send and each source discontinuity. A completed
 serial local retirement returns a checked TX epoch token, independent of RX epochs.
@@ -113,7 +113,7 @@ while PCM retries are suppressed. Text/key/control reliability remains intact.
 Successful prior UDP sends cannot be recalled; completion claims no remote ACK.
 
 For a prepared packet, sample `elapsed_ms` **first**, then the Host reference and
-the oldest contributing original PCM age. Add the remaining500ms age budget to
+the oldest contributing original PCM age. Add the remaining 500 ms age budget to
 that earlier native floor, rounding down and checking overflow. Unknown/future
 source age or a saturated native clock cannot qualify a packet. Keep this absolute
 deadline and TX token unchanged through partial encoding, retained buffers and
@@ -237,10 +237,11 @@ make provider-interop-check
 
 The explicit platform gate `provider-interop-check` uses the quality image's
 Asterisk as a loopback-only independent provider. The C smoke consumer uses the
-installed header and candidate DSO for call-token/MD5 setup, μ-law echo media,
-hangup, wrong-secret rejection and endpoint cleanup. Asterisk is a test tool;
+installed header and candidate DSO for call-token/MD5 setup, G.711 echo media,
+registration, refresh, release, incoming and outgoing provider calls, hangup,
+wrong-secret rejection and endpoint cleanup. Asterisk is a test tool;
 the runtime library and ordinary Debian package build do not depend on a PBX.
-Real-provider, registration, NAT and radio acceptance remain unverified.
+Live-provider, NAT and radio acceptance remain unverified.
 
 The client ABI is versioned and released as a shared object. Complete ASL3
 call/session behavior and live peer interoperability remain to be verified.
