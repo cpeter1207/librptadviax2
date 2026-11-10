@@ -587,6 +587,19 @@ fn real_socket_receive_failure_revokes_pending_ingress_without_fabricated_lifeti
         )
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(3);
+    // Observe this actual receiver's failure publication before selecting the
+    // pending-auth retirement turn. Without it, the legal ready-check/admission
+    // race can first report the stopped admission queue's network error.
+    while !listener.pending_provider[0]
+        .route
+        .ingress
+        .as_ref()
+        .unwrap()
+        .failed()
+    {
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
     loop {
         match listener.poll_accounts(
             1000,

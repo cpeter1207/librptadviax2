@@ -146,8 +146,8 @@ unsafe extern "C" fn peer_attach(
         };
         (
             wake,
-            source.map(|(socket, producer)| {
-                DatagramPump::from_socket(runtime.handle(), socket, remote, producer)
+            source.map(|(socket, producer, owner)| {
+                DatagramPump::from_socket(runtime.handle(), socket, remote, producer, Some(owner))
             }),
         )
     };

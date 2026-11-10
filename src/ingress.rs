@@ -73,11 +73,15 @@ pub struct IngressStats {
 pub struct InboundDatagram {
     generation: u64,
     arrived_at: Instant,
+    receipt: Option<crate::source_time::Receipt>,
     remote: SocketAddr,
     payload: Box<[u8]>,
 }
 
 impl InboundDatagram {
+    pub(crate) fn receipt(&self) -> Option<crate::source_time::Receipt> {
+        self.receipt
+    }
     /// Monotonic socket-receipt time, retained independently of executor delay.
     pub const fn arrived_at(&self) -> Instant {
         self.arrived_at
@@ -130,6 +134,16 @@ impl IngressProducer {
         payload: &[u8],
         arrived_at: Instant,
     ) -> Result<(), IngressPushError> {
+        self.try_push_received(remote, payload, arrived_at, None)
+    }
+
+    pub(crate) fn try_push_received(
+        &mut self,
+        remote: SocketAddr,
+        payload: &[u8],
+        arrived_at: Instant,
+        receipt: Option<crate::source_time::Receipt>,
+    ) -> Result<(), IngressPushError> {
         if payload.len() > MAX_DATAGRAM_SIZE {
             return Err(IngressPushError::DatagramTooLarge {
                 length: payload.len(),
@@ -151,6 +165,7 @@ impl IngressProducer {
         let packet = InboundDatagram {
             generation: self.generation,
             arrived_at,
+            receipt,
             remote,
             payload: payload.into(),
         };
@@ -412,6 +427,7 @@ impl PeerIngressRouter {
             remote,
             payload,
             Instant::now(),
+            None,
         )
     }
 
@@ -435,22 +451,40 @@ impl PeerIngressRouter {
         payload: &[u8],
         arrived_at: Instant,
     ) -> Result<(), PeerIngressRouterError> {
+        self.route_call_at_received(remote, local_call, remote_call, payload, arrived_at, None)
+    }
+
+    pub(crate) fn route_call_at_received(
+        &mut self,
+        remote: SocketAddr,
+        local_call: u16,
+        remote_call: u16,
+        payload: &[u8],
+        arrived_at: Instant,
+        receipt: Option<crate::source_time::Receipt>,
+    ) -> Result<(), PeerIngressRouterError> {
         let key = PeerRouteKey::Call {
             remote,
             local_call,
             remote_call,
         };
         if self.routes.contains_key(&key) {
-            return self.route_key(key, remote, payload, arrived_at);
+            return self.route_key(key, remote, payload, arrived_at, receipt);
         }
         let pending = PeerRouteKey::Pending { remote, local_call };
         if self.routes.contains_key(&pending) {
-            return self.route_key(pending, remote, payload, arrived_at);
+            return self.route_key(pending, remote, payload, arrived_at, receipt);
         }
         if self.has_call_routes(remote) {
             Err(PeerIngressRouterError::UnknownPeer)
         } else {
-            self.route_key(PeerRouteKey::Address(remote), remote, payload, arrived_at)
+            self.route_key(
+                PeerRouteKey::Address(remote),
+                remote,
+                payload,
+                arrived_at,
+                receipt,
+            )
         }
     }
 
@@ -472,6 +506,17 @@ impl PeerIngressRouter {
         payload: &[u8],
         arrived_at: Instant,
     ) -> Result<(), PeerIngressRouterError> {
+        self.route_remote_call_at_received(remote, remote_call, payload, arrived_at, None)
+    }
+
+    pub(crate) fn route_remote_call_at_received(
+        &mut self,
+        remote: SocketAddr,
+        remote_call: u16,
+        payload: &[u8],
+        arrived_at: Instant,
+        receipt: Option<crate::source_time::Receipt>,
+    ) -> Result<(), PeerIngressRouterError> {
         let mut matching_key = None;
         for key in self.routes.keys() {
             if matches!(key, PeerRouteKey::Call { remote: address, remote_call: number, .. } if *address == remote && *number == remote_call)
@@ -483,12 +528,18 @@ impl PeerIngressRouter {
             }
         }
         if let Some(key) = matching_key {
-            return self.route_key(key, remote, payload, arrived_at);
+            return self.route_key(key, remote, payload, arrived_at, receipt);
         }
         if self.has_call_routes(remote) {
             Err(PeerIngressRouterError::UnknownPeer)
         } else {
-            self.route_key(PeerRouteKey::Address(remote), remote, payload, arrived_at)
+            self.route_key(
+                PeerRouteKey::Address(remote),
+                remote,
+                payload,
+                arrived_at,
+                receipt,
+            )
         }
     }
 
@@ -506,12 +557,16 @@ impl PeerIngressRouter {
         remote: SocketAddr,
         payload: &[u8],
         arrived_at: Instant,
+        receipt: Option<crate::source_time::Receipt>,
     ) -> Result<(), PeerIngressRouterError> {
         let route = self
             .routes
             .get_mut(&key)
             .ok_or(PeerIngressRouterError::UnknownPeer)?;
-        match route.producer.try_push_at(remote, payload, arrived_at) {
+        match route
+            .producer
+            .try_push_received(remote, payload, arrived_at, receipt)
+        {
             Ok(()) => Ok(()),
             Err(IngressPushError::Closed) => Err(PeerIngressRouterError::UnknownPeer),
             Err(IngressPushError::Full) => Err(PeerIngressRouterError::Full),

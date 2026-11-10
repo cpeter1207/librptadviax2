@@ -8,6 +8,7 @@ use std::{
 
 #[derive(Default)]
 struct State {
+    resets: usize,
     rate: u32,
     loss_unit: u32,
     policy: (u32, u32, u32, u32),
@@ -20,6 +21,9 @@ struct State {
 thread_local! { static NEXT: RefCell<Option<Arc<Mutex<State>>>> = const { RefCell::new(None) }; }
 pub(crate) struct Fixture(Arc<Mutex<State>>);
 impl Fixture {
+    pub(crate) fn resets(&self) -> usize {
+        self.0.lock().unwrap().resets
+    }
     pub(crate) fn new() -> Self {
         Self(Arc::new(Mutex::new(State::default())))
     }
@@ -97,6 +101,7 @@ unsafe extern "C" fn reset(context: *mut c_void) -> i32 {
     let mut state = unsafe { &*context.cast::<Arc<Mutex<State>>>() }
         .lock()
         .unwrap();
+    state.resets += 1;
     state.decisions.clear();
     state.observation = Observation::default();
     0

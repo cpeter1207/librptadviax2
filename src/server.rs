@@ -365,7 +365,12 @@ impl InboundIaxListener {
         // No fallible work remains before the sole router moves into its task.
         let empty = PeerIngressRouter::new(1).expect("nonzero placeholder limits");
         let router = std::mem::replace(&mut self.router, empty);
-        self.async_ingress = Some(ListenerIngress::start(runtime, socket, router));
+        self.async_ingress = Some(ListenerIngress::start(
+            runtime,
+            socket,
+            router,
+            Some(self.endpoint.shared_socket()),
+        ));
         Ok(())
     }
 
@@ -615,7 +620,7 @@ impl InboundIaxListener {
     }
 
     fn route_existing(&mut self, remote: SocketAddr, packet: &[u8]) -> bool {
-        route_established(&mut self.router, remote, packet, Instant::now())
+        route_established(&mut self.router, remote, packet, Instant::now(), None)
     }
 }
 
@@ -624,6 +629,7 @@ fn route_established(
     remote: SocketAddr,
     packet: &[u8],
     arrived_at: Instant,
+    receipt: Option<crate::source_time::Receipt>,
 ) -> bool {
     if packet.first().is_some_and(|first| first & 0x80 != 0) {
         let Ok(frame) = parse_full_frame_packet(packet) else {
@@ -631,7 +637,14 @@ fn route_established(
         };
         let local_call = frame.header.destination_call_number;
         let remote_call = frame.header.source_call_number;
-        match router.route_call_at(remote, local_call, remote_call, packet, arrived_at) {
+        match router.route_call_at_received(
+            remote,
+            local_call,
+            remote_call,
+            packet,
+            arrived_at,
+            receipt,
+        ) {
             // Admission is not protocol validation: even HANGUP may be dropped
             // or rejected by its peer. Only released-generation reaping retires a route.
             Ok(()) | Err(PeerIngressRouterError::Full) => true,
@@ -642,11 +655,12 @@ fn route_established(
         let Ok(frame) = parse_mini_frame(packet) else {
             return false;
         };
-        match router.route_remote_call_at(
+        match router.route_remote_call_at_received(
             remote,
             frame.header.source_call_number,
             packet,
             arrived_at,
+            receipt,
         ) {
             Ok(()) | Err(PeerIngressRouterError::Full) => true,
             Err(PeerIngressRouterError::UnknownPeer) => false,

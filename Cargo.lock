@@ -297,6 +297,7 @@ version = "0.1.0"
 dependencies = [
  "audio-codec-algorithms",
  "getrandom",
+ "libc",
  "libloading",
  "md-5",
  "rptadv-codec-client",

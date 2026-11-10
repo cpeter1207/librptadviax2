@@ -26,12 +26,14 @@ static struct rptadv_iax2_bytes_v1 text(const char *value)
     return (struct rptadv_iax2_bytes_v1){ (const uint8_t *)value, strlen(value) };
 }
 
-static uint64_t now_ms(void)
+static uint64_t now_ns(void)
 {
     struct timespec now;
     if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) abort();
-    return (uint64_t)now.tv_sec * 1000 + (uint64_t)now.tv_nsec / 1000000;
+    return (uint64_t)now.tv_sec * 1000000000 + (uint64_t)now.tv_nsec;
 }
+
+static uint64_t now_ms(void) { return now_ns() / 1000000; }
 
 static void *catalog_open(const struct rptadv_iax2_client_descriptor_v2 *api, unsigned profile)
 {
@@ -44,31 +46,66 @@ static void *catalog_open(const struct rptadv_iax2_client_descriptor_v2 *api, un
     return api->open_catalog(&selection, 1, &catalog) == 0 ? catalog : NULL;
 }
 
-static size_t echo(const struct rptadv_iax2_client_descriptor_v2 *api, void *peer)
+static size_t echo(const struct rptadv_iax2_client_descriptor_v2 *api, void *peer, uint32_t timestamp_offset)
 {
     float source[160], output[4096];
     uint8_t encoded[512], body[4096];
     for (size_t i = 0; i < 160; ++i) source[i] = 0.25f;
-    size_t received = 0;
+    size_t received = 0, qualified = 0, prepared_bytes = 0;
+    uint32_t prepared_frames = 0, prepared_timestamp = 0;
+    int prepared = 0;
+    uint64_t tx_epoch = 0;
+    if (api->retire_egress(peer, &tx_epoch) != 0 || !tx_epoch) return 0;
+    struct rptadv_iax2_timed_send_v1 send_time = { .struct_size = sizeof(send_time), .abi_version = 1, .egress_epoch = tx_epoch };
+    uint64_t acknowledged = 0, cursor = 0, epoch = 0;
     double energy = 0;
     uint64_t deadline = now_ms() + 4000;
     uint64_t next = now_ms();
     while (now_ms() < deadline) {
-        if (now_ms() >= next) {
+        if (!prepared && now_ms() >= next) {
+            /* Native floor FIRST, then generation of this new test tone block.
+             * The remaining500ms budget/deadline stays unchanged on WouldBlock. */
+            uint32_t native = api->elapsed_ms(peer);
+            if (native > UINT32_MAX - 500) return 0;
+            send_time.deadline_ms = native + 500;
+            prepared_timestamp = native + timestamp_offset;
             struct rptadv_codec_encode_result_v1 coded = { .struct_size = sizeof(coded) };
             if (api->prepare_audio(peer, source, 160, encoded, sizeof(encoded), 0, &coded) != 0 ||
-                coded.consumed_frames != 160 || coded.encoded_bytes == 0 ||
-                api->send_prepared_audio(peer, encoded, coded.encoded_bytes, coded.packet_frames, api->elapsed_ms(peer)) != 0) return 0;
-            next += 20;
+                coded.consumed_frames != 160 || coded.encoded_bytes == 0) return 0;
+            prepared_bytes = coded.encoded_bytes;
+            prepared_frames = coded.packet_frames;
+            prepared = 1;
         }
-        uint32_t event = 0;
-        size_t samples = 0;
-        if (api->poll(peer, output, 4096, body, sizeof(body), &event, &samples) != 0) return 0;
-        if (event == RPTADV_IAX2_EVENT_AUDIO) {
-            received += samples;
-            for (size_t i = 0; i < samples; ++i) energy += output[i] * output[i];
+        if (prepared) {
+            int sent = api->send_prepared_audio_timed(peer, encoded, prepared_bytes, prepared_frames, prepared_timestamp, &send_time);
+            if (sent == 0) { prepared = 0; next += 20; }
+            else if (sent != 1) return 0;
         }
-        if (received >= 1600 && energy > 1) return received;
+        struct rptadv_iax2_timed_event_v1 timed = { .struct_size = sizeof(timed),
+            .abi_version = 1, .host_clock_epoch = 1, .reference_now_ns = now_ns(),
+            .acknowledged_media_epoch = acknowledged };
+        if (api->poll_timed(peer, output, 4096, body, sizeof(body), &timed) != 0) return 0;
+        if (timed.flags & RPTADV_IAX2_TIMED_DISCONTINUITY) {
+            if (timed.event_kind == RPTADV_IAX2_EVENT_AUDIO || timed.event_kind == RPTADV_IAX2_EVENT_GAP) return 0;
+            /* This fixture owns no retained downstream PCM/DSP/RF context. Its
+             * old output is already consumed; acknowledge this actual target. */
+            acknowledged = timed.media_epoch;
+            cursor = 0;
+            epoch = timed.media_epoch;
+        }
+        if (timed.event_kind == RPTADV_IAX2_EVENT_AUDIO || timed.event_kind == RPTADV_IAX2_EVENT_GAP) {
+            if (timed.media_epoch != epoch || timed.source_start != cursor) return 0;
+            cursor += timed.event_length;
+        }
+        if (timed.event_kind == RPTADV_IAX2_EVENT_AUDIO) {
+            if (timed.flags & RPTADV_IAX2_TIMED_BIRTH) {
+                if (timed.born_ns > timed.reference_now_ns - 5000000) return 0;
+                qualified += timed.event_length;
+            }
+            received += timed.event_length;
+            for (size_t i = 0; i < timed.event_length; ++i) energy += output[i] * output[i];
+        }
+        if (received >= 1600 && qualified >= 1600 && energy > 1) return received;
         struct timespec wait = { .tv_nsec = 1000000 };
         nanosleep(&wait, NULL);
     }
@@ -140,7 +177,7 @@ int main(int argc, char **argv)
     uint16_t bound_port = 0;
     unsigned outgoing_delay = 0;
     size_t outgoing_samples = 0, incoming_samples = 0;
-    if (!jitter || !catalog || server->struct_size < sizeof(*server) || !server->configure_accounts || !server->register_account || !server->poll_accounts || !server->dial_provider_account) goto done;
+    if (!jitter || !catalog || api->struct_size < sizeof(*api) || !api->poll_timed || !api->send_prepared_audio_timed || !api->retire_egress || server->struct_size < sizeof(*server) || !server->configure_accounts || !server->register_account || !server->poll_accounts || !server->dial_provider_account) goto done;
     struct rptadv_iax2_provider_account_v1 account = {
         .struct_size = sizeof(account), .abi_version = 1, .generation = 7,
         .account = text("club-account"), .local_binding = text("operator-west"),
@@ -170,7 +207,7 @@ int main(int argc, char **argv)
     stage = "outgoing/echo";
     if (server->dial_provider_account(listener, &dial, &outgoing, &receipt) != 0 || !outgoing || receipt.local.port != bound_port || receipt.format != format) goto done;
     stage = "real phone jitter/outgoing echo";
-    if (!phone_jitter(async, outgoing, jitter, &outgoing_delay) || !(outgoing_samples = echo(api, outgoing))) goto done;
+    if (!phone_jitter(async, outgoing, jitter, &outgoing_delay) || !(outgoing_samples = echo(api, outgoing, 65520))) goto done;
     api->destroy(outgoing); outgoing = NULL;
     if (server->poll_accounts(listener, 0, NULL, NULL, NULL, NULL, NULL) < 0) goto done;
     incoming.port = bound_port;
@@ -183,7 +220,7 @@ int main(int argc, char **argv)
         struct timespec wait = { .tv_nsec = 1000000 };
         nanosleep(&wait, NULL);
     }
-    if (!incoming.peer || incoming.authorized != 1 || !(incoming_samples = echo(api, incoming.peer))) goto done;
+    if (!incoming.peer || incoming.authorized != 1 || !(incoming_samples = echo(api, incoming.peer, 0))) goto done;
     api->destroy(incoming.peer); incoming.peer = NULL;
     if (server->poll_accounts(listener, 0, NULL, NULL, NULL, NULL, NULL) < 0) goto done;
     registration.release = 1;

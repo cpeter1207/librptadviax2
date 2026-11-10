@@ -15,6 +15,18 @@ static unsigned opened, closed;
 static int32_t (*provider_open_encoder)(const rptadv_codec_config_v1 *, void **);
 static int32_t (*provider_open_decoder)(const rptadv_codec_config_v1 *, void **);
 static void (*provider_destroy)(void *);
+static int32_t (*provider_reset)(void *);
+static unsigned reset_calls;
+static int reset_result;
+
+static int32_t reset_context(void *context) {
+  ++reset_calls;
+  return reset_result ? reset_result : provider_reset(context);
+}
+/** Actual reset call receipts and a backend failure fixture. */
+unsigned rptadv_test_resets(void) { return reset_calls; }
+/** Fail the next retained provider's real reset operation with this codec status. */
+void rptadv_test_reset_result(int result) { reset_result = result; }
 static int32_t open_encoder(const rptadv_codec_config_v1 *config, void **output) {
   int32_t result = provider_open_encoder(config, output);
   if (result == 0)
@@ -113,9 +125,11 @@ int rptadv_test_open(const char *path) {
   provider_open_encoder = fixture.open_encoder;
   provider_open_decoder = fixture.open_decoder;
   provider_destroy = fixture.destroy;
+  provider_reset = fixture.reset;
   fixture.open_encoder = open_encoder;
   fixture.open_decoder = open_decoder;
   fixture.destroy = destroy_context;
+  fixture.reset = reset_context;
   provider_profile_at = fixture.profile_at;
   fixture.profile_at = profile_at;
   fixture.inspect = inspect_packet;

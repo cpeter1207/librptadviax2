@@ -183,6 +183,7 @@ impl ListenerIngress {
         runtime: Arc<Runtime>,
         socket: Arc<UdpSocket>,
         mut router: PeerIngressRouter,
+        owner: Option<Arc<crate::network::SharedSocket>>,
     ) -> Self {
         let (commands, mut updates) = mpsc::channel(64);
         let (mut pending, admission) = producer_ingress(64, 0).expect("nonzero NEW queue capacity");
@@ -231,12 +232,17 @@ impl ListenerIngress {
                             let _ = reply.send(());
                         }
                     },
-                    received = crate::async_driver::receive_datagram(&socket, &mut bytes) => {
+                    received = crate::async_driver::receive_datagram(&socket, &mut bytes, owner.as_deref()) => {
                         let arrived_at = Instant::now();
-                        let Ok((length, remote)) = received else { break; };
+                        let (length, remote, receipt) = match received {
+                            Ok(packet) => packet,
+                            Err(error) if error.kind() == io::ErrorKind::InvalidData => continue,
+                            Err(_) => break,
+                        };
+                        let arrived_at = receipt.map_or(arrived_at, |receipt| receipt.instant);
                         if length > MAX_DATAGRAM_SIZE { continue; }
                         let packet = &bytes[..length];
-                        if route_established(&mut router, remote, packet, arrived_at) {
+                        if route_established(&mut router, remote, packet, arrived_at, receipt) {
                             route_count.store(router.route_count(), Ordering::Relaxed);
                             continue;
                         }
@@ -244,7 +250,7 @@ impl ListenerIngress {
                             if frame.header.destination_call_number == 0
                                 && decode_iax_command(&frame.header) == Ok(Some(IaxCommand::New)) {
                                 // Queue overflow drops only new admission work, never an established peer.
-                                let _ = pending.try_push_at(remote, packet, arrived_at);
+                                let _ = pending.try_push_received(remote, packet, arrived_at, receipt);
                             }
                         }
                     }
@@ -483,7 +489,7 @@ mod tests {
         crate::network::inject_receive(local, Ok((MAX_DATAGRAM_SIZE + 1, remote)));
         let mut router = PeerIngressRouter::new(1).unwrap();
         let mut peer = router.register_call(remote, 22, 42, 7).unwrap();
-        let mut pump = ListenerIngress::start(runtime.clone(), Arc::new(receiver), router);
+        let mut pump = ListenerIngress::start(runtime.clone(), Arc::new(receiver), router, None);
         let packet = serialize_full_frame(
             &FullFrameHeader {
                 source_call_number: 42,
@@ -513,6 +519,61 @@ mod tests {
     }
 
     #[test]
+    fn actual_listener_kernel_truncation_drops_one_packet_without_stopping_established_routes() {
+        let Some(library) = crate::source_time::tests::fault_child(
+            "server::async_ingress::tests::actual_listener_kernel_truncation_drops_one_packet_without_stopping_established_routes",
+        ) else {
+            return;
+        };
+        let runtime = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let endpoint = crate::network::UdpEndpoint::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let local = endpoint.local_addr().unwrap();
+        let owner = endpoint.shared_socket();
+        let socket = owner.register(runtime.handle()).unwrap();
+        let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut router = PeerIngressRouter::new(2).unwrap();
+        let mut peer = router
+            .register_call(sender.local_addr().unwrap(), 22, 42, 7)
+            .unwrap();
+        let truncate =
+            unsafe { library.get::<unsafe extern "C" fn(i32)>(b"rptadv_test_truncate_receive\0") }
+                .unwrap();
+        unsafe { truncate(0) };
+        let pump = ListenerIngress::start(runtime.clone(), socket, router, Some(owner));
+        let packet = serialize_full_frame(
+            &FullFrameHeader {
+                source_call_number: 42,
+                destination_call_number: 22,
+                retransmission: false,
+                timestamp: 0,
+                outgoing_sequence: 0,
+                incoming_sequence: 0,
+                frame_type: 6,
+                subclass: IaxCommand::Ack.subclass_value() as u8,
+                subclass_is_log: false,
+            },
+            &[],
+        )
+        .unwrap();
+        sender.send_to(&packet, local).unwrap();
+        sender.send_to(&packet, local).unwrap();
+        let received = runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(2), peer.receive())
+                .await
+                .unwrap()
+                .unwrap()
+        });
+        assert_eq!(received.payload(), &packet);
+        assert!(!peer.failed());
+        drop(pump);
+    }
+
+    #[test]
     fn stopped_before_first_poll_fails_admission_and_established_peers() {
         let runtime = Arc::new(
             tokio::runtime::Builder::new_current_thread()
@@ -525,7 +586,7 @@ mod tests {
         let peer = router
             .register_call("127.0.0.1:4569".parse().unwrap(), 22, 42, 7)
             .unwrap();
-        let mut pump = ListenerIngress::start(runtime.clone(), Arc::new(socket), router);
+        let mut pump = ListenerIngress::start(runtime.clone(), Arc::new(socket), router, None);
         pump.stop.send_replace(true);
 
         assert!(runtime.block_on(pump.admission.receive()).is_none());
@@ -557,7 +618,7 @@ mod tests {
         };
         let mut router = PeerIngressRouter::new(4).unwrap();
         let mut peer = router.register_call(remote, 22, 42, 7).unwrap();
-        let mut pump = ListenerIngress::start(runtime.clone(), Arc::new(socket), router);
+        let mut pump = ListenerIngress::start(runtime.clone(), Arc::new(socket), router, None);
         let packet = |destination, command: IaxCommand| {
             serialize_full_frame(
                 &FullFrameHeader {
@@ -666,7 +727,7 @@ mod tests {
         };
         let mut router = PeerIngressRouter::new(1).unwrap();
         let peer = router.register_call(remote, 22, 42, 7).unwrap();
-        let mut pump = ListenerIngress::start(runtime.clone(), Arc::new(socket), router);
+        let mut pump = ListenerIngress::start(runtime.clone(), Arc::new(socket), router, None);
         runtime.block_on(async {
             tokio::time::timeout(Duration::from_secs(2), pump.admission.wake().notified())
                 .await

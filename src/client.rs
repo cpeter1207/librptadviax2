@@ -21,6 +21,13 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[path = "client_timed.rs"]
+mod timed;
+pub use timed::{SourceTimeInput, TimedPeerEvent};
+#[path = "client_egress.rs"]
+mod egress;
+pub use egress::{EgressRetirement, EgressTime, TimedMediaSend};
+
 const IE_CALLED_NUMBER: u8 = 1;
 const IE_CALLING_NUMBER: u8 = 2;
 const IE_CALLING_ANI: u8 = 3;
@@ -46,6 +53,7 @@ struct PendingEvent {
 struct PacketPcm {
     samples: Vec<f32>,
     position: usize,
+    span: crate::source_time::Span,
 }
 impl PacketPcm {
     fn remaining(&self) -> usize {
@@ -152,6 +160,9 @@ pub struct IaxPeer {
     pending_replies: VecDeque<Vec<u8>>,
     pending_events: VecDeque<PendingEvent>,
     direct_pcm: PacketPcm,
+    incoming_receipt: Option<crate::source_time::Receipt>,
+    timed: timed::State,
+    egress: egress::State,
     answered: bool,
     voice_epoch: Option<u32>,
     release_on_drop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
@@ -173,6 +184,13 @@ struct SendStatistics {
     would_block: std::cell::Cell<u64>,
     retries: u64,
 }
+
+type ReceivedPacket = (
+    usize,
+    SocketAddr,
+    Instant,
+    Option<crate::source_time::Receipt>,
+);
 
 enum PeerEndpoint {
     Dedicated(UdpEndpoint),
@@ -197,9 +215,16 @@ pub(crate) struct SharedDial {
 type SocketIngress = (
     std::sync::Arc<tokio::net::UdpSocket>,
     crate::ingress::IngressProducer,
+    std::sync::Arc<SharedSocket>,
 );
 
 impl PeerEndpoint {
+    fn clock_revoked(&self) -> bool {
+        match self {
+            Self::Dedicated(endpoint) => endpoint.shared_socket().source_clock.revoked(),
+            Self::Shared { socket, .. } => socket.source_clock.revoked(),
+        }
+    }
     fn send_to(&self, packet: &[u8], remote: SocketAddr) -> io::Result<usize> {
         #[cfg(test)]
         unit_tests::send_fault(remote)?;
@@ -216,11 +241,23 @@ impl PeerEndpoint {
         }
     }
 
-    fn receive(&mut self, buffer: &mut [u8]) -> io::Result<Option<(usize, SocketAddr, Instant)>> {
+    fn receive(&mut self, buffer: &mut [u8]) -> io::Result<Option<ReceivedPacket>> {
         match self {
-            Self::Dedicated(endpoint) => endpoint
-                .try_receive(buffer)
-                .map(|packet| packet.map(|(length, address)| (length, address, Instant::now()))),
+            Self::Dedicated(endpoint) => {
+                endpoint
+                    .shared_socket()
+                    .receive_timed(buffer)
+                    .map(|packet| {
+                        packet.map(|(length, address, receipt)| {
+                            (
+                                length,
+                                address,
+                                receipt.map_or_else(Instant::now, |receipt| receipt.instant),
+                                receipt,
+                            )
+                        })
+                    })
+            }
             Self::Shared { ingress, .. } => {
                 let Some(datagram) = ingress.try_pop() else {
                     if ingress.failed() {
@@ -243,6 +280,7 @@ impl PeerEndpoint {
                     payload.len(),
                     datagram.remote(),
                     datagram.arrived_at(),
+                    datagram.receipt(),
                 )))
             }
         }
@@ -342,7 +380,7 @@ impl IaxPeer {
             .pending_reliable
             .iter()
             .map(|frame| {
-                if blocked {
+                if blocked || (self.egress.active && egress::payload_voice(&frame.packet)) {
                     frame.expires_at
                 } else {
                     frame.next_retry.min(frame.expires_at)
@@ -355,13 +393,18 @@ impl IaxPeer {
             .and_then(|playout| playout.deadline(now));
         // A due provider item left unconsumed by the bounded product turn means
         // inbound PCM backpressure, not idle work. Retry that work at 10 ms.
-        let provider = protocol.into_iter().chain(playout).min().map(|deadline| {
-            if deadline <= now {
-                now + crate::async_driver::TIMER_INTERVAL
-            } else {
-                deadline
-            }
-        });
+        let provider = protocol
+            .into_iter()
+            .chain(playout)
+            .chain(self.timed_deadline())
+            .min()
+            .map(|deadline| {
+                if deadline <= now {
+                    now + crate::async_driver::TIMER_INTERVAL
+                } else {
+                    deadline
+                }
+            });
         let product = self
             .product_deadline
             .unwrap_or(Some(now + crate::async_driver::TIMER_INTERVAL));
@@ -491,12 +534,12 @@ impl IaxPeer {
             .map_err(|_| io::Error::other("invalid IAX ingress capacity"))?;
         let wake = ingress.wake();
         self.endpoint = PeerEndpoint::Shared {
-            socket: shared,
+            socket: shared.clone(),
             ingress,
             local,
         };
         self.async_attached = true;
-        Ok((wake, Some((socket, producer))))
+        Ok((wake, Some((socket, producer, shared))))
     }
 
     pub(crate) fn from_inbound(
@@ -528,6 +571,9 @@ impl IaxPeer {
             pending_replies: VecDeque::new(),
             pending_events: VecDeque::new(),
             direct_pcm: PacketPcm::default(),
+            incoming_receipt: None,
+            timed: timed::State::default(),
+            egress: egress::State::default(),
             answered: true,
             voice_epoch: None,
             release_on_drop: Some(std::sync::Arc::clone(&released)),
@@ -652,6 +698,7 @@ impl IaxPeer {
         flush: bool,
     ) -> Result<crate::codec::providers::EncodeResult, DialError> {
         self.ensure_provider_live()?;
+        self.ensure_egress_preparation()?;
         self.codecs
             .as_mut()
             .ok_or(DialError::InvalidOptions)?
@@ -701,6 +748,9 @@ impl IaxPeer {
         timestamp_ms: u32,
     ) -> Result<MediaSend, DialError> {
         self.ensure_provider_live()?;
+        if self.egress.active {
+            return Err(DialError::InvalidOptions);
+        }
         self.validate_phone_payload(payload)?;
         if payload.len() > self.maximum_datagram() - 12 {
             return Err(DialError::InvalidOptions);
@@ -801,8 +851,20 @@ impl IaxPeer {
         pcm: &mut [f32],
         text: &mut [u8],
     ) -> Result<IaxPeerEvent, DialError> {
+        if self.timed.enabled {
+            return Err(DialError::InvalidOptions);
+        }
+        self.poll_event_inner(pcm, text)
+    }
+
+    fn poll_event_inner(
+        &mut self,
+        pcm: &mut [f32],
+        text: &mut [u8],
+    ) -> Result<IaxPeerEvent, DialError> {
         self.ensure_provider_live()?;
         if let Some(pending) = self.pending_events.front_mut() {
+            self.timed.last_span = pending.pcm.span.clone();
             if let Some(count) = pending.pcm.render(pcm)? {
                 if pending.pcm.remaining() == 0 {
                     self.pending_events.pop_front();
@@ -843,6 +905,7 @@ impl IaxPeer {
                                 _ => Vec::new(),
                             },
                             position: 0,
+                            span: self.timed.last_span.clone(),
                         },
                         text: match event {
                             IaxPeerEvent::Text(count) => text[..count].to_vec(),
@@ -863,6 +926,7 @@ impl IaxPeer {
         self.ensure_provider_live()?;
         self.retry_reliable_frames()?;
         self.flush_replies()?;
+        self.timed.last_span = self.direct_pcm.span.clone();
         if let Some(count) = self.direct_pcm.render(pcm)? {
             return Ok(IaxPeerEvent::Audio(count));
         }
@@ -873,7 +937,7 @@ impl IaxPeer {
                 break;
             }
             let mut packet = [0_u8; MAX_PACKET_SIZE];
-            let Some((length, address, arrived_at)) = self
+            let Some((length, address, arrived_at, receipt)) = self
                 .endpoint
                 .receive(&mut packet)
                 .map_err(DialError::Network)?
@@ -881,7 +945,10 @@ impl IaxPeer {
                 break;
             };
             let event = if address == self.remote {
-                self.receive_event(&packet[..length], arrived_at, pcm, text)?
+                {
+                    self.incoming_receipt = receipt;
+                    self.receive_event(&packet[..length], arrived_at, pcm, text)?
+                }
             } else {
                 IaxPeerEvent::None
             };
@@ -890,11 +957,15 @@ impl IaxPeer {
             }
         }
         match &mut self.playout {
-            Some(playout) => playout.poll_with_codec(
-                Instant::now(),
-                pcm,
-                self.codecs.as_mut().map(|codecs| &mut codecs.decoder),
-            ),
+            Some(playout) => {
+                let event = playout.poll_with_codec(
+                    Instant::now(),
+                    pcm,
+                    self.codecs.as_mut().map(|codecs| &mut codecs.decoder),
+                )?;
+                self.timed.last_span = playout.last_span().clone();
+                Ok(event)
+            }
             None => Ok(IaxPeerEvent::None),
         }
     }
@@ -933,6 +1004,7 @@ impl IaxPeer {
                         .iter()
                         .filter(|pending| {
                             pending.sent
+                                && !(self.egress.active && egress::payload_voice(&pending.packet))
                                 && pending
                                     .outgoing_sequence
                                     .wrapping_sub(frame.header.incoming_sequence)
@@ -1066,13 +1138,21 @@ impl IaxPeer {
             return Ok(IaxPeerEvent::None);
         }
         self.validate_phone_payload(payload)?;
+        if !self.accept_timed_receipt()? {
+            return Ok(IaxPeerEvent::None);
+        }
+        self.timed.last_span = crate::source_time::Span::new(self.incoming_receipt);
         if let Some(playout) = &mut self.playout {
-            playout.put_with_codec(
+            playout.put_received(
                 timestamp,
                 mini,
                 arrived_at,
                 payload,
                 self.codecs.as_ref().map(|codecs| &codecs.decoder),
+                self.timed
+                    .enabled
+                    .then_some(self.incoming_receipt)
+                    .flatten(),
             )?;
             return Ok(IaxPeerEvent::None);
         }
@@ -1096,6 +1176,7 @@ impl IaxPeer {
                         .map_err(DialError::Provider)?;
                     self.direct_pcm.samples.truncate(frames);
                     self.direct_pcm.position = 0;
+                    self.direct_pcm.span = self.timed.last_span.clone();
                     match self.direct_pcm.render(pcm)? {
                         Some(count) => Ok(IaxPeerEvent::Audio(count)),
                         None => Ok(IaxPeerEvent::Gap(required)),
@@ -1184,6 +1265,9 @@ impl IaxPeer {
         for frame in &mut self.pending_reliable {
             if now >= frame.expires_at {
                 return Err(DialError::Timeout);
+            }
+            if self.egress.active && egress::payload_voice(&frame.packet) {
+                continue;
             }
             if now < frame.next_retry {
                 continue;
@@ -1469,7 +1553,7 @@ pub(crate) fn dial_new_transport(
                 .check()
                 .map_err(|_| DialError::Protocol(CallSetupError::CallFinished))?;
         }
-        let Some((length, address, _arrived_at)) =
+        let Some((length, address, _arrived_at, _receipt)) =
             endpoint.receive(&mut packet).map_err(DialError::Network)?
         else {
             let now = Instant::now();
@@ -1538,6 +1622,9 @@ pub(crate) fn dial_new_transport(
                     pending_replies: VecDeque::new(),
                     pending_events: VecDeque::new(),
                     direct_pcm: PacketPcm::default(),
+                    incoming_receipt: None,
+                    timed: timed::State::default(),
+                    egress: egress::State::default(),
                     answered: false,
                     voice_epoch: None,
                     release_on_drop,

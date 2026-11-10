@@ -24,6 +24,7 @@ pub mod protocol;
 pub mod provider;
 pub mod server;
 pub mod session;
+mod source_time;
 pub mod text;
 
 #[cfg(test)]

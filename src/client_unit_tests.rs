@@ -20,6 +20,31 @@ thread_local! {
     static SEND_FAULT: std::cell::Cell<Option<(SocketAddr, std::io::ErrorKind)>> = const { std::cell::Cell::new(None) };
 }
 
+struct TimedCommitGate {
+    remote: SocketAddr,
+    timestamp: u32,
+    reached: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+static TIMED_COMMIT_GATE: std::sync::Mutex<Option<TimedCommitGate>> = std::sync::Mutex::new(None);
+pub(super) fn timed_egress_commit_checkpoint(remote: SocketAddr, timestamp: u32) {
+    let gate = {
+        let mut slot = TIMED_COMMIT_GATE.lock().unwrap();
+        if slot
+            .as_ref()
+            .is_some_and(|gate| gate.remote == remote && gate.timestamp == timestamp)
+        {
+            slot.take()
+        } else {
+            None
+        }
+    };
+    if let Some(gate) = gate {
+        gate.reached.send(()).unwrap();
+        gate.release.recv_timeout(Duration::from_secs(2)).unwrap();
+    }
+}
+
 /// Inject only the UDP send boundary; sequencing and received bytes remain real.
 pub(super) fn send_fault(remote: SocketAddr) -> std::io::Result<()> {
     match SEND_FAULT.get() {
@@ -707,6 +732,9 @@ fn linked_peer(remote: SocketAddr) -> IaxPeer {
         pending_replies: VecDeque::new(),
         pending_events: VecDeque::new(),
         direct_pcm: super::PacketPcm::default(),
+        incoming_receipt: None,
+        timed: super::timed::State::default(),
+        egress: super::egress::State::default(),
         answered: true,
         voice_epoch: None,
         release_on_drop: None,
@@ -735,6 +763,678 @@ fn shared_peer(remote: SocketAddr) -> (IaxPeer, crate::ingress::IngressProducer)
     )
     .unwrap();
     (peer, producer)
+}
+
+#[test]
+fn timed_poll_retains_one_original_birth_across_partial_pcm_and_requires_exact_epoch_ack() {
+    use super::{IaxPeerEvent, SourceTimeInput, TimedPeerEvent};
+    let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let mut peer = linked_peer(remote.local_addr().unwrap());
+    let input = SourceTimeInput {
+        host_clock_epoch: 7,
+        reference_now_ns: 5_000_000_000,
+        acknowledged_media_epoch: 0,
+    };
+    let first = peer.poll_timed(&mut [0.0; 40], &mut [], input).unwrap();
+    assert!(first.discontinuity);
+    assert_eq!(first.media_epoch, 1);
+    let mut input = SourceTimeInput {
+        acknowledged_media_epoch: 1,
+        ..input
+    };
+    // Establish genuine RX timestamp availability with wire probes; no fabricated receipt.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let packet = crate::protocol::serialize_mini_frame(
+            &crate::protocol::MiniFrameHeader {
+                source_call_number: 5678,
+                timestamp: 20,
+            },
+            &[0xff; 160],
+        )
+        .unwrap();
+        remote.send_to(&packet, peer.local_addr().unwrap()).unwrap();
+        let event = peer.poll_timed(&mut [0.0; 160], &mut [], input).unwrap();
+        if event.discontinuity {
+            assert_eq!(event.event, IaxPeerEvent::None);
+            input.acknowledged_media_epoch = event.media_epoch;
+        }
+        if event.born_ns.is_some() {
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    let packet = crate::protocol::serialize_mini_frame(
+        &crate::protocol::MiniFrameHeader {
+            source_call_number: 5678,
+            timestamp: 40,
+        },
+        &[0x80; 160],
+    )
+    .unwrap();
+    remote.send_to(&packet, peer.local_addr().unwrap()).unwrap();
+    std::thread::sleep(Duration::from_millis(25));
+    let first: TimedPeerEvent = peer.poll_timed(&mut [0.0; 40], &mut [], input).unwrap();
+    assert_eq!(first.event, IaxPeerEvent::Audio(40));
+    let birth = first
+        .born_ns
+        .expect("genuine kernel receipt survives decode");
+    assert!(birth < input.reference_now_ns - 25_000_000);
+    for suffix in 1..4 {
+        let event = peer
+            .poll_timed(
+                &mut [0.0; 40],
+                &mut [],
+                SourceTimeInput {
+                    reference_now_ns: input.reference_now_ns + 50_000_000,
+                    ..input
+                },
+            )
+            .unwrap();
+        assert_eq!(event.event, IaxPeerEvent::Audio(40));
+        assert_eq!(event.born_ns, Some(birth));
+        assert_eq!(event.source_start, first.source_start + suffix * 40);
+    }
+    let changed = SourceTimeInput {
+        host_clock_epoch: 8,
+        ..input
+    };
+    let reset = peer.poll_timed(&mut [0.0; 160], &mut [], changed).unwrap();
+    assert!(reset.discontinuity);
+    assert_eq!(reset.media_epoch, input.acknowledged_media_epoch + 1);
+    assert!(
+        peer.poll_timed(&mut [0.0; 160], &mut [], changed)
+            .unwrap()
+            .discontinuity,
+        "stale ack1 cannot acknowledge target2"
+    );
+    assert!(
+        !peer
+            .poll_timed(
+                &mut [0.0; 160],
+                &mut [],
+                SourceTimeInput {
+                    acknowledged_media_epoch: reset.media_epoch,
+                    ..changed
+                }
+            )
+            .unwrap()
+            .discontinuity
+    );
+}
+
+#[test]
+fn caller_supplied_ingress_instant_never_qualifies_timed_audio() {
+    use super::{IaxPeerEvent, SourceTimeInput};
+    let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let (mut peer, mut producer) = shared_peer(remote.local_addr().unwrap());
+    let input = SourceTimeInput {
+        host_clock_epoch: 1,
+        reference_now_ns: u64::MAX,
+        acknowledged_media_epoch: 0,
+    };
+    assert!(
+        peer.poll_timed(&mut [], &mut [], input)
+            .unwrap()
+            .discontinuity
+    );
+    let packet = crate::protocol::serialize_mini_frame(
+        &crate::protocol::MiniFrameHeader {
+            source_call_number: 5678,
+            timestamp: 20,
+        },
+        &[0xff; 160],
+    )
+    .unwrap();
+    producer
+        .try_push_at(remote.local_addr().unwrap(), &packet, Instant::now())
+        .unwrap();
+    let event = peer
+        .poll_timed(
+            &mut [0.0; 160],
+            &mut [],
+            SourceTimeInput {
+                acknowledged_media_epoch: 1,
+                ..input
+            },
+        )
+        .unwrap();
+    assert_eq!(event.event, IaxPeerEvent::Audio(160));
+    assert_eq!(event.born_ns, None);
+    assert!(matches!(
+        peer.poll_event(&mut [], &mut []),
+        Err(DialError::InvalidOptions)
+    ));
+    assert!(
+        peer.poll_timed(
+            &mut [],
+            &mut [],
+            super::SourceTimeInput {
+                host_clock_epoch: 2,
+                ..input
+            }
+        )
+        .unwrap()
+        .discontinuity
+    );
+}
+
+#[test]
+fn actual_clock_loss_before_or_after_decode_retires_media_and_preserves_private_untimed_control() {
+    const CHILD: &str = "RPTADV_IAX_PEER_CLOCK_CHILD";
+    let Some(selection) = std::env::var_os(CHILD) else {
+        let (path, _library) = crate::source_time::tests::fault_library();
+        for selection in ["before", "publish"] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "client::unit_tests::actual_clock_loss_before_or_after_decode_retires_media_and_preserves_private_untimed_control", "--nocapture"])
+                .env(CHILD, selection).env("LD_PRELOAD", &path).output().unwrap();
+            assert!(
+                output.status.success(),
+                "{selection}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        return;
+    };
+    let _probe = crate::source_time::tests::timestamp_probe();
+    let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let mut peer = linked_peer(remote.local_addr().unwrap());
+    let input = super::SourceTimeInput {
+        host_clock_epoch: 1,
+        reference_now_ns: 5_000_000_000,
+        acknowledged_media_epoch: 0,
+    };
+    assert!(
+        peer.poll_timed(&mut [], &mut [], input)
+            .unwrap()
+            .discontinuity
+    );
+    let input = super::SourceTimeInput {
+        acknowledged_media_epoch: 1,
+        ..input
+    };
+    let packet = crate::protocol::serialize_mini_frame(
+        &crate::protocol::MiniFrameHeader {
+            source_call_number: 5678,
+            timestamp: 20,
+        },
+        &[0x80; 160],
+    )
+    .unwrap();
+    remote.send_to(&packet, peer.local_addr().unwrap()).unwrap();
+    let mut first_pcm = vec![0.0; if selection == "before" { 40 } else { 160 }];
+    let first = peer.poll_timed(&mut first_pcm, &mut [], input).unwrap();
+    assert!(first.born_ns.is_some());
+    let library =
+        unsafe { libloading::Library::new(std::env::var_os("LD_PRELOAD").unwrap()) }.unwrap();
+    if selection == "before" {
+        let fd = match &peer.endpoint {
+            PeerEndpoint::Dedicated(endpoint) => {
+                endpoint.shared_socket().source_clock.monitor_fd().unwrap()
+            }
+            _ => unreachable!(),
+        };
+        let cancel = unsafe {
+            library.get::<unsafe extern "C" fn(i32) -> i32>(b"rptadv_test_cancel_timerfd\0")
+        }
+        .unwrap();
+        assert_eq!(unsafe { cancel(fd) }, 0);
+    } else {
+        // pre-poll check, RX map pre-check, RX map post-check succeed; the
+        // fourth actual realtime read fails at the final publication fence.
+        let fail = unsafe {
+            library.get::<unsafe extern "C" fn(u32)>(b"rptadv_test_fail_realtime_after\0")
+        }
+        .unwrap();
+        unsafe { fail(3) };
+    }
+    if selection == "publish" {
+        remote.send_to(&packet, peer.local_addr().unwrap()).unwrap();
+    } else {
+        assert_eq!(peer.direct_pcm.remaining(), 120);
+    }
+    let reset = peer.poll_timed(&mut [0.0; 40], &mut [], input).unwrap();
+    assert_eq!(
+        (reset.media_epoch, reset.event, reset.born_ns),
+        (2, super::IaxPeerEvent::None, None)
+    );
+    assert!(reset.discontinuity);
+    assert_eq!(peer.direct_pcm.remaining(), 0);
+    assert!(
+        peer.poll_timed(&mut [], &mut [], input)
+            .unwrap()
+            .discontinuity
+    );
+    let acknowledged = super::SourceTimeInput {
+        acknowledged_media_epoch: 2,
+        ..input
+    };
+    let _ = peer
+        .poll_timed(&mut [0.0; 160], &mut [], acknowledged)
+        .unwrap();
+    remote.send_to(&packet, peer.local_addr().unwrap()).unwrap();
+    let private = peer
+        .poll_timed(&mut [0.0; 160], &mut [], acknowledged)
+        .unwrap();
+    assert_eq!(
+        (private.event, private.born_ns, private.discontinuity),
+        (super::IaxPeerEvent::Audio(160), None, false)
+    );
+    let digit = serialize_full_frame(
+        &FullFrameHeader {
+            source_call_number: 5678,
+            destination_call_number: 1234,
+            retransmission: false,
+            timestamp: 40,
+            outgoing_sequence: 1,
+            incoming_sequence: 1,
+            frame_type: 1,
+            subclass_is_log: false,
+            subclass: b'5',
+        },
+        &[],
+    )
+    .unwrap();
+    remote.send_to(&digit, peer.local_addr().unwrap()).unwrap();
+    let digit = peer.poll_timed(&mut [], &mut [0; 1], acknowledged).unwrap();
+    assert_eq!(
+        (digit.event, digit.born_ns),
+        (super::IaxPeerEvent::Digit(b'5'), None)
+    );
+}
+
+#[test]
+fn actual_retained_pcm_and_kernel_queue_expiry_retire_epochs_without_relabeling_old_audio() {
+    use super::{IaxPeerEvent, SourceTimeInput};
+    for retain_pcm in [false, true] {
+        let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut peer = linked_peer(remote.local_addr().unwrap());
+        let input = SourceTimeInput {
+            host_clock_epoch: 1,
+            reference_now_ns: 5_000_000_000,
+            acknowledged_media_epoch: 0,
+        };
+        assert!(
+            peer.poll_timed(&mut [], &mut [], input)
+                .unwrap()
+                .discontinuity
+        );
+        let mut input = SourceTimeInput {
+            acknowledged_media_epoch: 1,
+            ..input
+        };
+        let packet = crate::protocol::serialize_mini_frame(
+            &crate::protocol::MiniFrameHeader {
+                source_call_number: 5678,
+                timestamp: 20,
+            },
+            &[0x80; 160],
+        )
+        .unwrap();
+        // Prime actual kernel stamp activation before this distinct retained packet.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            remote.send_to(&packet, peer.local_addr().unwrap()).unwrap();
+            let event = peer.poll_timed(&mut [0.0; 160], &mut [], input).unwrap();
+            if event.discontinuity {
+                assert_eq!(event.event, IaxPeerEvent::None);
+                input.acknowledged_media_epoch = event.media_epoch;
+            }
+            if event.born_ns.is_some() {
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        remote.send_to(&packet, peer.local_addr().unwrap()).unwrap();
+        if retain_pcm {
+            assert_eq!(
+                peer.poll_timed(&mut [0.0; 40], &mut [], input)
+                    .unwrap()
+                    .event,
+                IaxPeerEvent::Audio(40)
+            );
+            assert_eq!(peer.direct_pcm.remaining(), 120);
+        }
+        std::thread::sleep(Duration::from_millis(510));
+        let mut untouched = [0.25; 160];
+        let reset = peer.poll_timed(&mut untouched, &mut [], input).unwrap();
+        assert!(reset.discontinuity);
+        assert_eq!(
+            (reset.media_epoch, reset.event, reset.born_ns),
+            (input.acknowledged_media_epoch + 1, IaxPeerEvent::None, None)
+        );
+        assert_eq!(untouched, [0.25; 160]);
+        assert_eq!(peer.direct_pcm.remaining(), 0);
+        assert!(
+            peer.poll_timed(&mut untouched, &mut [], input)
+                .unwrap()
+                .discontinuity
+        );
+        assert!(
+            !peer
+                .poll_timed(
+                    &mut untouched,
+                    &mut [],
+                    SourceTimeInput {
+                        acknowledged_media_epoch: reset.media_epoch,
+                        ..input
+                    }
+                )
+                .unwrap()
+                .discontinuity
+        );
+    }
+}
+
+#[test]
+fn async_timed_owner_wakes_for_original_history_expiry_after_real_jitter_goes_quiet() {
+    let _probe = crate::source_time::tests::timestamp_probe();
+    let runtime = crate::provider_tests::runtime();
+    let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let mut peer = linked_peer(remote.local_addr().unwrap());
+    let local = peer.local_addr().unwrap();
+    let paths = std::fs::read_dir("/usr/lib")
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| {
+            entry
+                .path()
+                .join("rpt_advanced/librptadv_jitter_adapter.so.1")
+        })
+        .filter(|path| path.exists())
+        .collect::<Vec<_>>();
+    assert_eq!(paths.len(), 1);
+    let library = unsafe { libloading::Library::new(&paths[0]) }.unwrap();
+    let entry = unsafe {
+        library.get::<unsafe extern "C" fn() -> *const std::ffi::c_void>(
+            b"rptadv_jitter_adapter_descriptor_v1\0",
+        )
+    }
+    .unwrap();
+    unsafe { peer.configure_jitter(entry()) }.unwrap();
+    peer.set_product_deadline(u64::MAX).unwrap();
+    let (wake, ingress) = peer.prepare_async_ingress(runtime.handle()).unwrap();
+    let (socket, producer, owner) = ingress.unwrap();
+    let pump = crate::async_driver::DatagramPump::from_socket(
+        runtime.handle(),
+        socket,
+        remote.local_addr().unwrap(),
+        producer,
+        Some(owner),
+    );
+    let (sender, events) = std::sync::mpsc::channel();
+    let started = Instant::now();
+    let mut acknowledged = 0;
+    let driver = crate::async_driver::PeerDriver::attach(runtime.handle(), wake, move || {
+        let input = super::SourceTimeInput {
+            host_clock_epoch: 1,
+            reference_now_ns: 1_000_000_000 + started.elapsed().as_nanos() as u64,
+            acknowledged_media_epoch: acknowledged,
+        };
+        let event = peer
+            .poll_timed(&mut [0.0; 160], &mut [0; 1], input)
+            .unwrap();
+        if event.discontinuity || event.event != super::IaxPeerEvent::None {
+            sender.send(event).unwrap();
+        }
+        if event.discontinuity {
+            acknowledged = event.media_epoch;
+        }
+        Some(peer.wait_state())
+    });
+    let initial = events.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(initial.discontinuity);
+    assert_eq!(initial.media_epoch, 1);
+    let packet = crate::protocol::serialize_mini_frame(
+        &crate::protocol::MiniFrameHeader {
+            source_call_number: 5678,
+            timestamp: 20,
+        },
+        &[0xff; 160],
+    )
+    .unwrap();
+    remote.send_to(&packet, local).unwrap();
+    let audio = events.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(audio.event, super::IaxPeerEvent::Audio(160));
+    assert!(audio.born_ns.is_some());
+    let expired = events.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(
+        (expired.media_epoch, expired.event, expired.discontinuity),
+        (2, super::IaxPeerEvent::None, true)
+    );
+    driver.stop();
+    driver.detach();
+    pump.detach();
+    drop(library);
+}
+
+#[test]
+fn real_routed_old_receipts_are_rejected_at_ingress_or_after_a_host_epoch_retirement() {
+    let _probe = crate::source_time::tests::timestamp_probe();
+    for expired in [true, false] {
+        let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let (mut peer, mut producer) = shared_peer(remote.local_addr().unwrap());
+        let input = super::SourceTimeInput {
+            host_clock_epoch: 1,
+            reference_now_ns: 5_000_000_000,
+            acknowledged_media_epoch: 0,
+        };
+        assert!(
+            peer.poll_timed(&mut [], &mut [], input)
+                .unwrap()
+                .discontinuity
+        );
+        let packet = crate::protocol::serialize_mini_frame(
+            &crate::protocol::MiniFrameHeader {
+                source_call_number: 5678,
+                timestamp: 20,
+            },
+            &[0xff; 160],
+        )
+        .unwrap();
+        remote.send_to(&packet, peer.local_addr().unwrap()).unwrap();
+        let mut bytes = [0; 256];
+        let (count, source, receipt) = match &peer.endpoint {
+            PeerEndpoint::Shared { socket, .. } => {
+                socket.receive_timed(&mut bytes).unwrap().unwrap()
+            }
+            _ => unreachable!(),
+        };
+        assert!(receipt.is_some());
+        if expired {
+            std::thread::sleep(Duration::from_millis(510));
+        }
+        producer
+            .try_push_received(source, &bytes[..count], receipt.unwrap().instant, receipt)
+            .unwrap();
+        let input = super::SourceTimeInput {
+            host_clock_epoch: if expired { 1 } else { 2 },
+            acknowledged_media_epoch: 1,
+            ..input
+        };
+        let event = peer.poll_timed(&mut [0.0; 160], &mut [], input).unwrap();
+        assert_eq!(
+            (
+                event.media_epoch,
+                event.event,
+                event.born_ns,
+                event.discontinuity
+            ),
+            (2, super::IaxPeerEvent::None, None, true)
+        );
+    }
+}
+
+#[test]
+fn actual_unknown_and_kernel_qualified_source_history_transitions_require_new_retirement_targets() {
+    let _probe = crate::source_time::tests::timestamp_probe();
+    let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let (mut peer, mut producer) = shared_peer(remote.local_addr().unwrap());
+    let mut input = super::SourceTimeInput {
+        host_clock_epoch: 1,
+        reference_now_ns: 5_000_000_000,
+        acknowledged_media_epoch: 1,
+    };
+    let packet = crate::protocol::serialize_mini_frame(
+        &crate::protocol::MiniFrameHeader {
+            source_call_number: 5678,
+            timestamp: 20,
+        },
+        &[0xff; 160],
+    )
+    .unwrap();
+    producer
+        .try_push_at(remote.local_addr().unwrap(), &packet, Instant::now())
+        .unwrap();
+    let unknown = peer.poll_timed(&mut [0.0; 160], &mut [], input).unwrap();
+    assert_eq!(
+        (unknown.event, unknown.born_ns),
+        (super::IaxPeerEvent::Audio(160), None)
+    );
+    for step in 0..2 {
+        remote.send_to(&packet, peer.local_addr().unwrap()).unwrap();
+        let mut bytes = [0; 256];
+        let (count, source, receipt) = match &peer.endpoint {
+            PeerEndpoint::Shared { socket, .. } => {
+                socket.receive_timed(&mut bytes).unwrap().unwrap()
+            }
+            _ => unreachable!(),
+        };
+        let receipt = receipt.unwrap();
+        producer
+            .try_push_received(source, &bytes[..count], receipt.instant, Some(receipt))
+            .unwrap();
+        let event = peer.poll_timed(&mut [0.0; 160], &mut [], input).unwrap();
+        if step == 0 {
+            assert_eq!(
+                (event.media_epoch, event.event, event.discontinuity),
+                (2, super::IaxPeerEvent::None, true)
+            );
+            input.acknowledged_media_epoch = 2;
+        } else {
+            assert!(event.born_ns.is_some());
+        }
+    }
+    producer
+        .try_push_at(remote.local_addr().unwrap(), &packet, Instant::now())
+        .unwrap();
+    let reset = peer.poll_timed(&mut [0.0; 160], &mut [], input).unwrap();
+    assert_eq!(
+        (reset.media_epoch, reset.event, reset.discontinuity),
+        (3, super::IaxPeerEvent::None, true)
+    );
+}
+
+#[test]
+fn timed_egress_requires_activation_complete_retirement_and_supported_twenty_millisecond_shape() {
+    use super::{EgressRetirement, EgressTime};
+    let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let mut peer = linked_peer(remote.local_addr().unwrap());
+    let time = EgressTime {
+        epoch: 0,
+        deadline_ms: 500,
+    };
+    assert!(matches!(
+        peer.send_prepared_audio_timed(&[0xff; 160], 160, 0, time),
+        Err(DialError::InvalidOptions)
+    ));
+    peer.send_prepared_audio(&[0xff; 160], 160, 0).unwrap();
+    assert_eq!(peer.retire_egress().unwrap(), EgressRetirement::Pending);
+    assert!(matches!(
+        peer.send_prepared_audio_timed(&[0xff; 160], 160, 0, time),
+        Err(DialError::InvalidOptions)
+    ));
+    let mut fresh = linked_peer(remote.local_addr().unwrap());
+    let EgressRetirement::Complete(epoch) = fresh.retire_egress().unwrap() else {
+        panic!("fresh");
+    };
+    assert!(matches!(
+        fresh.send_prepared_audio_timed(
+            &[0xff; 80],
+            160,
+            0,
+            EgressTime {
+                epoch,
+                deadline_ms: 500
+            }
+        ),
+        Err(DialError::InvalidOptions)
+    ));
+}
+
+#[test]
+fn real_jitter_retained_packet_expires_before_decode_and_resets_its_actual_queue() {
+    let _probe = crate::source_time::tests::timestamp_probe();
+    let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let mut peer = linked_peer(remote.local_addr().unwrap());
+    let paths = std::fs::read_dir("/usr/lib")
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| {
+            entry
+                .path()
+                .join("rpt_advanced/librptadv_jitter_adapter.so.1")
+        })
+        .filter(|path| path.exists())
+        .collect::<Vec<_>>();
+    assert_eq!(paths.len(), 1);
+    let library = unsafe { libloading::Library::new(&paths[0]) }.unwrap();
+    let entry = unsafe {
+        library.get::<unsafe extern "C" fn() -> *const std::ffi::c_void>(
+            b"rptadv_jitter_adapter_descriptor_v1\0",
+        )
+    }
+    .unwrap();
+    unsafe { peer.configure_jitter(entry()) }.unwrap();
+    let input = super::SourceTimeInput {
+        host_clock_epoch: 1,
+        reference_now_ns: 5_000_000_000,
+        acknowledged_media_epoch: 1,
+    };
+    let packet = crate::protocol::serialize_mini_frame(
+        &crate::protocol::MiniFrameHeader {
+            source_call_number: 5678,
+            timestamp: 20,
+        },
+        &[0xff; 160],
+    )
+    .unwrap();
+    remote.send_to(&packet, peer.local_addr().unwrap()).unwrap();
+    assert_eq!(
+        peer.poll_timed(&mut [0.0; 160], &mut [], input)
+            .unwrap()
+            .event,
+        super::IaxPeerEvent::None
+    );
+    assert_eq!(
+        peer.playout
+            .as_ref()
+            .unwrap()
+            .observe()
+            .unwrap()
+            .queued_packets,
+        1
+    );
+    std::thread::sleep(Duration::from_millis(510));
+    let reset = peer.poll_timed(&mut [0.0; 160], &mut [], input).unwrap();
+    assert_eq!(
+        (reset.media_epoch, reset.event, reset.discontinuity),
+        (2, super::IaxPeerEvent::None, true)
+    );
+    assert_eq!(
+        peer.playout
+            .as_ref()
+            .unwrap()
+            .observe()
+            .unwrap()
+            .queued_packets,
+        0
+    );
+    drop(peer);
+    drop(library);
 }
 
 #[test]
@@ -774,6 +1474,7 @@ fn ingress_pending_early_audio_can_be_read_with_smaller_buffers() {
         pcm: super::PacketPcm {
             samples: vec![0.25; 480],
             position: 0,
+            span: crate::source_time::Span::default(),
         },
         text: Vec::new(),
     });
@@ -1274,6 +1975,455 @@ fn cumulative_acknowledgements_handle_wrap_and_ignore_future_sequences() {
 }
 
 #[test]
+fn timed_egress_announces_only_empty_reliable_markers_and_never_replays_expired_pcm() {
+    use super::{EgressRetirement, EgressTime, TimedMediaSend};
+    let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
+    remote
+        .set_read_timeout(Some(Duration::from_millis(50)))
+        .unwrap();
+    let mut peer = linked_peer(remote.local_addr().unwrap());
+    let EgressRetirement::Complete(epoch) = peer.retire_egress().unwrap() else {
+        panic!("new call owns no old PCM");
+    };
+    let time = EgressTime {
+        epoch,
+        deadline_ms: peer.elapsed_ms() + 100,
+    };
+    assert_eq!(
+        peer.send_prepared_audio_timed(&[0xff; 160], 160, 100, time)
+            .unwrap(),
+        TimedMediaSend::Accepted
+    );
+    let mut bytes = [0; 2048];
+    let (count, _) = remote.recv_from(&mut bytes).unwrap();
+    let marker = crate::protocol::parse_full_frame_packet(&bytes[..count]).unwrap();
+    assert_eq!(
+        (
+            marker.header.frame_type,
+            marker.header.timestamp,
+            marker.header.outgoing_sequence,
+            marker.payload.len()
+        ),
+        (2, 100, 1, 0)
+    );
+    let (count, _) = remote.recv_from(&mut bytes).unwrap();
+    assert_eq!(&bytes[4..count], &[0xff; 160]);
+    assert_eq!(peer.pending_reliable.len(), 1);
+    assert_eq!(peer.pending_reliable[0].packet.len(), 12);
+    std::thread::sleep(Duration::from_millis(110));
+    assert_eq!(
+        peer.send_prepared_audio_timed(&[0xff; 160], 160, 100, time)
+            .unwrap(),
+        TimedMediaSend::Expired
+    );
+    assert_eq!(
+        remote.recv_from(&mut bytes).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    let EgressRetirement::Complete(next) = peer.retire_egress().unwrap() else {
+        panic!("empty marker is protocol, not retained PCM");
+    };
+    assert_eq!(next, epoch + 1);
+    let stale = EgressTime {
+        epoch,
+        deadline_ms: peer.elapsed_ms() + 100,
+    };
+    assert_eq!(
+        peer.send_prepared_audio_timed(&[0xff; 160], 160, 120, stale)
+            .unwrap(),
+        TimedMediaSend::Expired
+    );
+    assert!(matches!(
+        peer.send_prepared_audio(&[0xff; 160], 160, 120),
+        Err(DialError::InvalidOptions)
+    ));
+    assert_eq!(
+        remote.recv_from(&mut bytes).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[test]
+fn timed_egress_reannounces_after_a_long_silence_when_initial_pcm_never_committed() {
+    use super::{EgressRetirement, EgressTime, TimedMediaSend};
+    let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
+    remote
+        .set_read_timeout(Some(Duration::from_millis(50)))
+        .unwrap();
+    let mut peer = linked_peer(remote.local_addr().unwrap());
+    let EgressRetirement::Complete(epoch) = peer.retire_egress().unwrap() else {
+        panic!("initial");
+    };
+    let time = EgressTime {
+        epoch,
+        deadline_ms: peer.elapsed_ms() + 500,
+    };
+    let fault = SendFault::set(remote.local_addr().unwrap(), std::io::ErrorKind::WouldBlock);
+    assert_eq!(
+        peer.send_prepared_audio_timed(&[0xff; 160], 160, 100, time)
+            .unwrap(),
+        TimedMediaSend::WouldBlock
+    );
+    drop(fault);
+    std::thread::sleep(Duration::from_millis(505));
+    peer.poll_event(&mut [], &mut []).unwrap();
+    assert_eq!(
+        peer.send_prepared_audio_timed(&[0xff; 160], 160, 100, time)
+            .unwrap(),
+        TimedMediaSend::Expired
+    );
+    let mut bytes = [0; 2048];
+    let (count, _) = remote.recv_from(&mut bytes).unwrap();
+    assert!(
+        crate::protocol::parse_full_frame_packet(&bytes[..count])
+            .unwrap()
+            .payload
+            .is_empty()
+    );
+    assert_eq!(
+        peer.send_prepared_audio_timed(
+            &[0xff; 160],
+            160,
+            40000,
+            EgressTime {
+                epoch,
+                deadline_ms: peer.elapsed_ms() + 500
+            }
+        )
+        .unwrap(),
+        TimedMediaSend::Accepted
+    );
+    let (count, _) = remote.recv_from(&mut bytes).unwrap();
+    let marker = crate::protocol::parse_full_frame_packet(&bytes[..count])
+        .expect("fresh long-gap PCM needs a new full marker even without earlier accepted PCM");
+    assert_eq!((marker.header.timestamp, marker.payload.len()), (40000, 0));
+    assert_eq!(remote.recv_from(&mut bytes).unwrap().0, 164);
+}
+
+#[test]
+fn timed_egress_wouldblock_retains_deadline_and_legacy_pcm_is_an_actual_ack_barrier() {
+    use super::{EgressRetirement, EgressTime, TimedMediaSend};
+    let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
+    remote
+        .set_read_timeout(Some(Duration::from_millis(50)))
+        .unwrap();
+    let address = remote.local_addr().unwrap();
+    let mut peer = linked_peer(address);
+    let EgressRetirement::Complete(epoch) = peer.retire_egress().unwrap() else {
+        panic!("initial retirement");
+    };
+    let time = EgressTime {
+        epoch,
+        deadline_ms: peer.elapsed_ms() + 500,
+    };
+    let fault = SendFault::set(address, std::io::ErrorKind::WouldBlock);
+    assert_eq!(
+        peer.send_prepared_audio_timed(&[0xff; 160], 160, 0, time)
+            .unwrap(),
+        TimedMediaSend::WouldBlock
+    );
+    assert_eq!(
+        peer.send_prepared_audio_timed(&[0xff; 160], 160, 0, time)
+            .unwrap(),
+        TimedMediaSend::WouldBlock
+    );
+    assert_eq!(peer.pending_reliable.len(), 1);
+    drop(fault);
+    std::thread::sleep(Duration::from_millis(505));
+    peer.poll_event(&mut [], &mut []).unwrap();
+    assert_eq!(
+        peer.send_prepared_audio_timed(&[0xff; 160], 160, 0, time)
+            .unwrap(),
+        TimedMediaSend::Expired
+    );
+    let mut bytes = [0; 2048];
+    let (count, _) = remote.recv_from(&mut bytes).unwrap();
+    assert!(
+        crate::protocol::parse_full_frame_packet(&bytes[..count])
+            .unwrap()
+            .payload
+            .is_empty()
+    );
+    assert_eq!(
+        remote.recv_from(&mut bytes).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+
+    let mut legacy = linked_peer(address);
+    legacy.send_prepared_audio(&[0xff; 160], 160, 0).unwrap();
+    remote.recv_from(&mut bytes).unwrap();
+    assert_eq!(legacy.retire_egress().unwrap(), EgressRetirement::Pending);
+    assert_eq!(legacy.retire_egress().unwrap(), EgressRetirement::Pending);
+    legacy.send_text(b"control still reliable").unwrap();
+    let (count, _) = remote.recv_from(&mut bytes).unwrap();
+    assert_eq!(
+        crate::protocol::parse_full_frame_packet(&bytes[..count])
+            .unwrap()
+            .payload,
+        b"control still reliable"
+    );
+    let ack = serialize_full_frame(
+        &FullFrameHeader {
+            source_call_number: 5678,
+            destination_call_number: 1234,
+            retransmission: false,
+            timestamp: 0,
+            outgoing_sequence: 1,
+            incoming_sequence: 3,
+            frame_type: 6,
+            subclass: crate::protocol::IaxCommand::Ack.subclass_value() as u8,
+            subclass_is_log: false,
+        },
+        &[],
+    )
+    .unwrap();
+    remote.send_to(&ack, legacy.local_addr().unwrap()).unwrap();
+    legacy.poll_event(&mut [], &mut []).unwrap();
+    assert_eq!(
+        legacy.retire_egress().unwrap(),
+        EgressRetirement::Complete(2)
+    );
+}
+
+#[test]
+fn timed_mini_commit_rechecks_actual_expiry_and_ffi_reports_wouldblock_without_renewal() {
+    use super::{EgressRetirement, EgressTime, TimedMediaSend};
+    let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
+    remote
+        .set_read_timeout(Some(Duration::from_millis(50)))
+        .unwrap();
+    let address = remote.local_addr().unwrap();
+    let mut peer = linked_peer(address);
+    let EgressRetirement::Complete(epoch) = peer.retire_egress().unwrap() else {
+        panic!("initial retirement");
+    };
+    let time = EgressTime {
+        epoch,
+        deadline_ms: peer.elapsed_ms() + 50,
+    };
+    let (reached, ready) = std::sync::mpsc::channel();
+    let (release, wait) = std::sync::mpsc::channel();
+    *TIMED_COMMIT_GATE.lock().unwrap() = Some(TimedCommitGate {
+        remote: address,
+        timestamp: 100,
+        reached,
+        release: wait,
+    });
+    let job = std::thread::spawn(move || {
+        let result = peer.send_prepared_audio_timed(&[0xff; 160], 160, 100, time);
+        (peer, result)
+    });
+    ready.recv_timeout(Duration::from_secs(2)).unwrap();
+    std::thread::sleep(Duration::from_millis(60));
+    release.send(()).unwrap();
+    let (mut peer, result) = job.join().unwrap();
+    assert_eq!(result.unwrap(), TimedMediaSend::Expired);
+    let mut bytes = [0; 2048];
+    let (count, _) = remote.recv_from(&mut bytes).unwrap();
+    assert!(
+        crate::protocol::parse_full_frame_packet(&bytes[..count])
+            .unwrap()
+            .payload
+            .is_empty()
+    );
+    assert_eq!(
+        remote.recv_from(&mut bytes).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    let api = unsafe { &*crate::ffi::rptadv_iax2_client_descriptor_v2() };
+    let time = crate::ffi::rptadv_iax2_timed_send_v1 {
+        struct_size: std::mem::size_of::<crate::ffi::rptadv_iax2_timed_send_v1>() as u32,
+        abi_version: 1,
+        egress_epoch: epoch,
+        deadline_ms: peer.elapsed_ms() + 500,
+        reserved: 0,
+    };
+    let fault = SendFault::set(address, std::io::ErrorKind::WouldBlock);
+    assert_eq!(
+        unsafe {
+            api.send_prepared_audio_timed.unwrap()(
+                (&mut peer as *mut IaxPeer).cast(),
+                [0xff; 160].as_ptr(),
+                160,
+                160,
+                120,
+                &time,
+            )
+        },
+        1
+    );
+    drop(fault);
+    assert_eq!(
+        unsafe {
+            api.send_prepared_audio_timed.unwrap()(
+                (&mut peer as *mut IaxPeer).cast(),
+                [0xff; 160].as_ptr(),
+                160,
+                160,
+                120,
+                &time,
+            )
+        },
+        0
+    );
+    let (count, _) = remote.recv_from(&mut bytes).unwrap();
+    assert_eq!(count, 164);
+    let fault = SendFault::set(address, std::io::ErrorKind::ConnectionReset);
+    assert!(
+        matches!(peer.send_prepared_audio_timed(&[0xff;160],160,140,EgressTime { epoch, deadline_ms: time.deadline_ms }), Err(DialError::Network(error)) if error.kind() == std::io::ErrorKind::ConnectionReset)
+    );
+    drop(fault);
+}
+
+#[test]
+fn actual_legacy_vnak_pcm_staging_is_retired_without_erasing_control_or_sequence_ownership() {
+    let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
+    remote
+        .set_read_timeout(Some(Duration::from_millis(50)))
+        .unwrap();
+    let address = remote.local_addr().unwrap();
+    let mut peer = linked_peer(address);
+    let local = peer.local_addr().unwrap();
+    peer.send_prepared_audio(&[0xff; 160], 160, 0).unwrap();
+    let mut bytes = [0; 2048];
+    remote.recv_from(&mut bytes).unwrap();
+    let vnak = vnak_packet(1);
+    remote.send_to(&vnak, local).unwrap();
+    let fault = SendFault::set(address, std::io::ErrorKind::WouldBlock);
+    peer.poll_event(&mut [], &mut []).unwrap();
+    assert_eq!(peer.pending_replies.len(), 1);
+    assert_eq!(&peer.pending_replies[0][12..], &[0xff; 160]);
+    drop(fault);
+    assert_eq!(
+        peer.retire_egress().unwrap(),
+        super::EgressRetirement::Pending
+    );
+    assert!(peer.pending_replies.is_empty());
+    assert_eq!(&peer.pending_reliable[0].packet[12..], &[0xff; 160]);
+    peer.begin_turn();
+    peer.set_product_deadline(u64::MAX).unwrap();
+    assert_eq!(
+        peer.wait_state().deadline,
+        Some(peer.pending_reliable[0].expires_at)
+    );
+    assert!(matches!(
+        peer.prepare_audio(&[0.0; 160], &mut [0; 160], false),
+        Err(DialError::InvalidOptions)
+    ));
+    peer.send_text(b"control").unwrap();
+    remote.recv_from(&mut bytes).unwrap();
+    remote.send_to(&vnak, local).unwrap();
+    peer.poll_event(&mut [], &mut []).unwrap();
+    let (count, _) = remote.recv_from(&mut bytes).unwrap();
+    let frame = crate::protocol::parse_full_frame_packet(&bytes[..count]).unwrap();
+    assert_eq!(
+        (
+            frame.header.frame_type,
+            frame.header.retransmission,
+            frame.payload
+        ),
+        (7, true, &b"control"[..])
+    );
+    assert_eq!(
+        remote.recv_from(&mut bytes).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    assert_eq!(peer.pending_reliable.len(), 2);
+    assert_eq!(
+        peer.retire_egress().unwrap(),
+        super::EgressRetirement::Pending
+    );
+}
+
+#[test]
+fn timed_egress_reannounces_wrap_silence_and_timestamp_discontinuity_without_pcm_in_markers() {
+    use super::{EgressRetirement, EgressTime, TimedMediaSend};
+    let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
+    remote
+        .set_read_timeout(Some(Duration::from_millis(50)))
+        .unwrap();
+    let mut peer = linked_peer(remote.local_addr().unwrap());
+    let EgressRetirement::Complete(epoch) = peer.retire_egress().unwrap() else {
+        panic!("initial retirement");
+    };
+    let mut bytes = [0; 2048];
+    let mut next_marker = 1;
+    for (timestamp, announce) in [
+        (100, true),
+        (120, false),
+        (40_000, true),
+        (39_000, true),
+        (65_520, false),
+        (65_540, true),
+    ] {
+        let time = EgressTime {
+            epoch,
+            deadline_ms: peer.elapsed_ms() + 500,
+        };
+        assert_eq!(
+            peer.send_prepared_audio_timed(&[0xff; 160], 160, timestamp, time)
+                .unwrap(),
+            TimedMediaSend::Accepted
+        );
+        if announce {
+            let (count, _) = remote.recv_from(&mut bytes).unwrap();
+            let frame = crate::protocol::parse_full_frame_packet(&bytes[..count]).unwrap();
+            assert_eq!(
+                (
+                    frame.header.frame_type,
+                    frame.header.timestamp,
+                    frame.header.outgoing_sequence
+                ),
+                (2, timestamp, next_marker)
+            );
+            assert!(frame.payload.is_empty());
+            next_marker += 1;
+        }
+        let (count, _) = remote.recv_from(&mut bytes).unwrap();
+        assert_eq!(count, 164);
+        assert_eq!(u16::from_be_bytes([bytes[2], bytes[3]]), timestamp as u16);
+        assert_eq!(&bytes[4..count], &[0xff; 160]);
+    }
+    assert_eq!(next_marker, 5);
+    assert!(
+        peer.pending_reliable
+            .iter()
+            .all(|frame| frame.packet.len() == 12)
+    );
+    assert_eq!(
+        remote.recv_from(&mut bytes).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    let time = EgressTime {
+        epoch,
+        deadline_ms: peer.elapsed_ms() + 500,
+    };
+    let fault = SendFault::set(remote.local_addr().unwrap(), std::io::ErrorKind::WouldBlock);
+    assert_eq!(
+        peer.send_prepared_audio_timed(&[0xff; 160], 160, 65000, time)
+            .unwrap(),
+        TimedMediaSend::WouldBlock
+    );
+    drop(fault);
+    peer.poll_event(&mut [], &mut []).unwrap();
+    let (count, _) = remote.recv_from(&mut bytes).unwrap();
+    let marker = crate::protocol::parse_full_frame_packet(&bytes[..count]).unwrap();
+    assert_eq!((marker.header.timestamp, marker.payload.len()), (65000, 0));
+    assert_eq!(
+        peer.send_prepared_audio_timed(&[0xff; 160], 160, 65000, time)
+            .unwrap(),
+        TimedMediaSend::Accepted
+    );
+    assert_eq!(remote.recv_from(&mut bytes).unwrap().0, 164);
+    peer.begin_turn();
+    peer.set_product_deadline(u64::MAX).unwrap();
+    assert_eq!(
+        peer.wait_state().deadline,
+        Some(peer.pending_reliable[0].next_retry)
+    );
+}
+
+#[test]
 fn shared_endpoint_routes_sends_and_rejects_packets_larger_than_output_storage() {
     let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
     remote
@@ -1306,7 +2456,7 @@ fn shared_endpoint_routes_sends_and_rejects_packets_larger_than_output_storage()
         endpoint
             .receive(&mut [0; 2])
             .unwrap()
-            .map(|(count, remote, _)| (count, remote)),
+            .map(|(count, remote, _, _)| (count, remote)),
         Some((2, remote_address))
     );
 

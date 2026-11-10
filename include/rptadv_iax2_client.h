@@ -112,6 +112,45 @@ const struct rptadv_iax2_async_descriptor_v1 *rptadv_iax2_async_descriptor_v1(vo
 #define RPTADV_IAX2_EVENT_RADIO_UNKEY 6U
 /** Only jitter-configured peers emit this counted input-rate loss span (no PCM data). */
 #define RPTADV_IAX2_EVENT_GAP 7U
+/** No fresh PCM/gap until exact previous media-owner retirement is acknowledged. */
+#define RPTADV_IAX2_EVENT_DISCONTINUITY 8U
+/** Original birth is qualified; absent means private/unqualified media only. */
+#define RPTADV_IAX2_TIMED_BIRTH 1U
+/** Pending retirement TARGET; private/control events can continue meanwhile. */
+#define RPTADV_IAX2_TIMED_DISCONTINUITY 2U
+
+/** Caller-sized ABI1 in/out record,72 bytes on supported native64 platforms.
+ * Inputs must be captured BEFORE poll_timed entry. Birth subtracts original age
+ * plus5ms uncertainty from that fixed reference, once per original span; every
+ * PCM partial/suffix retains it. Underflow/missing/future receipt never qualifies.
+ * Digits remain legacy private untimed IAX digits; no source interval is invented.
+ */
+struct rptadv_iax2_timed_event_v1 {
+    uint32_t struct_size; /**< At least sizeof this record; future tails untouched. */
+    uint32_t abi_version; /**< One. */
+    uint64_t host_clock_epoch; /**< INPUT stable nonzero Host clock identity. */
+    uint64_t reference_now_ns; /**< INPUT time captured BEFORE this provider call. */
+    uint64_t acknowledged_media_epoch; /**< INPUT TARGET whose actual old owners retired. */
+    uint32_t event_kind; /**< OUTPUT ordinary event or DISCONTINUITY. */
+    uint32_t flags; /**< OUTPUT TIMED_BIRTH / TIMED_DISCONTINUITY bits. */
+    size_t event_length; /**< OUTPUT samples/bytes or required PCM capacity on1. */
+    uint64_t media_epoch; /**< OUTPUT epoch / pending retirement TARGET. */
+    uint64_t source_start; /**< OUTPUT playout PCM cursor incl gaps/insertion, not wire time. */
+    uint64_t born_ns; /**< OUTPUT immutable original birth, valid ONLY with TIMED_BIRTH. */
+};
+
+/** Immutable prepared packet expiry,24 bytes on native64. Sample elapsed_ms FIRST,
+ * then the Host clock reference and oldest contributing PCM age. Compute deadline
+ * as that earlier native floor plus the remaining500ms age budget, rounding down.
+ * Never refresh it on WouldBlock, partial input/output, or retained retries.
+ */
+struct rptadv_iax2_timed_send_v1 {
+    uint32_t struct_size; /**< At least this complete record. */
+    uint32_t abi_version; /**< One. */
+    uint64_t egress_epoch; /**< Exact completed local retirement token, not RX epoch. */
+    uint32_t deadline_ms; /**< Absolute peer elapsed deadline; saturation refuses PCM. */
+    uint32_t reserved; /**< Zero. */
+};
 
 /** One explicitly selected bidirectional neutral profile. */
 struct rptadv_iax2_codec_selection_v2 {
@@ -217,6 +256,32 @@ struct rptadv_iax2_client_descriptor_v2 {
      */
     int32_t (*dial_account)(const struct rptadv_iax2_account_dial_options_v1 *options,
                            void **peer);
+    /** Optional offset136/full144 tail; check physical descriptor size first.
+     * Exclusive peer owner; use this OR legacy poll, never alternate modes.
+     * Short records reject before a full-size reference/write. First target is1;
+     * acknowledge only after genuine previous ring/DSP/RF retirement. Stale ack
+     * never releases a later target. No fresh Audio/Gap while reset is pending.
+     * Linux original RX/time qualification loss is sticky; control remains usable.
+     */
+    int32_t (*poll_timed)(void *peer, float *samples, size_t sample_capacity,
+        uint8_t *text, size_t text_capacity, struct rptadv_iax2_timed_event_v1 *record);
+    /** Optional offset144/full152:PCMU/PCMA8k20ms.0 Accepted,1 WouldBlock,
+     *2 Expired/stale token; negative failure. No PCM is committed on1/2.
+     * Reliable codec/timestamp markers carry ZERO PCM; actual media is Mini only.
+     * Caller retains the unchanged packet/deadline/token on WouldBlock.
+     */
+    int32_t (*send_prepared_audio_timed)(void *peer, const uint8_t *bytes, size_t count,
+        uint32_t packet_frames, uint32_t timestamp_ms, const struct rptadv_iax2_timed_send_v1 *timing);
+    /** Optional offset152/full160:serial local retirement before initial timed
+     * send and every source discontinuity.0 returns new TX epoch,1 Pending,
+     * negative failure. Epoch output cleared on1/failure. Retires encoder history
+     * and old local PCM eligibility; caller drops old staged items. Old token
+     * cannot send after retirement. Previously successful UDP cannot be recalled.
+     * Unacknowledged legacy PCM full-frames remain Pending until real ACK/teardown
+     * instead of erasing their OSeq hole; PCM retries suppressed, control preserved.
+     * Empty reliable markers remain protocol obligations, with no remote ACK claim.
+     */
+    int32_t (*retire_egress)(void *peer, uint64_t *egress_epoch);
 };
 
 /**

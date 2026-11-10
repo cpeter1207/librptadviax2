@@ -58,9 +58,85 @@ independent client `dial_account` retain their existing codec and jitter policy.
 Retain the borrowed neutral jitter descriptor's DSO until the peer is destroyed.
 
 This callable account/media layer still requires product configuration and host
-composition. Its current public media poll has no genuine kernel receive-time
-record, so it does not qualify phone PCM for age-bounded RF admission. Mailbox/PIN,
-radio attachment, and live-provider acceptance are separate consumer work.
+composition. Mailbox/PIN, radio attachment, and live-provider acceptance remain
+separate consumer work.
+
+## Original receive time
+
+The optional client ABI2 `poll_timed` slot preserves the released136-byte prefix;
+check through its144-byte table prefix before accessing it. Its caller-sized ABI1 record is
+72 bytes on supported native64 Linux. The ordinary `poll` remains untimed. Use one
+poll mode per exclusive peer owner; legacy polling rejects after timed activation.
+
+Capture a stable Host clock epoch and `reference_now_ns` **before** provider entry.
+Only `TIMED_BIRTH` grants original-time qualification. At first exposure, the
+provider subtracts genuine kernel RX age plus a conservative5ms uncertainty from
+that fixed reference. It caches the result for the whole original span, including
+every PCM partial/retry/suffix. Underflow, missing/future/unrepresentable receipt,
+legacy caller-supplied ingress time, concealment and gaps never supply a fresh birth.
+`source_start` is the checked per-epoch playout PCM cursor, including gaps and delay
+insertion; it is not claimed to be an IAX wire clock or DTMF interval. IAX digits
+remain private untimed events.
+
+Owned UDP sockets request `SO_TIMESTAMPING` software RX stamps, without the
+`SO_TIMESTAMP[NS]` options that can synthesize a missing stamp during dequeue.
+Linux timestamp activation may be deferred; packets without an actual RX record
+remain unqualified. One nonblocking CLOEXEC `timerfd` monitors realtime steps with
+`CANCEL_ON_SET`, plus a fixed realtime/monotonic anchor. Its checked absolute2262
+deadline fits signed64 native ktime and is never rearmed. Initial unavailable
+qualification leaves private control/media usable. Later clock qualification loss
+is sticky and revokes retained epochs; protocol teardown continues without rebase.
+
+Retained source media older than500ms retires actual packet jitter, decoded PCM
+and codec history. `TIMED_DISCONTINUITY` names the new **target** epoch. No fresh
+Audio/Gap is exposed until the consumer acknowledges that exact target **after**
+its prior ring, DSP and RF owners actually retire; stale acknowledgments cannot
+release a newer target. Private control can continue while retirement is pending.
+A native reset failure stays closed until peer teardown. This timing capability
+does not itself authorize mailbox access or RF.
+
+## Timed prepared transmission
+
+The optional client slots `send_prepared_audio_timed` and `retire_egress` extend
+the table to160 bytes, preserving both released136 and timed-RX144-byte prefixes.
+Only these explicitly negotiated phone operations implement the transmit age
+contract; ordinary numeric and independent generic prepared-send behavior remains.
+The first profile is PCMU/PCMA8k20ms, exactly160 encoded bytes/source frames.
+
+Retire egress before its first timed send and each source discontinuity. A completed
+serial local retirement returns a checked TX epoch token, independent of RX epochs.
+It resets the actual encoder and cancels old local PCM eligibility. The consumer
+also abandons its old staged items; their old tokens cannot send after retirement.
+A failed reset stays closed until teardown. A previously committed legacy PCM full
+frame remains `Pending` until real ACK or teardown: it keeps its reliable OSeq hole
+while PCM retries are suppressed. Text/key/control reliability remains intact.
+Successful prior UDP sends cannot be recalled; completion claims no remote ACK.
+
+For a prepared packet, sample `elapsed_ms` **first**, then the Host reference and
+the oldest contributing original PCM age. Add the remaining500ms age budget to
+that earlier native floor, rounding down and checking overflow. Unknown/future
+source age or a saturated native clock cannot qualify a packet. Keep this absolute
+deadline and TX token unchanged through partial encoding, retained buffers and
+`WouldBlock`. The provider rechecks the actual native deadline inside the short
+account lifetime guard immediately before nonblocking UDP commit. `Expired` is
+distinct from `WouldBlock`, and neither commits PCM.
+
+Timed PCM travels only in Mini frames. Reliable full Voice frames announce codec
+and timestamp with **zero PCM**, including first use, Mini wrap and timestamp
+discontinuity/long silence. Lost initial markers can lose media until their reliable
+retry; expired PCM is never retransmitted. Marker/control sequence ownership remains
+intact. Retirements cannot claim a clean protocol shutdown merely because local
+media is canceled. The independent Asterisk fixture checks both G.711 modes,
+incoming/outgoing setup and actual Mini wrap; live-provider/NAT/RF acceptance remains
+separate work.
+
+The kernel contracts are documented in [Linux timestamping](https://docs.kernel.org/networking/timestamping.html)
+and [timerfd](https://man7.org/linux/man-pages/man2/timerfd_create.2.html). The fixed
+ancillary layout follows Linux v6.18 `__sock_recv_timestamp`: this exclusively owned
+Internet UDP socket subscribes to no other ancillary records and never reads the
+error queue. Missing/short records and `MSG_CTRUNC` never qualify; `MSG_TRUNC` drops
+the partial datagram. IPv6 scope/flow and mapped IPv4 endpoints retain the actual
+owned socket family. Tests use owned child-only syscall faults, never host clock changes.
 
 Codec providers supply ULAW, ALAW, GSM, G.723.1, G.726 AAL2, Dialogic ADPCM,
 SLIN, LPC10, G.729, Speex, iLBC, G.726, G.722, SLIN16, Speex16, and Opus.

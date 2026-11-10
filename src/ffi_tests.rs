@@ -13,7 +13,7 @@ fn server_account_operations_extend_the_released_table_prefix() {
         48
     );
     assert_eq!(descriptor.abi_version, 2);
-    assert_eq!(DESCRIPTOR.struct_size as usize, 136);
+    assert_eq!(DESCRIPTOR.struct_size as usize, 160);
     assert_eq!(size_of::<rptadv_iax2_server_options_v2>(), 64);
     assert!(descriptor.configure_accounts.is_some());
     assert!(descriptor.register_account.is_some());
@@ -1585,7 +1585,7 @@ fn native_plc_output_capacity_is_retryable_not_a_peer_failure() {
 #[test]
 fn egress_abi2_layout_and_prepared_codec() {
     let api = unsafe { &*super::rptadv_iax2_client_descriptor_v2() };
-    assert_eq!(api.struct_size as usize, 24 + 14 * size_of::<usize>());
+    assert_eq!(api.struct_size as usize, 24 + 17 * size_of::<usize>());
     assert_eq!(
         std::mem::offset_of!(rptadv_iax2_client_descriptor_v2, dial_account),
         24 + 13 * size_of::<usize>()
@@ -1672,4 +1672,410 @@ fn egress_abi2_layout_and_prepared_codec() {
         assert_eq!(api.elapsed_ms.unwrap()(ptr::null()), 0);
         destroy(peer);
     }
+}
+
+#[test]
+fn timed_optional_tail_rejects_physical_short_records_and_preserves_future_canaries() {
+    assert_eq!(size_of::<rptadv_iax2_timed_event_v1>(), 72);
+    assert_eq!(
+        std::mem::offset_of!(rptadv_iax2_client_descriptor_v2, poll_timed),
+        136
+    );
+    assert!(DESCRIPTOR.poll_timed.is_some());
+    let mut short = 4_u32;
+    assert_eq!(
+        unsafe {
+            poll_timed(
+                ptr::null_mut(),
+                ptr::null_mut(),
+                0,
+                ptr::null_mut(),
+                0,
+                ptr::from_mut(&mut short).cast(),
+            )
+        },
+        -1
+    );
+    assert_eq!(short, 4);
+    assert_eq!(
+        unsafe {
+            poll_timed(
+                ptr::null_mut(),
+                ptr::null_mut(),
+                0,
+                ptr::null_mut(),
+                0,
+                ptr::null_mut(),
+            )
+        },
+        -1
+    );
+    #[repr(C)]
+    struct Future {
+        record: rptadv_iax2_timed_event_v1,
+        canary: u64,
+    }
+    let mut future = Future {
+        record: rptadv_iax2_timed_event_v1 {
+            struct_size: size_of::<Future>() as u32,
+            abi_version: 2,
+            host_clock_epoch: 7,
+            reference_now_ns: 9,
+            acknowledged_media_epoch: 11,
+            event_kind: 99,
+            flags: 99,
+            event_length: 99,
+            media_epoch: 99,
+            source_start: 99,
+            born_ns: 99,
+        },
+        canary: 0x1234_5678_90ab_cdef,
+    };
+    let (peer, _server, _) = establish();
+    for invalid in 0..4 {
+        future.record.abi_version = if invalid == 0 { 2 } else { 1 };
+        let result = unsafe {
+            poll_timed(
+                if invalid == 1 { ptr::null_mut() } else { peer },
+                ptr::null_mut(),
+                usize::from(invalid == 2),
+                ptr::null_mut(),
+                usize::from(invalid == 3),
+                &mut future.record,
+            )
+        };
+        assert_eq!(result, -1);
+        assert_eq!(
+            (
+                future.record.event_kind,
+                future.record.flags,
+                future.record.event_length,
+                future.record.media_epoch,
+                future.record.source_start,
+                future.record.born_ns
+            ),
+            (0, 0, 0, 0, 0, 0)
+        );
+        assert_eq!(
+            (
+                future.record.host_clock_epoch,
+                future.record.reference_now_ns,
+                future.record.acknowledged_media_epoch
+            ),
+            (7, 9, 11)
+        );
+        assert_eq!(future.canary, 0x1234_5678_90ab_cdef);
+    }
+    future.record.abi_version = 1;
+    assert_eq!(
+        unsafe {
+            poll_timed(
+                peer,
+                ptr::null_mut(),
+                0,
+                ptr::null_mut(),
+                0,
+                &mut future.record,
+            )
+        },
+        0
+    );
+    assert_eq!(
+        (
+            future.record.event_kind,
+            future.record.flags,
+            future.record.media_epoch
+        ),
+        (
+            RPTADV_IAX2_EVENT_DISCONTINUITY,
+            RPTADV_IAX2_TIMED_DISCONTINUITY,
+            1
+        )
+    );
+    assert_eq!(future.canary, 0x1234_5678_90ab_cdef);
+    future.record.acknowledged_media_epoch = 1;
+    assert_eq!(
+        unsafe {
+            poll_timed(
+                peer,
+                ptr::null_mut(),
+                0,
+                ptr::null_mut(),
+                0,
+                &mut future.record,
+            )
+        },
+        0
+    );
+    assert_eq!(
+        (future.record.event_kind, future.record.flags),
+        (RPTADV_IAX2_EVENT_NONE, 0)
+    );
+    unsafe { destroy(peer) };
+}
+
+#[test]
+fn timed_ffi_outputfull_retains_the_real_packet_until_pcm_storage_is_available() {
+    let _probe = crate::source_time::tests::timestamp_probe();
+    let (peer, server, client) = establish();
+    let mut record = rptadv_iax2_timed_event_v1 {
+        struct_size: size_of::<rptadv_iax2_timed_event_v1>() as u32,
+        abi_version: 1,
+        host_clock_epoch: 1,
+        reference_now_ns: 5_000_000_000,
+        acknowledged_media_epoch: 1,
+        ..Default::default()
+    };
+    let packet = crate::protocol::serialize_mini_frame(
+        &crate::protocol::MiniFrameHeader {
+            source_call_number: REMOTE_CALL,
+            timestamp: 20,
+        },
+        &[0xff; 160],
+    )
+    .unwrap();
+    server.send_to(&packet, client).unwrap();
+    assert_eq!(
+        unsafe { poll_timed(peer, ptr::null_mut(), 0, ptr::null_mut(), 0, &mut record) },
+        1
+    );
+    assert_eq!(
+        (record.event_kind, record.event_length, record.flags),
+        (0, 1, 0)
+    );
+    let mut pcm = [1.0; 40];
+    let mut birth = None;
+    for offset in 0..4 {
+        assert_eq!(
+            unsafe {
+                poll_timed(
+                    peer,
+                    pcm.as_mut_ptr(),
+                    pcm.len(),
+                    ptr::null_mut(),
+                    0,
+                    &mut record,
+                )
+            },
+            0
+        );
+        assert_eq!(
+            (
+                record.event_kind,
+                record.event_length,
+                record.source_start,
+                record.flags
+            ),
+            (
+                RPTADV_IAX2_EVENT_AUDIO,
+                40,
+                offset * 40,
+                RPTADV_IAX2_TIMED_BIRTH
+            )
+        );
+        assert_eq!(record.born_ns, *birth.get_or_insert(record.born_ns));
+        assert_eq!(pcm, [0.0; 40]);
+    }
+    unsafe { destroy(peer) };
+}
+
+#[test]
+fn decoded_but_unexposed_outputfull_pcm_expires_without_acquiring_a_new_birth() {
+    let _probe = crate::source_time::tests::timestamp_probe();
+    let (peer, server, client) = establish();
+    let mut record = rptadv_iax2_timed_event_v1 {
+        struct_size: size_of::<rptadv_iax2_timed_event_v1>() as u32,
+        abi_version: 1,
+        host_clock_epoch: 1,
+        reference_now_ns: 5_000_000_000,
+        acknowledged_media_epoch: 1,
+        ..Default::default()
+    };
+    let packet = crate::protocol::serialize_mini_frame(
+        &crate::protocol::MiniFrameHeader {
+            source_call_number: REMOTE_CALL,
+            timestamp: 20,
+        },
+        &[0xff; 160],
+    )
+    .unwrap();
+    server.send_to(&packet, client).unwrap();
+    assert_eq!(
+        unsafe { poll_timed(peer, ptr::null_mut(), 0, ptr::null_mut(), 0, &mut record) },
+        1
+    );
+    thread::sleep(Duration::from_millis(510));
+    let mut pcm = [0.25; 160];
+    assert_eq!(
+        unsafe {
+            poll_timed(
+                peer,
+                pcm.as_mut_ptr(),
+                pcm.len(),
+                ptr::null_mut(),
+                0,
+                &mut record,
+            )
+        },
+        0
+    );
+    assert_eq!(
+        (
+            record.event_kind,
+            record.flags,
+            record.media_epoch,
+            record.born_ns
+        ),
+        (
+            RPTADV_IAX2_EVENT_DISCONTINUITY,
+            RPTADV_IAX2_TIMED_DISCONTINUITY,
+            2,
+            0
+        )
+    );
+    assert_eq!(pcm, [0.25; 160]);
+    unsafe { destroy(peer) };
+}
+
+#[test]
+fn timed_send_tail_validates_physical_prefixes_and_reports_real_pending_complete_and_expired_outcomes()
+ {
+    assert_eq!(size_of::<rptadv_iax2_timed_send_v1>(), 24);
+    assert_eq!(
+        std::mem::offset_of!(rptadv_iax2_client_descriptor_v2, send_prepared_audio_timed),
+        144
+    );
+    assert_eq!(
+        std::mem::offset_of!(rptadv_iax2_client_descriptor_v2, retire_egress),
+        152
+    );
+    let mut short = 4_u32;
+    assert_eq!(
+        unsafe {
+            send_prepared_audio_timed(
+                ptr::null_mut(),
+                ptr::null(),
+                0,
+                0,
+                0,
+                ptr::from_mut(&mut short).cast(),
+            )
+        },
+        -1
+    );
+    assert_eq!(short, 4);
+    assert_eq!(
+        unsafe { send_prepared_audio_timed(ptr::null_mut(), ptr::null(), 0, 0, 0, ptr::null()) },
+        -1
+    );
+    let mut token = 99;
+    assert_eq!(unsafe { retire_egress(ptr::null_mut(), &mut token) }, -1);
+    assert_eq!(token, 0);
+    assert_eq!(
+        unsafe { retire_egress(ptr::null_mut(), ptr::null_mut()) },
+        -1
+    );
+    let (peer, server, client) = establish();
+    assert_eq!(
+        unsafe { send_prepared_audio(peer, [0xff; 160].as_ptr(), 160, 160, 0) },
+        0
+    );
+    let mut bytes = [0; 2048];
+    server.recv_from(&mut bytes).unwrap();
+    assert_eq!(unsafe { retire_egress(peer, &mut token) }, 1);
+    assert_eq!(token, 0);
+    let ack = serialize_full_frame(
+        &FullFrameHeader {
+            source_call_number: REMOTE_CALL,
+            destination_call_number: LOCAL_CALL,
+            retransmission: false,
+            timestamp: 0,
+            outgoing_sequence: 2,
+            incoming_sequence: 2,
+            frame_type: 6,
+            subclass: crate::protocol::IaxCommand::Ack.subclass_value() as u8,
+            subclass_is_log: false,
+        },
+        &[],
+    )
+    .unwrap();
+    server.send_to(&ack, client).unwrap();
+    let (mut kind, mut length) = (99, 99);
+    assert_eq!(
+        unsafe {
+            poll(
+                peer,
+                ptr::null_mut(),
+                0,
+                ptr::null_mut(),
+                0,
+                &mut kind,
+                &mut length,
+            )
+        },
+        0
+    );
+    assert_eq!(unsafe { retire_egress(peer, &mut token) }, 0);
+    assert_eq!(token, 2);
+    let mut timing = rptadv_iax2_timed_send_v1 {
+        struct_size: size_of::<rptadv_iax2_timed_send_v1>() as u32,
+        abi_version: 1,
+        egress_epoch: token,
+        deadline_ms: unsafe { elapsed_ms(peer) } + 500,
+        reserved: 0,
+    };
+    for invalid in 0..5 {
+        timing.abi_version = if invalid == 0 { 2 } else { 1 };
+        timing.reserved = u32::from(invalid == 1);
+        assert_eq!(
+            unsafe {
+                send_prepared_audio_timed(
+                    if invalid == 2 { ptr::null_mut() } else { peer },
+                    if invalid == 3 {
+                        ptr::null()
+                    } else {
+                        bytes.as_ptr()
+                    },
+                    160,
+                    if invalid == 4 { 80 } else { 160 },
+                    20,
+                    &timing,
+                )
+            },
+            -1
+        );
+    }
+    timing.abi_version = 1;
+    timing.reserved = 0;
+    timing.deadline_ms = unsafe { elapsed_ms(peer) };
+    assert_eq!(
+        unsafe { send_prepared_audio_timed(peer, bytes.as_ptr(), 160, 160, 20, &timing) },
+        2
+    );
+    timing.deadline_ms += 500;
+    assert_eq!(
+        unsafe { send_prepared_audio_timed(peer, [0xff; 160].as_ptr(), 160, 160, 20, &timing) },
+        0
+    );
+    unsafe { destroy(peer) };
+}
+
+#[test]
+fn timed_phone_sender_rejects_actual_negotiated_opus_without_relabeling_its_clock() {
+    let (peer, _server, _) = establish_profile(ProfileId::Opus);
+    let mut epoch = 0;
+    assert_eq!(unsafe { retire_egress(peer, &mut epoch) }, 0);
+    let timing = rptadv_iax2_timed_send_v1 {
+        struct_size: size_of::<rptadv_iax2_timed_send_v1>() as u32,
+        abi_version: 1,
+        egress_epoch: epoch,
+        deadline_ms: unsafe { elapsed_ms(peer) } + 500,
+        reserved: 0,
+    };
+    assert_eq!(
+        unsafe { send_prepared_audio_timed(peer, [0xff; 160].as_ptr(), 160, 160, 0, &timing) },
+        -1
+    );
+    assert_eq!(unsafe { sample_rate_hz(peer) }, 48000);
+    unsafe { destroy(peer) };
 }

@@ -6,6 +6,59 @@ use std::sync::{
 };
 use std::time::Duration;
 
+#[test]
+fn owned_datagram_pump_drops_a_real_truncated_datagram_and_keeps_the_next_packet() {
+    let Some(library) = crate::source_time::tests::fault_child(
+        "async_driver_tests::owned_datagram_pump_drops_a_real_truncated_datagram_and_keeps_the_next_packet",
+    ) else {
+        return;
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let endpoint = crate::network::UdpEndpoint::bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let local = endpoint.local_addr().unwrap();
+    let owner = endpoint.shared_socket();
+    let socket = owner.register(runtime.handle()).unwrap();
+    let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let (producer, mut consumer) = producer_ingress(2, 1).unwrap();
+    let truncate =
+        unsafe { library.get::<unsafe extern "C" fn(i32)>(b"rptadv_test_truncate_receive\0") }
+            .unwrap();
+    unsafe { truncate(0) };
+    let pump = crate::async_driver::DatagramPump::from_socket(
+        runtime.handle(),
+        socket,
+        sender.local_addr().unwrap(),
+        producer,
+        Some(owner),
+    );
+    sender
+        .send_to(b"drop this complete datagram", local)
+        .unwrap();
+    sender.send_to(b"next", local).unwrap();
+    let packet = runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(2), consumer.receive())
+            .await
+            .unwrap()
+            .unwrap()
+    });
+    assert_eq!(packet.payload(), b"next");
+    assert!(!consumer.failed());
+    pump.stop();
+    assert!(
+        runtime
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(2), consumer.receive())
+                    .await
+                    .unwrap()
+            })
+            .is_none()
+    );
+    pump.detach();
+}
+
 fn attach_polling(
     runtime: &tokio::runtime::Handle,
     wake: crate::ingress::IngressWake,
