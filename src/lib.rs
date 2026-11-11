@@ -40,4 +40,5 @@ mod inbound_tests;
 mod provider_tests;
 
 #[cfg(test)]
+#[path = "../tests/support/allocation.rs"]
 mod allocation_test_support;
