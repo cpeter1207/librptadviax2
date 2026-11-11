@@ -18,7 +18,7 @@ symbols without a second cost/emergency-number policy.
 The optional server ABI2 tail adds `configure_accounts`, `register_account`,
 `poll_accounts`, and `dial_provider_account`. Check `struct_size` through each
 required slot: the released 56-byte table prefix is unchanged; the complete table
-is 88 bytes. Bind options retain their 48-byte prefix and have a 64-byte complete
+was 88 bytes in alpha11. Bind options retain their 48-byte prefix and have a 64-byte complete
 record. Account arrays use the exact ABI1 record stride declared in the header.
 
 Configure an opaque account label, nonzero configuration generation, resolved
@@ -60,6 +60,33 @@ Retain the borrowed neutral jitter descriptor's DSO until the peer is destroyed.
 This callable account/media layer still requires product configuration and host
 composition. Mailbox/PIN, radio attachment, and live-provider acceptance remain
 separate consumer work.
+
+## Prepared listener configuration
+
+The optional 112-byte server tail adds `prepare_configuration_batch`,
+`commit_configuration_batch`, and `destroy_configuration_batch`; the released
+88-byte account prefix stays unchanged. Require the complete tail and all three
+slots before using a transaction. Sequential per-listener replacement is not a
+safe fallback: it may retire calls before another listener fails preparation.
+
+Prepare copies complete numeric binding and provider account replacements for
+all distinct retained listeners, validates and allocates every replacement, then
+reserves the whole cohort. Conflicting configuration changes return busy while
+normal poll, registration, dial, and media continue against the old configuration.
+A failed or destroyed preparation leaves old account and numeric lifetimes intact.
+An empty numeric/account replacement disables admission and retires those owners
+at commit, permitting socket cleanup afterward.
+
+A valid reserved token commits once with no allocation, callbacks, network waits,
+or recoverable late failure. All listener locks are acquired in address order and
+held until the complete cohort is published. Unchanged owners keep their exact
+lifetimes. Commit or destroy consumes the token; retain all listeners and their
+DSO until then. Null consumption is harmless; a reused or invalid nonnull token
+violates the caller contract. No Rust mutex guard crosses a C return.
+
+This is a listener transaction, not a claim about an external product's commit
+point. The consumer must finish its other fallible preparation and know whether
+product publication occurred before consuming the listener token as a commit.
 
 ## Original receive time
 

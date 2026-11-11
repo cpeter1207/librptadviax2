@@ -19,6 +19,9 @@ use std::{
 #[path = "provider_ffi.rs"]
 mod provider;
 pub use provider::*;
+#[path = "configuration_ffi.rs"]
+mod configuration;
+pub use configuration::rptadv_iax2_configuration_entry_v1;
 
 /// Exact C-client ABI revision.
 pub const RPTADV_IAX2_CLIENT_ABI_VERSION: u32 = 2;
@@ -380,6 +383,18 @@ pub struct rptadv_iax2_server_descriptor_v2 {
             *mut rptadv_iax2_provider_call_receipt_v1,
         ) -> i32,
     >,
+    /// Prepare and reserve a whole listener configuration cohort without changing admission.
+    pub prepare_configuration_batch: Option<
+        unsafe extern "C" fn(
+            *const rptadv_iax2_configuration_entry_v1,
+            usize,
+            *mut *mut c_void,
+        ) -> i32,
+    >,
+    /// Consume a valid reserved token with no fallible work, allocation or callbacks.
+    pub commit_configuration_batch: Option<unsafe extern "C" fn(*mut c_void)>,
+    /// Consume an uncommitted token, releasing reservations without retiring old owners.
+    pub destroy_configuration_batch: Option<unsafe extern "C" fn(*mut c_void)>,
 }
 
 const DESCRIPTOR: rptadv_iax2_client_descriptor_v2 = rptadv_iax2_client_descriptor_v2 {
@@ -417,6 +432,9 @@ const SERVER_DESCRIPTOR: rptadv_iax2_server_descriptor_v2 = rptadv_iax2_server_d
     register_account: Some(provider::register_account),
     poll_accounts: Some(provider::poll_accounts),
     dial_provider_account: Some(provider::dial_provider_account),
+    prepare_configuration_batch: Some(configuration::prepare),
+    commit_configuration_batch: Some(configuration::commit),
+    destroy_configuration_batch: Some(configuration::destroy),
 };
 
 #[cfg(test)]

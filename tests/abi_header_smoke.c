@@ -34,6 +34,15 @@ _Static_assert(offsetof(struct rptadv_iax2_client_descriptor_v2, send_prepared_a
 _Static_assert(offsetof(struct rptadv_iax2_client_descriptor_v2, retire_egress) == 152, "egress retirement tail order");
 _Static_assert(sizeof(struct rptadv_iax2_timed_send_v1) == 24, "timed send record layout");
 
+_Static_assert(offsetof(struct rptadv_iax2_server_descriptor_v2, prepare_configuration_batch) == 88,
+    "prepared configuration must preserve released88 prefix");
+_Static_assert(offsetof(struct rptadv_iax2_server_descriptor_v2, commit_configuration_batch) == 96,
+    "configuration commit tail order");
+_Static_assert(offsetof(struct rptadv_iax2_server_descriptor_v2, destroy_configuration_batch) == 104,
+    "configuration destroy tail order");
+_Static_assert(sizeof(struct rptadv_iax2_configuration_entry_v1) == 48,
+    "configuration entry stride");
+
 static void *open_catalog(void)
 {
 	const struct rptadv_iax2_client_descriptor_v2 *client = rptadv_iax2_client_descriptor_v2();

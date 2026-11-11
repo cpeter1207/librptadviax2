@@ -3,7 +3,29 @@ use super::*;
 #[test]
 fn server_account_operations_extend_the_released_table_prefix() {
     let descriptor = unsafe { &*rptadv_iax2_server_descriptor_v2() };
-    assert_eq!(descriptor.struct_size as usize, 88);
+    assert_eq!(descriptor.struct_size as usize, 112);
+    assert_eq!(
+        std::mem::offset_of!(
+            rptadv_iax2_server_descriptor_v2,
+            prepare_configuration_batch
+        ),
+        88
+    );
+    assert_eq!(
+        std::mem::offset_of!(rptadv_iax2_server_descriptor_v2, commit_configuration_batch),
+        96
+    );
+    assert_eq!(
+        std::mem::offset_of!(
+            rptadv_iax2_server_descriptor_v2,
+            destroy_configuration_batch
+        ),
+        104
+    );
+    assert_eq!(size_of::<rptadv_iax2_configuration_entry_v1>(), 48);
+    assert!(descriptor.prepare_configuration_batch.is_some());
+    assert!(descriptor.commit_configuration_batch.is_some());
+    assert!(descriptor.destroy_configuration_batch.is_some());
     assert_eq!(
         std::mem::offset_of!(rptadv_iax2_server_descriptor_v2, bind),
         24
