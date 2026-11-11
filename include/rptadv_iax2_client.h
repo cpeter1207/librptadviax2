@@ -438,6 +438,21 @@ typedef int32_t (*rptadv_iax2_accept_v1)(void *context,
     const uint8_t *remote, size_t remote_length,
     const uint8_t *source, size_t source_length, void *peer);
 
+/** Borrowed whole-listener configuration, copied by batch preparation.
+ * Arrays use this exact ABI1 record stride. Retain every listener until the
+ * returned token is consumed by commit or destroy; never destroy/reuse a
+ * listener handle while reserved. Caller strings/arrays need live only through
+ * prepare. Numeric bindings and provider identities remain separate.
+ */
+struct rptadv_iax2_configuration_entry_v1 {
+    uint32_t struct_size; /**< Exactly sizeof this ABI1 record. */
+    uint32_t abi_version; /**< Exactly1. */
+    void *listener; /**< Unique live listener; duplicates in a batch reject. */
+    struct rptadv_iax2_bytes_v1 local_nodes; /**< Decimal comma-separated bindings. */
+    const struct rptadv_iax2_provider_account_v1 *accounts; /**< Copied account array. */
+    size_t account_count; /**< At most64; empty accounts and nodes disable admission. */
+};
+
 /** Synchronous control operations; no callback is retained. Optional operations
  * share this listener's socket/router and source port. No control mutex is held
  * across foreign callbacks or network/route waits, so policy may reconfigure
@@ -485,6 +500,30 @@ struct rptadv_iax2_server_descriptor_v2 {
     int32_t (*dial_provider_account)(void *listener,
         const struct rptadv_iax2_provider_dial_options_v1 *options, void **peer,
         struct rptadv_iax2_provider_call_receipt_v1 *receipt);
+    /** Optional offset88: validate/copy/allocate and reserve the entire batch.
+     * Zero returns one unique token; failure clears it and preserves every old
+     * account, call and numeric admission generation. Empty batches reject.
+     * No network operation, callback or Rust mutex guard survives this call.
+     * While reserved, configure_accounts/set_local_nodes/overlapping preparation
+     * reject without mutation; polling and existing call work retain old state.
+     * Call off audio. Inputs must describe readable exact-stride records.
+     */
+    int32_t (*prepare_configuration_batch)(
+        const struct rptadv_iax2_configuration_entry_v1 *entries, size_t count, void **token);
+    /** Optional offset96: consume the valid token exactly once and publish every
+     * reserved listener together. No fallible work, allocation, callback or
+     * network operation remains. Unchanged owners retain their exact lifetime;
+     * changed account/numeric admissions retire. Listener locks use deterministic
+     * order and are released before returning. NULL is harmless; a fabricated or
+     * previously consumed token is caller misuse, not a recoverable reload error.
+     * The caller commits only after its other product preparation has succeeded.
+     */
+    void (*commit_configuration_batch)(void *token);
+    /** Optional offset104: consume an uncommitted token exactly once, releasing
+     * reservations without changing or retiring old owners. NULL is harmless.
+     * No configuration token may survive listener destruction or DSO unloading.
+     */
+    void (*destroy_configuration_batch)(void *token);
 };
 
 /** Borrow the immutable listener table while this shared library remains loaded. */

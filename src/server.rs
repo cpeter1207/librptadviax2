@@ -14,6 +14,7 @@ use crate::{
     session::{InboundNewAction, process_inbound_new},
 };
 use std::{
+    borrow::Cow,
     io,
     net::SocketAddr,
     sync::{
@@ -30,6 +31,9 @@ use async_ingress::ListenerIngress;
 #[path = "server_provider.rs"]
 mod provider_admission;
 pub use provider_admission::{CompletedPoll, PreparedPoll};
+#[path = "server_configuration.rs"]
+mod configuration;
+pub(crate) use configuration::PreparedConfiguration;
 
 static NEXT_INBOUND_CALL: AtomicU32 = AtomicU32::new(0);
 
@@ -127,6 +131,7 @@ pub struct InboundIaxListener {
     accounts: Vec<Arc<Account>>,
     life: Arc<Life>,
     legacy_admission: Arc<Life>,
+    configuration_reserved: bool,
     pending_provider: Vec<provider_admission::PendingIncoming>,
     #[cfg(test)]
     fail_next_poll: bool,
@@ -335,6 +340,7 @@ impl InboundIaxListener {
                 .collect(),
             life: Life::new(),
             legacy_admission: Life::new(),
+            configuration_reserved: false,
             pending_provider: Vec::with_capacity(MAX_ACCOUNTS),
             #[cfg(test)]
             fail_next_poll: false,
@@ -392,6 +398,9 @@ impl InboundIaxListener {
 
     /// Replace local identities for future calls; established peer routes remain active.
     pub fn set_local_nodes(&mut self, local_nodes: &[String]) -> Result<(), ListenerError> {
+        if self.configuration_reserved {
+            return Err(ListenerError::Provider(AccountError::Busy));
+        }
         if !(valid_local_nodes(local_nodes) || local_nodes.is_empty() && !self.accounts.is_empty())
         {
             return Err(ListenerError::InvalidFrame);
@@ -408,6 +417,17 @@ impl InboundIaxListener {
     /// Established provider peers retain their resources but become unusable
     /// when their exact account retires; the product must close/destroy them.
     pub fn configure_accounts(&mut self, configs: &[AccountConfig]) -> Result<(), AccountError> {
+        self.validate_accounts(configs)?;
+        let next = self.prepare_accounts(configs.iter().map(Cow::Borrowed))?;
+        self.replace_accounts(next);
+        Ok(())
+    }
+
+    /// Validate replacement identity without changing any existing account lifetime.
+    fn validate_accounts(&self, configs: &[AccountConfig]) -> Result<(), AccountError> {
+        if self.configuration_reserved {
+            return Err(AccountError::Busy);
+        }
         if !valid_accounts(configs)
             || configs.iter().any(|config| {
                 self.accounts.iter().any(|old| {
@@ -419,6 +439,14 @@ impl InboundIaxListener {
         {
             return Err(AccountError::InvalidOptions);
         }
+        Ok(())
+    }
+
+    /// Retain unchanged account owners; transfer already copied records without copying twice.
+    fn prepare_accounts<'a>(
+        &self,
+        configs: impl ExactSizeIterator<Item = Cow<'a, AccountConfig>>,
+    ) -> Result<Vec<Arc<Account>>, AccountError> {
         let mut next = Vec::new();
         next.try_reserve(configs.len())
             .map_err(|_| AccountError::Busy)?;
@@ -430,19 +458,23 @@ impl InboundIaxListener {
                     .cloned()
                     .unwrap_or_else(|| {
                         Arc::new(Account {
-                            config: config.clone(),
+                            config: config.into_owned(),
                             life: Life::new(),
                         })
                     }),
             );
         }
+        Ok(next)
+    }
+
+    /// Publish prepared storage and revoke only account owners absent from the replacement.
+    fn replace_accounts(&mut self, next: Vec<Arc<Account>>) {
         for old in &self.accounts {
             if !next.iter().any(|new| Arc::ptr_eq(old, new)) {
                 old.life.retire();
             }
         }
         self.accounts = next;
-        Ok(())
     }
 
     /// Snapshot an exact configured account and reserve a listener-local route.
@@ -747,4 +779,45 @@ fn check_reply_send(sent: io::Result<usize>, expected: usize) -> Result<(), List
 fn next_call_number() -> u16 {
     let offset = NEXT_INBOUND_CALL.fetch_add(1, Ordering::Relaxed) % 16_384;
     (16_384 + offset) as u16
+}
+
+#[cfg(test)]
+pub(crate) mod configuration_test_support {
+    use super::*;
+    /// Test-only snapshot of concrete account and numeric admission fences.
+    pub(crate) struct Snapshot {
+        pub(crate) accounts: Vec<Arc<Account>>,
+        pub(crate) legacy: Arc<Life>,
+        pub(crate) server: Arc<Life>,
+        pub(crate) nodes: Vec<String>,
+    }
+    /// Observe generation ownership without mutating a production listener.
+    pub(crate) fn snapshot(listener: &InboundIaxListener) -> Snapshot {
+        Snapshot {
+            accounts: listener.accounts.clone(),
+            legacy: listener.legacy_admission.clone(),
+            server: listener.life.clone(),
+            nodes: listener.local_nodes.clone(),
+        }
+    }
+    impl Snapshot {
+        pub(crate) fn account_live(&self, index: usize) -> bool {
+            Ownership {
+                server: self.server.clone(),
+                account: self.accounts[index].life.clone(),
+                operation: Life::new(),
+            }
+            .check()
+            .is_ok()
+        }
+        pub(crate) fn numeric_live(&self) -> bool {
+            Ownership {
+                server: self.server.clone(),
+                account: self.legacy.clone(),
+                operation: Life::new(),
+            }
+            .check()
+            .is_ok()
+        }
+    }
 }

@@ -11,7 +11,9 @@
 #include <unistd.h>
 
 _Static_assert(sizeof(struct rptadv_iax2_server_options_v2) == 64, "server options layout");
-_Static_assert(sizeof(struct rptadv_iax2_server_descriptor_v2) == 88, "server tail layout");
+_Static_assert(sizeof(struct rptadv_iax2_server_descriptor_v2) == 112, "server transaction tail layout");
+_Static_assert(offsetof(struct rptadv_iax2_server_descriptor_v2, prepare_configuration_batch) == 88,
+    "prepared configuration preserves the released account prefix");
 _Static_assert(offsetof(struct rptadv_iax2_server_descriptor_v2, configure_accounts) == 56, "released server prefix");
 _Static_assert(offsetof(struct rptadv_iax2_server_descriptor_v2, dial_provider_account) == 80, "shared outgoing slot");
 _Static_assert(sizeof(struct rptadv_iax2_provider_account_v1) == 104, "account record stride");

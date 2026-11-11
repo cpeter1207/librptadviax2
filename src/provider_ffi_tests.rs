@@ -1059,3 +1059,6 @@ fn exact_outgoing_account_retirement_at_final_publication_never_transfers_the_an
         0
     );
 }
+
+#[path = "configuration_ffi_tests.rs"]
+mod configuration;

@@ -501,6 +501,22 @@ fn provider_incoming_authenticates_nonnumeric_caller_then_uses_the_common_dynami
     });
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     let mut authorized = 0;
+    let mut authorized_route = None;
+    let assert_metadata = |metadata: &crate::provider::ProviderCallMetadata| {
+        assert_eq!(metadata.account, "provider-one");
+        assert_eq!(metadata.account_generation, 7);
+        assert_eq!(metadata.local_binding, "n".repeat(63));
+        assert_eq!(metadata.username, "telephone-login");
+        assert_eq!(metadata.caller_number, "KG0BP");
+        assert_eq!(metadata.called, "incoming-extension");
+        assert_eq!(metadata.caller_name, "Untrusted display");
+        assert_eq!(metadata.context, "untrusted-context");
+        assert_eq!(metadata.remote, remote);
+        assert_eq!(metadata.local, bound);
+        assert_eq!(metadata.remote_call, 77);
+        assert_eq!(metadata.format, 4);
+        assert!(metadata.incoming && metadata.call_generation != 0 && metadata.local_call != 0);
+    };
     let call = loop {
         match listener
             .poll_accounts(
@@ -508,12 +524,8 @@ fn provider_incoming_authenticates_nonnumeric_caller_then_uses_the_common_dynami
                 |_, _, _| panic!("provider reached numeric policy"),
                 |metadata| {
                     authorized += 1;
-                    assert_eq!(metadata.account, "provider-one");
-                    assert_eq!(metadata.account_generation, 7);
-                    assert_eq!(metadata.local_binding, "n".repeat(63));
-                    assert_eq!(metadata.caller_number, "KG0BP");
-                    assert_eq!(metadata.called, "incoming-extension");
-                    assert_eq!(metadata.remote, remote);
+                    assert_metadata(metadata);
+                    authorized_route = Some((metadata.call_generation, metadata.local_call));
                     metadata.incoming
                 },
             )
@@ -528,6 +540,11 @@ fn provider_incoming_authenticates_nonnumeric_caller_then_uses_the_common_dynami
         thread::yield_now();
     };
     assert_eq!(authorized, 1);
+    assert_metadata(&call.metadata);
+    assert_eq!(
+        authorized_route,
+        Some((call.metadata.call_generation, call.metadata.local_call))
+    );
     let mut peer = call.into_peer();
     let mut pcm = [1.0; 160];
     let mut audio = false;

@@ -176,32 +176,30 @@ impl PreparedPoll {
                     ownership: None,
                 }),
                 Ok(true) => {
-                    let authorized = authorize_provider(&pending.metadata);
+                    let metadata = pending.take_metadata();
+                    let authorized = authorize_provider(&metadata);
                     if !authorized || Instant::now() >= pending.deadline {
                         pending.reject().map_err(ListenerError::Provider)?;
                         return Ok(CompletedPoll::event(ListenerEvent::Replied));
                     }
                     let ownership = pending.route.ownership.clone();
                     let mut payload = Vec::new();
-                    append_formats(&mut payload, pending.metadata.format, None);
+                    append_formats(&mut payload, metadata.format, None);
                     let packet =
                         serialize_full_frame(&pending.header(IaxCommand::Accept, 1, 2), &payload)
                             .expect("validated owned ACCEPT header");
                     let peer = pending
                         .route
                         .accept(
-                            pending.metadata.remote_call,
-                            pending.metadata.format,
+                            metadata.remote_call,
+                            metadata.format,
                             packet,
                             Some(&pending.catalog),
                             Some(pending.deadline),
                         )
                         .map_err(ListenerError::Provider)?;
                     Ok(CompletedPoll {
-                        event: ListenerEvent::Provider(Box::new(ProviderCall {
-                            metadata: pending.metadata.clone(),
-                            peer,
-                        })),
+                        event: ListenerEvent::Provider(Box::new(ProviderCall { metadata, peer })),
                         pending: None,
                         ownership: Some(ownership),
                     })
@@ -275,10 +273,21 @@ impl PreparedRoute {
     }
 }
 
+/// Only wire fields not already owned by the immutable account and exact route.
+struct IncomingFields {
+    local: SocketAddr,
+    remote_call: u16,
+    format: u64,
+    called: String,
+    caller_number: String,
+    caller_name: String,
+    context: String,
+}
+
 pub(super) struct PendingIncoming {
     route: PreparedRoute,
     account: Arc<Account>,
-    metadata: ProviderCallMetadata,
+    fields: IncomingFields,
     catalog: Arc<crate::formats::FormatCatalog>,
     challenge: String,
     packet: Vec<u8>,
@@ -318,22 +327,16 @@ impl PendingIncoming {
             }
             Ok(text.to_owned())
         };
-        let metadata = ProviderCallMetadata {
-            account: account.config.id.clone(),
-            account_generation: account.config.generation,
-            local_binding: account.config.local_binding.clone(),
-            call_generation: route.generation,
-            remote: route.remote,
+        // Admission already matched the exact endpoint and username to this
+        // retained Account. Do not duplicate its identity while authentication waits.
+        let fields = IncomingFields {
             local: route.socket.local_addr().map_err(AccountError::Network)?,
-            local_call: route.local_call,
             remote_call: frame.header.source_call_number,
             format,
-            username: text(6)?,
             called: text(1)?,
             caller_number: text(2)?,
             caller_name: text(4)?,
             context: text(5)?,
-            incoming: true,
         };
         let mut random = [0; 16];
         getrandom::getrandom(&mut random).map_err(|_| {
@@ -367,7 +370,7 @@ impl PendingIncoming {
         let mut pending = Self {
             route,
             account,
-            metadata,
+            fields,
             catalog,
             challenge,
             packet: Vec::new(),
@@ -384,10 +387,32 @@ impl PendingIncoming {
         Ok(pending)
     }
 
+    /// Materialize one authenticated receipt from retained owners, never current config.
+    /// Move caller fields into that receipt instead of cloning them at acceptance.
+    fn take_metadata(&mut self) -> ProviderCallMetadata {
+        ProviderCallMetadata {
+            account: self.account.config.id.clone(),
+            account_generation: self.account.config.generation,
+            local_binding: self.account.config.local_binding.clone(),
+            call_generation: self.route.generation,
+            remote: self.route.remote,
+            local: self.fields.local,
+            local_call: self.route.local_call,
+            remote_call: self.fields.remote_call,
+            format: self.fields.format,
+            username: self.account.config.username.clone(),
+            called: std::mem::take(&mut self.fields.called),
+            caller_number: std::mem::take(&mut self.fields.caller_number),
+            caller_name: std::mem::take(&mut self.fields.caller_name),
+            context: std::mem::take(&mut self.fields.context),
+            incoming: true,
+        }
+    }
+
     fn header(&self, command: IaxCommand, outgoing: u8, incoming: u8) -> FullFrameHeader {
         FullFrameHeader {
-            source_call_number: self.metadata.local_call,
-            destination_call_number: self.metadata.remote_call,
+            source_call_number: self.route.local_call,
+            destination_call_number: self.fields.remote_call,
             retransmission: false,
             timestamp: 0,
             outgoing_sequence: outgoing,
@@ -448,7 +473,7 @@ impl PendingIncoming {
         let frame =
             parse_full_frame_packet(received.payload()).map_err(|_| AccountError::Protocol)?;
         // The private pending router already matched the exact local call.
-        if frame.header.source_call_number != self.metadata.remote_call
+        if frame.header.source_call_number != self.fields.remote_call
             || frame.header.outgoing_sequence != 1
             || frame.header.incoming_sequence != 1
         {
@@ -621,8 +646,8 @@ impl InboundIaxListener {
                 route.remote == remote && route.new_call == Some(frame.header.source_call_number)
             }) {
                 if let Some(pending) = self.pending_provider.iter().find(|pending| {
-                    pending.metadata.remote == remote
-                        && pending.metadata.remote_call == frame.header.source_call_number
+                    pending.route.remote == remote
+                        && pending.fields.remote_call == frame.header.source_call_number
                 }) {
                     return Ok(PreparedPoll {
                         task: PollTask::Reply {

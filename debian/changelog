@@ -1,3 +1,16 @@
+librptadviax2 (0.1.0~alpha12) unstable; urgency=medium
+
+  * Add reserved preparation and allocation-free commit/abort for complete
+    multi-listener numeric and provider-account configuration replacements.
+  * Preserve unchanged admission lifetimes and all existing call generations
+    when preparation fails or is abandoned.
+  * Extend the optional server ABI 2 tail while preserving the alpha11 prefix
+    and SONAME 2; consumers must require the complete transaction capability.
+  * Reduce retained pending authentication and poll work from 504 to 384 bytes
+    without per-poll allocation or duplicate account identity strings.
+
+ -- Chris Peterson <cpeter1207@users.noreply.github.com>  Wed, 11 Nov 2026 22:47:55 +0000
+
 librptadviax2 (0.1.0~alpha11) unstable; urgency=medium
 
   * Add configured provider registration, authenticated incoming calls and

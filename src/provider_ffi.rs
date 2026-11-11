@@ -327,7 +327,7 @@ pub(super) unsafe fn bind(
     }
 }
 
-unsafe fn copy_accounts(
+pub(super) unsafe fn copy_accounts(
     records: *const rptadv_iax2_provider_account_v1,
     count: usize,
 ) -> Option<Vec<AccountConfig>> {
@@ -623,7 +623,7 @@ pub(super) unsafe extern "C" fn poll_accounts(
     })
 }
 
-fn status(error: AccountError) -> i32 {
+pub(super) fn status(error: AccountError) -> i32 {
     match error {
         AccountError::InvalidOptions => -1,
         AccountError::Network(_) => -2,
