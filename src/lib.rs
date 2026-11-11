@@ -38,3 +38,6 @@ mod inbound_tests;
 
 #[cfg(test)]
 mod provider_tests;
+
+#[cfg(test)]
+mod allocation_test_support;

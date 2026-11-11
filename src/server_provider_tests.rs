@@ -19,7 +19,7 @@ fn acknowledge_pending(listener: &mut InboundIaxListener, socket: &UdpSocket, re
     while !listener
         .pending_provider
         .iter()
-        .find(|pending| pending.metadata.remote == socket.local_addr().unwrap())
+        .find(|pending| pending.route.remote == socket.local_addr().unwrap())
         .unwrap()
         .acknowledged
     {
@@ -627,4 +627,55 @@ fn real_socket_receive_failure_revokes_pending_ingress_without_fabricated_lifeti
     // The failed receiver owns no live routes. Drop joins that actual owner;
     // it does not report a cleanup acknowledgment from its closed channel.
     drop(listener);
+}
+
+#[test]
+fn pending_authentication_retains_identity_without_duplicate_string_allocations() {
+    let (mut listener, socket) = fixture();
+    let mut config = account(socket.local_addr().unwrap());
+    config.id = "a".repeat(43);
+    config.local_binding = "b".repeat(47);
+    config.username = "u".repeat(53);
+    config.generation = 8;
+    let username = config.username.clone();
+    listener.configure_accounts(&[config]).unwrap();
+    let (_, retry) = initial_retry(&mut listener, &socket, username.as_bytes(), b"KG0BP");
+    let frame = parse_full_frame_packet(&retry).unwrap();
+    let account = listener.accounts[0].clone();
+    let route = listener
+        .reserve_route(
+            socket.local_addr().unwrap(),
+            Some(frame.header.source_call_number),
+            account.life.clone(),
+            true,
+        )
+        .unwrap();
+    let catalog = catalog();
+    let (pending, allocations, identity_copies) = crate::allocation_test_support::measure(|| {
+        PendingIncoming::new(route, account, frame, catalog, Instant::now()).unwrap()
+    });
+    eprintln!(
+        "pending auth: size={}, poll={}, allocations={allocations}, duplicated identity allocations={identity_copies}",
+        std::mem::size_of::<PendingIncoming>(),
+        std::mem::size_of::<PreparedPoll>()
+    );
+    assert_eq!(
+        identity_copies, 0,
+        "retained Account already owns all three identity strings"
+    );
+    drop(pending);
+}
+
+#[test]
+fn pending_authentication_layout_does_not_repeat_retained_owner_identity() {
+    assert!(
+        std::mem::size_of::<PendingIncoming>() <= 400,
+        "pending authentication retained {} bytes",
+        std::mem::size_of::<PendingIncoming>()
+    );
+    assert!(
+        std::mem::size_of::<PreparedPoll>() <= 400,
+        "prepared poll copies {} bytes",
+        std::mem::size_of::<PreparedPoll>()
+    );
 }
