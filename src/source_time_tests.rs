@@ -341,6 +341,16 @@ fn actual_owned_clock_unavailability_cancellation_and_expiration_are_sticky_with
             },
             0
         );
+        // A past deadline schedules kernel expiry; settime does not promise the
+        // nonblocking fd is already readable on return. Wait for this actual
+        // owned event without consuming it before testing sticky revocation.
+        let mut ready = libc::pollfd {
+            fd: clock.monitor_fd().unwrap(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(unsafe { libc::poll(&mut ready, 1, 1000) }, 1);
+        assert_ne!(ready.revents & libc::POLLIN, 0);
     } else if selection == "lost-realtime" {
         let fail = unsafe { library.get::<unsafe extern "C" fn()>(b"rptadv_test_fail_realtime\0") }
             .unwrap();
