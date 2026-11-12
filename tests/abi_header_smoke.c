@@ -30,6 +30,14 @@ _Static_assert(offsetof(struct rptadv_iax2_client_descriptor_v2, poll_timed) ==
     136, "timed poll must preserve released136 prefix");
 _Static_assert(sizeof(struct rptadv_iax2_timed_event_v1) == 72,
     "timed source record layout differs");
+_Static_assert(sizeof(struct rptadv_iax2_timed_event_v2) == 80,
+    "private timed source request layout differs");
+_Static_assert(offsetof(struct rptadv_iax2_timed_event_v2, prefix) == 0,
+    "private timed source request must preserve the prefix");
+_Static_assert(offsetof(struct rptadv_iax2_timed_event_v2, request_flags) == 72,
+    "private timed source flags must follow the released prefix");
+_Static_assert(offsetof(struct rptadv_iax2_timed_event_v2, reserved) == 76,
+    "private timed source reserved field layout differs");
 _Static_assert(offsetof(struct rptadv_iax2_client_descriptor_v2, send_prepared_audio_timed) == 144, "timed send tail order");
 _Static_assert(offsetof(struct rptadv_iax2_client_descriptor_v2, retire_egress) == 152, "egress retirement tail order");
 _Static_assert(sizeof(struct rptadv_iax2_timed_send_v1) == 24, "timed send record layout");
