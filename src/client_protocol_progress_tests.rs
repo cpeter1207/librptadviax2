@@ -132,7 +132,7 @@ fn refused_digit_keeps_real_ack_progress_and_later_source_order() {
                 0,
                 std::ptr::null_mut(),
                 0,
-                &mut request.prefix,
+                std::ptr::from_mut(&mut request).cast(),
             )
         };
         let retirement = if status == 0 {
@@ -392,7 +392,7 @@ fn invalid_service_request_leaves_protocol_and_source_state_unchanged() {
                     0,
                     std::ptr::null_mut(),
                     0,
-                    &mut request.prefix,
+                    std::ptr::from_mut(&mut request).cast(),
                 )
             },
             -1
@@ -686,4 +686,607 @@ fn invalid_private_activation_keeps_early_text_and_existing_source_mode_unchange
         IaxPeerEvent::Text(4)
     );
     assert_eq!(&text, b"kept");
+}
+
+fn installed_jitter() -> libloading::Library {
+    let paths = std::fs::read_dir("/usr/lib")
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| {
+            entry
+                .path()
+                .join("rpt_advanced/librptadv_jitter_adapter.so.1")
+        })
+        .filter(|path| path.exists())
+        .collect::<Vec<_>>();
+    assert_eq!(paths.len(), 1);
+    unsafe { libloading::Library::new(&paths[0]) }.unwrap()
+}
+
+fn configure_installed_jitter(peer: &mut IaxPeer, library: &libloading::Library) {
+    let descriptor = unsafe {
+        library.get::<unsafe extern "C" fn() -> *const std::ffi::c_void>(
+            b"rptadv_jitter_adapter_descriptor_v1\0",
+        )
+    }
+    .unwrap();
+    unsafe { peer.configure_jitter(descriptor()) }.unwrap();
+}
+
+fn radio(sequence: u8, subclass: u8) -> Vec<u8> {
+    serialize_full_frame(
+        &FullFrameHeader {
+            source_call_number: 5678,
+            destination_call_number: 1234,
+            retransmission: false,
+            timestamp: 80,
+            outgoing_sequence: sequence,
+            incoming_sequence: 1,
+            frame_type: 4,
+            subclass,
+            subclass_is_log: false,
+        },
+        &[],
+    )
+    .unwrap()
+}
+
+#[test]
+fn installed_jitter_selected_suffix_stays_before_deferred_radio_effects_and_digit() {
+    let _probe = crate::source_time::tests::timestamp_probe();
+    let library = installed_jitter();
+    let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let mut peer = linked_peer(remote.local_addr().unwrap());
+    configure_installed_jitter(&mut peer, &library);
+    service(&mut peer).unwrap();
+    let local = peer.local_addr().unwrap();
+    remote.send_to(&mini(20, 0x80), local).unwrap();
+    let first = next_source(&mut peer, &mut [0.0; 40]);
+    assert_eq!(first.event, IaxPeerEvent::Audio(40));
+    let birth = first
+        .born_ns
+        .expect("installed jitter retains real original receipt");
+    peer.send_prepared_audio(&[0xff; 160], 160, 0).unwrap();
+    assert_eq!(peer.retire_egress().unwrap(), EgressRetirement::Pending);
+    remote.send_to(&radio(1, 13), local).unwrap();
+    remote.send_to(&radio(2, 12), local).unwrap();
+    remote.send_to(&digit(3, b'5'), local).unwrap();
+    remote
+        .send_to(&control(99, 2, crate::protocol::IaxCommand::Ack), local)
+        .unwrap();
+    for _ in 0..3 {
+        assert_eq!(service(&mut peer).unwrap().event, IaxPeerEvent::None);
+    }
+    assert_eq!(peer.retire_egress().unwrap(), EgressRetirement::Complete(2));
+    for offset in [40, 80, 120] {
+        let suffix = next_source(&mut peer, &mut [0.0; 40]);
+        assert_eq!(
+            (suffix.event, suffix.source_start, suffix.born_ns),
+            (
+                IaxPeerEvent::Audio(40),
+                first.source_start + offset,
+                Some(birth)
+            )
+        );
+    }
+    let remaining = (0..3)
+        .map(|_| next_source(&mut peer, &mut [0.0; 160]).event)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        remaining,
+        [
+            IaxPeerEvent::RadioUnkey,
+            IaxPeerEvent::RadioKey,
+            IaxPeerEvent::Digit(b'5')
+        ]
+    );
+}
+
+#[test]
+fn installed_jitter_unselected_voice_preserves_ordinary_not_due_control_order() {
+    let library = installed_jitter();
+    let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let mut peer = linked_peer(remote.local_addr().unwrap());
+    configure_installed_jitter(&mut peer, &library);
+    service(&mut peer).unwrap();
+    remote
+        .send_to(&mini(20, 0x80), peer.local_addr().unwrap())
+        .unwrap();
+    remote
+        .send_to(&digit(1, b'5'), peer.local_addr().unwrap())
+        .unwrap();
+    service(&mut peer).unwrap();
+    let control = next_source(&mut peer, &mut [0.0; 160]);
+    assert_eq!(control.event, IaxPeerEvent::Digit(b'5'));
+    let media = next_source(&mut peer, &mut [0.0; 160]);
+    assert_eq!(media.event, IaxPeerEvent::Audio(160));
+}
+
+#[test]
+fn private_source_queue_moves_owned_payloads_without_new_phone_allocations() {
+    let state_bytes = std::mem::size_of::<super::super::service::State>();
+    assert_eq!(state_bytes, 4);
+    eprintln!("ACTUAL_PHONE_STATE bytes={state_bytes} prior_state_bytes=3 early_counter_bytes=1");
+    for full in [false, true] {
+        let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let address = remote.local_addr().unwrap();
+        let (mut peer, mut producer) = shared_peer(address);
+        peer.compose_codec(crate::ffi::test_peer_catalog()).unwrap();
+        service(&mut peer).unwrap();
+        peer.pending_events.reserve(64);
+        peer.pending_replies.reserve(64);
+        for sequence in 1..=64 {
+            let bytes = if full {
+                serialize_full_frame(
+                    &FullFrameHeader {
+                        source_call_number: 5678,
+                        destination_call_number: 1234,
+                        retransmission: false,
+                        timestamp: u32::from(sequence) * 20,
+                        outgoing_sequence: sequence,
+                        incoming_sequence: 1,
+                        frame_type: 2,
+                        subclass: 4,
+                        subclass_is_log: false,
+                    },
+                    &[0x80; 160],
+                )
+                .unwrap()
+            } else {
+                mini(u16::from(sequence) * 20, 0x80)
+            };
+            producer.try_push(address, &bytes).unwrap();
+        }
+        let (result, allocations, copies) =
+            crate::allocation_test_support::measure_phone_payload(|| service(&mut peer));
+        result.unwrap();
+        assert_eq!(
+            copies, 0,
+            "shared ingress payload ownership must move, not copy"
+        );
+        if !full {
+            assert_eq!(
+                allocations, 0,
+                "reserved mini admission needs no allocation"
+            );
+        }
+        assert_eq!(peer.pending_events.len(), 64);
+        assert_eq!(peer.pending_events.capacity(), 64);
+        let bytes = super::super::service::retained_payload_bytes(&peer);
+        assert_eq!(bytes, 64 * if full { 172 } else { 164 });
+        let slot = std::mem::size_of::<super::super::PendingSource>();
+        assert_eq!(slot, std::mem::size_of::<super::super::PendingEvent>());
+        eprintln!(
+            "ACTUAL_PHONE_QUEUE full={full} slots=64 slot_bytes={slot} metadata={} payload={bytes} allocations={allocations} payload_copies={copies}",
+            64 * slot
+        );
+    }
+}
+
+#[test]
+fn successful_private_activation_persists_through_abi1_and_rust_delivery() {
+    let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let mut peer = linked_peer(remote.local_addr().unwrap());
+    service(&mut peer).unwrap();
+    for sequence in 1..=2 {
+        let text = serialize_full_frame(
+            &FullFrameHeader {
+                source_call_number: 5678,
+                destination_call_number: 1234,
+                retransmission: false,
+                timestamp: 20,
+                outgoing_sequence: sequence,
+                incoming_sequence: 1,
+                frame_type: 7,
+                subclass: 0,
+                subclass_is_log: false,
+            },
+            &vec![b'x'; 4096],
+        )
+        .unwrap();
+        remote.send_to(&text, peer.local_addr().unwrap()).unwrap();
+        let mut untouched = [0xa5; 8];
+        if sequence == 1 {
+            assert_eq!(
+                peer.poll_timed(&mut [], &mut untouched, input())
+                    .unwrap()
+                    .event,
+                IaxPeerEvent::None
+            );
+        } else {
+            let api = unsafe { &*crate::ffi::rptadv_iax2_client_descriptor_v2() };
+            let mut record = crate::ffi::rptadv_iax2_timed_event_v1 {
+                struct_size: 72,
+                abi_version: 1,
+                host_clock_epoch: 7,
+                reference_now_ns: 5_000_000_000,
+                acknowledged_media_epoch: 1,
+                ..Default::default()
+            };
+            assert_eq!(
+                unsafe {
+                    api.poll_timed.unwrap()(
+                        (&mut peer as *mut IaxPeer).cast(),
+                        std::ptr::null_mut(),
+                        0,
+                        untouched.as_mut_ptr(),
+                        untouched.len(),
+                        &mut record,
+                    )
+                },
+                0
+            );
+            assert_eq!(record.event_kind, crate::ffi::RPTADV_IAX2_EVENT_NONE);
+        }
+        assert_eq!(untouched, [0xa5; 8]);
+        assert!(peer.pending_events.is_empty());
+        assert!(peer.service.active);
+    }
+}
+
+#[test]
+fn oversized_private_voice_cannot_spend_incoming_ack_credit_or_sequence() {
+    let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
+    remote.set_nonblocking(true).unwrap();
+    let mut peer = linked_peer(remote.local_addr().unwrap());
+    peer.send_prepared_audio(&[0xff; 160], 160, 0).unwrap();
+    service(&mut peer).unwrap();
+    let malformed = serialize_full_frame(
+        &FullFrameHeader {
+            source_call_number: 5678,
+            destination_call_number: 1234,
+            retransmission: false,
+            timestamp: 20,
+            outgoing_sequence: 1,
+            incoming_sequence: 2,
+            frame_type: 2,
+            subclass: 4,
+            subclass_is_log: false,
+        },
+        &[0x80; 161],
+    )
+    .unwrap();
+    while remote.recv_from(&mut [0; 2048]).is_ok() {}
+    remote
+        .send_to(&malformed, peer.local_addr().unwrap())
+        .unwrap();
+    assert!(matches!(service(&mut peer), Err(DialError::Provider(error))
+        if error.status == crate::codec::providers::Status::Malformed));
+    assert_eq!(
+        peer.pending_reliable.len(),
+        1,
+        "malformed input grants no ACK credit"
+    );
+    assert!(peer.pending_events.is_empty());
+    assert_eq!(
+        remote.recv_from(&mut [0; 2048]).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    assert!(peer.retire_egress().is_err());
+}
+
+/// A failed release must establish the selected source barrier before returning.
+#[test]
+fn output_full_deferred_voice_stays_before_later_digit() {
+    let _probe = crate::source_time::tests::timestamp_probe();
+    let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let mut peer = linked_peer(remote.local_addr().unwrap());
+    service(&mut peer).unwrap();
+    remote
+        .send_to(&mini(20, 0x80), peer.local_addr().unwrap())
+        .unwrap();
+    remote
+        .send_to(&digit(1, b'5'), peer.local_addr().unwrap())
+        .unwrap();
+    service(&mut peer).unwrap();
+    assert!(matches!(peer.poll_timed(&mut [], &mut [0; 1], input()),
+        Err(DialError::Provider(error)) if error.status == crate::codec::providers::Status::OutputFull));
+    let mut output = [0.0; 160];
+    let first = next_source(&mut peer, &mut output);
+    assert_eq!(
+        first.event,
+        IaxPeerEvent::Audio(160),
+        "digit must not overtake retained voice A"
+    );
+    assert_eq!(first.source_start, 0);
+    assert!(first.born_ns.is_some());
+    assert!(output.iter().all(|sample| *sample > 0.9));
+    let digit = next_source(&mut peer, &mut output);
+    assert_eq!(
+        (digit.event, digit.source_start),
+        (IaxPeerEvent::Digit(b'5'), 160)
+    );
+}
+
+/// This independent case catches overwrite even when no digit repairs the barrier.
+#[test]
+fn output_full_deferred_voice_cannot_be_overwritten_by_later_voice() {
+    let _probe = crate::source_time::tests::timestamp_probe();
+    let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let mut peer = linked_peer(remote.local_addr().unwrap());
+    service(&mut peer).unwrap();
+    remote
+        .send_to(&mini(20, 0x80), peer.local_addr().unwrap())
+        .unwrap();
+    remote
+        .send_to(&mini(40, 0xff), peer.local_addr().unwrap())
+        .unwrap();
+    service(&mut peer).unwrap();
+    assert!(matches!(peer.poll_timed(&mut [], &mut [0; 1], input()),
+        Err(DialError::Provider(error)) if error.status == crate::codec::providers::Status::OutputFull));
+    let mut output = [0.0; 160];
+    let first = next_source(&mut peer, &mut output);
+    assert_eq!(
+        (first.event, first.source_start),
+        (IaxPeerEvent::Audio(160), 0)
+    );
+    assert!(
+        output.iter().all(|sample| *sample > 0.9),
+        "voice B must not overwrite voice A"
+    );
+    let second = next_source(&mut peer, &mut output);
+    assert_eq!(
+        (second.event, second.source_start),
+        (IaxPeerEvent::Audio(160), 160)
+    );
+    assert_eq!(output, [0.0; 160]);
+}
+
+#[test]
+fn activation_preserves_early_prefix_before_later_selected_media() {
+    let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let mut peer = linked_peer(remote.local_addr().unwrap());
+    peer.pending_events
+        .push_back(super::super::PendingSource::Ready(
+            super::super::PendingEvent {
+                event: IaxPeerEvent::Digit(b'5'),
+                pcm: super::super::PacketPcm::default(),
+                text: Vec::new(),
+            },
+        ));
+    peer.pending_events
+        .push_back(super::super::PendingSource::Ready(
+            super::super::PendingEvent {
+                event: IaxPeerEvent::Audio(40),
+                pcm: super::super::PacketPcm {
+                    samples: vec![0.25; 40],
+                    position: 0,
+                    span: crate::source_time::Span::default(),
+                },
+                text: Vec::new(),
+            },
+        ));
+    peer.direct_pcm.samples = vec![0.75; 160];
+    peer.direct_pcm.position = 40;
+    service(&mut peer).unwrap();
+    assert_eq!(
+        next_source(&mut peer, &mut [0.0; 160]).event,
+        IaxPeerEvent::Digit(b'5')
+    );
+    let mut output = [0.0; 160];
+    let early = next_source(&mut peer, &mut output);
+    assert_eq!(
+        (early.event, early.source_start),
+        (IaxPeerEvent::Audio(40), 0)
+    );
+    assert_eq!(
+        &output[..40],
+        &[0.25; 40],
+        "later selected PCM must not pass the early prefix"
+    );
+    let selected = next_source(&mut peer, &mut output);
+    assert_eq!(
+        (selected.event, selected.source_start),
+        (IaxPeerEvent::Audio(120), 40)
+    );
+    assert_eq!(&output[..120], &[0.75; 120]);
+}
+
+#[test]
+fn pre_reset_real_udp_voice_does_not_fill_new_epoch_source_capacity() {
+    let _probe = crate::source_time::tests::timestamp_probe();
+    let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let mut peer = linked_peer(remote.local_addr().unwrap());
+    service(&mut peer).unwrap();
+    peer.send_prepared_audio(&[0xff; 160], 160, 0).unwrap();
+    assert_eq!(peer.retire_egress().unwrap(), EgressRetirement::Pending);
+    let local = peer.local_addr().unwrap();
+    for index in 0..65 {
+        remote.send_to(&mini(20 + index * 20, 0x80), local).unwrap();
+    }
+    remote
+        .send_to(&control(99, 2, crate::protocol::IaxCommand::Ack), local)
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(5));
+    let changed = SourceTimeInput {
+        host_clock_epoch: 8,
+        ..input()
+    };
+    for _ in 0..2 {
+        let reset = peer
+            .poll_timed_private(
+                &mut [],
+                &mut [],
+                changed,
+                crate::client::SourceDelivery::ServiceOnly,
+            )
+            .unwrap();
+        assert_eq!((reset.media_epoch, reset.source_start), (2, 0));
+        assert!(reset.discontinuity);
+        assert_eq!(reset.event, IaxPeerEvent::None);
+        assert!(
+            peer.pending_events.is_empty(),
+            "already retired receipts must not occupy source slots"
+        );
+    }
+    assert_eq!(peer.retire_egress().unwrap(), EgressRetirement::Complete(2));
+}
+
+/// Sizes describe the actual caller allocation; invalid records never touch peer.
+#[test]
+fn ffi_timed_request_respects_exact_prefix_tail_and_caller_guards() {
+    use crate::ffi::rptadv_iax2_timed_event_v1 as Prefix;
+    #[repr(C)]
+    struct Guarded {
+        request: ServiceRequest,
+        guard: [u64; 2],
+    }
+    let api = unsafe { &*crate::ffi::rptadv_iax2_client_descriptor_v2() };
+    let poll = api.poll_timed.unwrap();
+    assert_eq!(std::mem::size_of::<Prefix>(), 72);
+    assert_eq!(std::mem::size_of::<ServiceRequest>(), 80);
+    for version in [1, 2] {
+        let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut peer = linked_peer(remote.local_addr().unwrap());
+        let flags = if version == 1 { u32::MAX } else { 1 };
+        let reserved = if version == 1 { u32::MAX } else { 0 };
+        let mut guarded = Guarded {
+            request: ServiceRequest {
+                prefix: Prefix {
+                    struct_size: 80,
+                    abi_version: version,
+                    host_clock_epoch: 7,
+                    reference_now_ns: 5_000_000_000,
+                    acknowledged_media_epoch: 1,
+                    ..Default::default()
+                },
+                request_flags: flags,
+                reserved,
+            },
+            guard: [0x1234_5678_90ab_cdef; 2],
+        };
+        assert_eq!(
+            unsafe {
+                poll(
+                    std::ptr::from_mut(&mut peer).cast(),
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::from_mut(&mut guarded).cast(),
+                )
+            },
+            0
+        );
+        assert_eq!(guarded.request.prefix.host_clock_epoch, 7);
+        assert_eq!(guarded.request.prefix.reference_now_ns, 5_000_000_000);
+        assert_eq!(guarded.request.prefix.acknowledged_media_epoch, 1);
+        assert_eq!(guarded.request.request_flags, flags);
+        assert_eq!(guarded.request.reserved, reserved);
+        assert_eq!(guarded.guard, [0x1234_5678_90ab_cdef; 2]);
+        assert_eq!(peer.service.active, version == 2);
+    }
+    // The actual allocation stops at byte72. ABI2 must reject before reading tail.
+    let mut short = Prefix {
+        struct_size: 72,
+        abi_version: 2,
+        event_kind: u32::MAX,
+        flags: u32::MAX,
+        event_length: usize::MAX,
+        media_epoch: u64::MAX,
+        source_start: u64::MAX,
+        born_ns: u64::MAX,
+        ..Default::default()
+    };
+    assert_eq!(
+        unsafe {
+            poll(
+                std::ptr::dangling_mut::<std::ffi::c_void>(),
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::from_mut(&mut short),
+            )
+        },
+        -1
+    );
+    assert_eq!(
+        (
+            short.event_kind,
+            short.flags,
+            short.event_length,
+            short.media_epoch,
+            short.source_start,
+            short.born_ns
+        ),
+        (0, 0, 0, 0, 0, 0)
+    );
+    // Only the size prefix physically exists: no full-record reference is valid.
+    let mut tiny = 4_u32;
+    assert_eq!(
+        unsafe {
+            poll(
+                std::ptr::dangling_mut::<std::ffi::c_void>(),
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::from_mut(&mut tiny).cast(),
+            )
+        },
+        -1
+    );
+    assert_eq!(tiny, 4);
+}
+
+#[test]
+fn retired_full_voice_still_advances_real_protocol_sequence_and_ack() {
+    let _probe = crate::source_time::tests::timestamp_probe();
+    let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let mut peer = linked_peer(remote.local_addr().unwrap());
+    service(&mut peer).unwrap();
+    peer.send_prepared_audio(&[0xff; 160], 160, 0).unwrap();
+    assert_eq!(peer.retire_egress().unwrap(), EgressRetirement::Pending);
+    let packet = serialize_full_frame(
+        &FullFrameHeader {
+            source_call_number: 5678,
+            destination_call_number: 1234,
+            retransmission: false,
+            timestamp: 20,
+            outgoing_sequence: 1,
+            incoming_sequence: 2,
+            frame_type: 2,
+            subclass: 4,
+            subclass_is_log: false,
+        },
+        &[0x80; 160],
+    )
+    .unwrap();
+    remote.send_to(&packet, peer.local_addr().unwrap()).unwrap();
+    std::thread::sleep(Duration::from_millis(5));
+    let changed = SourceTimeInput {
+        host_clock_epoch: 8,
+        ..input()
+    };
+    let reset = peer
+        .poll_timed_private(
+            &mut [],
+            &mut [],
+            changed,
+            crate::client::SourceDelivery::ServiceOnly,
+        )
+        .unwrap();
+    assert_eq!((reset.media_epoch, reset.source_start), (2, 0));
+    assert!(reset.discontinuity);
+    assert!(peer.pending_events.is_empty());
+    assert_eq!(peer.retire_egress().unwrap(), EgressRetirement::Complete(2));
+    remote
+        .send_to(&digit(2, b'6'), peer.local_addr().unwrap())
+        .unwrap();
+    let next = peer
+        .poll_timed(
+            &mut [0.0; 160],
+            &mut [0; 1],
+            SourceTimeInput {
+                acknowledged_media_epoch: 2,
+                ..changed
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        (next.event, next.media_epoch, next.source_start),
+        (IaxPeerEvent::Digit(b'6'), 2, 0)
+    );
+    assert!(!next.discontinuity);
 }

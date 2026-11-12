@@ -951,6 +951,28 @@ unsafe extern "C" fn poll_timed(
         {
             return -1;
         }
+        // Retain the caller allocation's raw provenance while validating the
+        // optional tail. Do not widen a pointer derived from a V1 reference.
+        let size = unsafe { ptr::addr_of!((*record).struct_size).read() };
+        let version = unsafe { ptr::addr_of!((*record).abi_version).read() };
+        let delivery = match version {
+            1 => Ok(None),
+            2 if size >= size_of::<rptadv_iax2_timed_event_v2>() as u32 => {
+                let tail = record.cast::<u8>();
+                let flags = unsafe { tail.add(72).cast::<u32>().read() };
+                let reserved = unsafe { tail.add(76).cast::<u32>().read() };
+                if reserved != 0 || flags > 1 {
+                    Err(())
+                } else {
+                    Ok(Some(if flags == 1 {
+                        crate::client::SourceDelivery::ServiceOnly
+                    } else {
+                        crate::client::SourceDelivery::Deliver
+                    }))
+                }
+            }
+            _ => Err(()),
+        };
         let record = unsafe { &mut *record };
         record.event_kind = RPTADV_IAX2_EVENT_NONE;
         record.flags = 0;
@@ -958,23 +980,8 @@ unsafe extern "C" fn poll_timed(
         record.media_epoch = 0;
         record.source_start = 0;
         record.born_ns = 0;
-        let delivery = match record.abi_version {
-            1 => None,
-            2 if record.struct_size >= size_of::<rptadv_iax2_timed_event_v2>() as u32 => {
-                // Read the tail only after checking its complete physical size.
-                let tail = ptr::from_mut(record).cast::<u8>();
-                let flags = unsafe { tail.add(72).cast::<u32>().read() };
-                let reserved = unsafe { tail.add(76).cast::<u32>().read() };
-                if reserved != 0 || flags > 1 {
-                    return -1;
-                }
-                Some(if flags == 1 {
-                    crate::client::SourceDelivery::ServiceOnly
-                } else {
-                    crate::client::SourceDelivery::Deliver
-                })
-            }
-            _ => return -1,
+        let Ok(delivery) = delivery else {
+            return -1;
         };
         let (Some(peer), Some(samples), Some(text)) = (
             unsafe { peer.cast::<IaxPeer>().as_mut() },

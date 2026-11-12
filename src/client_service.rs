@@ -25,6 +25,8 @@ pub(super) struct State {
     pub terminal: bool,
     // Only a selected direct/jitter item, not unselected jitter packets.
     pub selected: bool,
+    // Accepted early events precede any selected direct/jitter remainder.
+    pub early_remaining: u8,
 }
 
 #[derive(Clone, Copy)]
@@ -160,7 +162,8 @@ impl IaxPeer {
             )
         });
         self.service.active = true;
-        self.service.selected = self.pending_events.is_empty() && self.selected_source_pending();
+        self.service.early_remaining = self.pending_events.len() as u8;
+        self.service.selected = self.selected_source_pending();
         Ok(())
     }
 
@@ -236,7 +239,9 @@ impl IaxPeer {
                 continue;
             }
             let storage = self.source_storage(&input.bytes)?;
-            if let Some(voice) = storage {
+            let retired_voice =
+                storage == Some(true) && self.receipt_before_timed_cutoff(input.receipt);
+            if let Some(voice) = storage.filter(|_| !retired_voice) {
                 if self.pending_events.len() == MAX_EARLY_EVENTS {
                     return Err(DialError::EarlyEventsFull);
                 }
@@ -273,7 +278,7 @@ impl IaxPeer {
                 ReceivedEvent::RadioUnkey => {
                     self.pending_events.push_back(PendingSource::RadioUnkey)
                 }
-                ReceivedEvent::Voice(voice) if voice.length != 0 => {
+                ReceivedEvent::Voice(voice) if voice.length != 0 && !retired_voice => {
                     self.pending_events
                         .push_back(PendingSource::Voice(DeferredVoice {
                             bytes: input.bytes.into_owned().into_boxed_slice(),
@@ -290,8 +295,8 @@ impl IaxPeer {
 
     fn poll_selected_source(&mut self, pcm: &mut [f32]) -> Result<IaxPeerEvent, DialError> {
         self.timed.last_span = self.direct_pcm.span.clone();
-        let result = match self.direct_pcm.render(pcm)? {
-            Some(count) => IaxPeerEvent::Audio(count),
+        let result = (|| match self.direct_pcm.render(pcm)? {
+            Some(count) => Ok(IaxPeerEvent::Audio(count)),
             None => match &mut self.playout {
                 Some(playout) => {
                     let event = playout.poll_with_codec(
@@ -300,13 +305,15 @@ impl IaxPeer {
                         self.codecs.as_mut().map(|codecs| &mut codecs.decoder),
                     )?;
                     self.timed.last_span = playout.last_span().clone();
-                    event
+                    Ok(event)
                 }
-                None => IaxPeerEvent::None,
+                None => Ok(IaxPeerEvent::None),
             },
-        };
+        })();
+        // A retryable render error can still select a packet. Preserve its
+        // ownership barrier before returning the error to the caller.
         self.service.selected = self.selected_source_pending();
-        Ok(result)
+        result
     }
 
     pub(super) fn release_radio_key(&mut self, timestamp: u32) -> Result<IaxPeerEvent, DialError> {
@@ -332,18 +339,20 @@ impl IaxPeer {
         text: &mut [u8],
     ) -> Result<IaxPeerEvent, DialError> {
         self.service_private()?;
-        if self.service.selected {
-            let event = self.poll_selected_source(pcm)?;
-            if event != IaxPeerEvent::None || self.service.selected {
-                return Ok(event);
-            }
-        }
         for _ in 0..MAX_EARLY_EVENTS {
+            if self.service.early_remaining == 0 && self.service.selected {
+                let event = self.poll_selected_source(pcm)?;
+                if event != IaxPeerEvent::None || self.service.selected {
+                    return Ok(event);
+                }
+            }
             if let Some(PendingSource::Ready(pending)) = self.pending_events.front_mut() {
                 self.timed.last_span = pending.pcm.span.clone();
                 if let Some(count) = pending.pcm.render(pcm)? {
                     if pending.pcm.remaining() == 0 {
                         self.pending_events.pop_front();
+                        self.service.early_remaining =
+                            self.service.early_remaining.saturating_sub(1);
                     }
                     return Ok(IaxPeerEvent::Audio(count));
                 }
@@ -354,23 +363,39 @@ impl IaxPeer {
             let Some(pending) = self.pending_events.pop_front() else {
                 break;
             };
-            let event = match pending {
-                PendingSource::Ready(pending) => pending.event,
+            self.service.early_remaining = self.service.early_remaining.saturating_sub(1);
+            let result = match pending {
+                PendingSource::Ready(pending) => Ok(pending.event),
                 PendingSource::Voice(voice) => {
                     self.incoming_receipt = voice.receipt;
-                    self.release_voice(&voice.bytes, voice.arrived_at, voice.voice, pcm)?
+                    self.release_voice(&voice.bytes, voice.arrived_at, voice.voice, pcm)
                 }
-                PendingSource::RadioKey(timestamp) => self.release_radio_key(timestamp)?,
-                PendingSource::RadioUnkey => self.release_radio_unkey()?,
+                PendingSource::RadioKey(timestamp) => self.release_radio_key(timestamp),
+                PendingSource::RadioUnkey => self.release_radio_unkey(),
             };
+            // release_voice may install direct PCM and then return OutputFull.
+            // Latch its barrier even on that retryable error, before another
+            // event can be released or another voice can overwrite the packet.
             self.service.selected = self.selected_source_pending();
+            let event = result?;
             if event != IaxPeerEvent::None {
                 return Ok(event);
-            }
-            if self.service.selected {
-                return self.poll_selected_source(pcm);
             }
         }
         self.poll_selected_source(pcm)
     }
+}
+
+#[cfg(test)]
+pub(super) fn retained_payload_bytes(peer: &IaxPeer) -> usize {
+    peer.pending_events
+        .iter()
+        .map(|source| match source {
+            PendingSource::Ready(event) => {
+                event.pcm.samples.capacity() * std::mem::size_of::<f32>() + event.text.capacity()
+            }
+            PendingSource::Voice(voice) => voice.bytes.len(),
+            PendingSource::RadioKey(_) | PendingSource::RadioUnkey => 0,
+        })
+        .sum()
 }

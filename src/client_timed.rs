@@ -223,6 +223,12 @@ impl IaxPeer {
         self.timed.cursor = 0;
         self.timed.cutoff = Some(Instant::now());
         self.direct_pcm = super::PacketPcm::default();
+        self.service.early_remaining = self
+            .pending_events
+            .iter()
+            .take(usize::from(self.service.early_remaining))
+            .filter(|event| !event.is_media())
+            .count() as u8;
         self.pending_events.retain(|event| !event.is_media());
         self.service.selected = false;
         self.timed.last_span = Span::default();
@@ -262,6 +268,18 @@ impl IaxPeer {
             .and_then(|instant| instant.checked_add(crate::source_time::MAXIMUM_AGE))
     }
 
+    pub(super) fn receipt_before_timed_cutoff(
+        &self,
+        receipt: Option<crate::source_time::Receipt>,
+    ) -> bool {
+        self.timed.enabled
+            && receipt.is_some_and(|receipt| {
+                self.timed
+                    .cutoff
+                    .is_some_and(|cutoff| receipt.instant < cutoff)
+            })
+    }
+
     pub(super) fn accept_timed_receipt(&mut self) -> Result<bool, DialError> {
         if !self.timed.enabled {
             return Ok(true);
@@ -280,11 +298,7 @@ impl IaxPeer {
         let Some(receipt) = self.incoming_receipt else {
             return Ok(true);
         };
-        if self
-            .timed
-            .cutoff
-            .is_some_and(|cutoff| receipt.instant < cutoff)
-        {
+        if self.receipt_before_timed_cutoff(Some(receipt)) {
             return Ok(false);
         }
         if Span::new(Some(receipt)).expired(Instant::now()) {

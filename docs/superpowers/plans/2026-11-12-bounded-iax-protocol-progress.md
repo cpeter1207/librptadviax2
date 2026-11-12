@@ -130,3 +130,16 @@ Observed command: cargo test --locked --lib client::unit_tests::protocol_progres
 - Logs: .work/protocol-progress-red.log and .work/protocol-progress-layout.log. Exact commands and exclusions: .work/quality-progress.md.
 
 Local implementation checkpoint: all seven prepared protocol_progress cases passed on the approved fresh constrained image. This is targeted evidence, not full verification or release readiness. See .work/quality-progress.md.
+
+
+## Local code-review regressions
+
+The first implementation checkpoint was 1f69f1a69a3532500b966174baca84856c5e7d5f. The next fresh constrained run compiled successfully and ran 16 cases: 12 passed and four failed. Independent deferred-voice cases proved that an empty output buffer could let a later digit pass voice A or let voice B overwrite A. A third test proved that a later selected remainder could pass an older early-answer PCM item. A real 65-datagram pre-reset burst proved that already retired receipts still consumed source slots. The log is .work/protocol-progress-review-red.log.
+
+The local repair preserves the selected-source barrier even when decoding or rendering returns retryable OutputFull. A bounded early-prefix count keeps all previously accepted early events ahead of a later selected direct or jitter remainder. Media retirement subtracts only retired early media from that count and preserves controls. Service still commits legal protocol sequence and ACK information for valid pre-cutoff voice, but does not reserve or retain that already invalidated source.
+
+ABI2 validation now reads the optional tail using the original caller-allocation raw pointer before creating a mutable reference to the 72-byte prefix. Physical 4-byte, 72-byte, and 80-byte caller records, untouched ABI1 tails, malformed requests, and guard bytes are tested separately. Native execution is not proof of Rust pointer-provenance safety; Miri has not run.
+
+Actual representation measurements in the 16-case run confirmed the proposed 96-byte source slot and 6,144-byte 64-slot metadata bound. Shared ownership transfer retained 10,496 mini-frame bytes or 11,008 full-frame bytes, with zero new exact phone-payload allocations. Reserved mini admission made zero total allocations; full admission made 64 existing protocol-response allocations. The repaired state adds one byte for the early-prefix counter to the previous three-byte service state; a measurement assertion is prepared. Allocator bookkeeping, existing Span mappings, and existing ingress/protocol buffers remain outside these payload-plus-slot totals. No new source queue or host buffer was introduced.
+
+The repaired 18-case batch passed on the same freshly pulled constrained image (exit 0): all four exact RED regressions, installed jitter cases, physical-size request tests, and stale full-voice sequence/ACK preservation passed. The measured service state is four bytes, with unchanged source-slot and payload bounds. See .work/protocol-progress-review-green.log. Broader suite, static analysis, ABI smoke, coverage, consumer integration, and publication remain separate pending gates.
