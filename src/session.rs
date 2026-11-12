@@ -889,6 +889,17 @@ impl OutboundCallSetup {
         }
     }
 
+    /// Predict only source ownership without consuming sequence state. The
+    /// normal admission methods still validate and commit the actual frame.
+    pub(crate) fn admits_source(&self, header: &FullFrameHeader, reordered: bool) -> bool {
+        let distance = header.outgoing_sequence.wrapping_sub(self.next_incoming);
+        if reordered {
+            distance < 64 && self.received_media & (1_u64 << distance) == 0
+        } else {
+            distance == 0
+        }
+    }
+
     /// Whether a full frame belongs to the consumed modular half-range.
     pub(crate) fn is_old_frame(&self, header: &FullFrameHeader) -> bool {
         (1..128).contains(&self.next_incoming.wrapping_sub(header.outgoing_sequence))

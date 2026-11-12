@@ -280,6 +280,21 @@ impl Playout {
     pub(crate) fn unkey(&mut self) {
         self.ending = true;
     }
+    /// Read-only activation proof; opaque queued packets are trusted only when
+    /// their existing provider admission already enforced the phone profile.
+    pub(crate) fn private_profile_ready(&self, provider_profile: bool) -> bool {
+        self.decoded.capacity() <= 160
+            && self
+                .pending
+                .as_ref()
+                .is_none_or(|pending| pending.length <= 160)
+            && (provider_profile
+                || self
+                    .jitter
+                    .observe()
+                    .is_ok_and(|state| state.queued_packets == 0))
+    }
+
     pub(crate) fn blocks_transport(&self) -> bool {
         self.pending.is_some() || self.next_key.is_some()
     }

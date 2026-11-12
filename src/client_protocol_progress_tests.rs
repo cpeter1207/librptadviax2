@@ -1,0 +1,689 @@
+//! Proposed protocol-only request exercised through the real owner and UDP.
+use super::*;
+use crate::client::{EgressRetirement, IaxPeerEvent, SourceTimeInput, TimedPeerEvent};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    mpsc,
+};
+
+/// The new request is represented locally so this test compiles against alpha12.
+#[repr(C)]
+struct ServiceRequest {
+    prefix: crate::ffi::rptadv_iax2_timed_event_v1,
+    request_flags: u32,
+    reserved: u32,
+}
+
+#[derive(Debug)]
+enum Report {
+    Service {
+        status: i32,
+        event_kind: u32,
+        source_start: u64,
+        retirement: Option<EgressRetirement>,
+        held: TimedPeerEvent,
+    },
+    Delivered(TimedPeerEvent, Vec<f32>),
+    Failed(String),
+    Finished,
+}
+
+fn digit(sequence: u8, symbol: u8) -> Vec<u8> {
+    serialize_full_frame(
+        &FullFrameHeader {
+            source_call_number: 5678,
+            destination_call_number: 1234,
+            retransmission: false,
+            timestamp: 20,
+            outgoing_sequence: sequence,
+            incoming_sequence: 1,
+            frame_type: 1,
+            subclass: symbol,
+            subclass_is_log: false,
+        },
+        &[],
+    )
+    .unwrap()
+}
+
+/// Removing protocol service, consuming a later source event, or synthesizing
+/// ACK credit must fail this test. The only artificial input is sink refusal.
+#[test]
+fn refused_digit_keeps_real_ack_progress_and_later_source_order() {
+    let _timestamp_probe = crate::source_time::tests::timestamp_probe();
+    let runtime = crate::provider_tests::runtime();
+    let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
+    remote
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let mut peer = linked_peer(remote.local_addr().unwrap());
+    let local = peer.local_addr().unwrap();
+    let origin = Instant::now();
+    let input = SourceTimeInput {
+        host_clock_epoch: 7,
+        reference_now_ns: 5_000_000_000,
+        acknowledged_media_epoch: 1,
+    };
+    remote.send_to(&digit(1, b'5'), local).unwrap();
+    let held = loop {
+        let event = peer.poll_timed(&mut [], &mut [0; 1], input).unwrap();
+        if event.event != IaxPeerEvent::None {
+            break event;
+        }
+        assert!(origin.elapsed() < Duration::from_secs(2));
+        std::thread::yield_now();
+    };
+    assert_eq!(held.event, IaxPeerEvent::Digit(b'5'));
+    assert_eq!(
+        (held.media_epoch, held.source_start, held.born_ns),
+        (1, 0, None)
+    );
+    assert!(!held.discontinuity);
+
+    peer.send_prepared_audio(&[0xff; 160], 160, 0).unwrap();
+    let mut bytes = [0; 2048];
+    loop {
+        let (count, _) = remote.recv_from(&mut bytes).unwrap();
+        let frame = crate::protocol::parse_full_frame_packet(&bytes[..count]).unwrap();
+        if frame.header.frame_type == 2 {
+            assert_eq!(frame.payload, &[0xff; 160]);
+            assert_eq!(frame.header.outgoing_sequence, 1);
+            break;
+        }
+    }
+    assert_eq!(peer.retire_egress().unwrap(), EgressRetirement::Pending);
+    remote.send_to(&digit(2, b'6'), local).unwrap();
+
+    let (wake, ingress) = peer.prepare_async_ingress(runtime.handle()).unwrap();
+    let (socket, producer, owner) = ingress.unwrap();
+    let pump = crate::async_driver::DatagramPump::from_socket(
+        runtime.handle(),
+        socket,
+        remote.local_addr().unwrap(),
+        producer,
+        Some(owner),
+    );
+    let permit = Arc::new(AtomicBool::new(false));
+    let may_accept = Arc::clone(&permit);
+    let (sender, reports) = mpsc::channel();
+    let mut held_pending = true;
+    let mut delivered = 0;
+    let mut completed = None;
+    let api = unsafe { &*crate::ffi::rptadv_iax2_client_descriptor_v2() };
+    let driver = crate::async_driver::PeerDriver::attach(runtime.handle(), wake, move || {
+        peer.begin_turn();
+        let reference = 5_000_000_000 + origin.elapsed().as_nanos() as u64;
+        let mut request = ServiceRequest {
+            prefix: crate::ffi::rptadv_iax2_timed_event_v1 {
+                struct_size: std::mem::size_of::<ServiceRequest>() as u32,
+                abi_version: 2,
+                host_clock_epoch: 7,
+                reference_now_ns: reference,
+                acknowledged_media_epoch: 1,
+                ..Default::default()
+            },
+            request_flags: 1,
+            reserved: 0,
+        };
+        let status = unsafe {
+            api.poll_timed.unwrap()(
+                (&mut peer as *mut IaxPeer).cast(),
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                0,
+                &mut request.prefix,
+            )
+        };
+        let retirement = if status == 0 {
+            completed.or_else(|| peer.retire_egress().ok())
+        } else {
+            None
+        };
+        if matches!(retirement, Some(EgressRetirement::Complete(_))) {
+            completed = retirement;
+        }
+        sender
+            .send(Report::Service {
+                status,
+                event_kind: request.prefix.event_kind,
+                source_start: request.prefix.source_start,
+                retirement,
+                held,
+            })
+            .ok()?;
+        if status != 0 || retirement.is_none() {
+            return None;
+        }
+        if may_accept.load(Ordering::Acquire) {
+            if held_pending {
+                sender.send(Report::Delivered(held, Vec::new())).ok()?;
+                held_pending = false;
+                delivered += 1;
+            }
+            let mut pcm = [0.0; 160];
+            let event = match peer.poll_timed(
+                &mut pcm,
+                &mut [0; 1],
+                SourceTimeInput {
+                    reference_now_ns: reference,
+                    ..input
+                },
+            ) {
+                Ok(event) => event,
+                Err(error) => {
+                    sender.send(Report::Failed(format!("{error:?}"))).ok()?;
+                    return None;
+                }
+            };
+            if event.event != IaxPeerEvent::None {
+                let count = match event.event {
+                    IaxPeerEvent::Audio(count) => count,
+                    _ => 0,
+                };
+                sender
+                    .send(Report::Delivered(event, pcm[..count].to_vec()))
+                    .ok()?;
+                delivered += 1;
+            }
+            if delivered == 4 {
+                match peer.poll_timed(&mut pcm, &mut [0; 1], input) {
+                    Ok(extra) if extra.event == IaxPeerEvent::None => {
+                        sender.send(Report::Finished).ok()?;
+                    }
+                    other => {
+                        sender
+                            .send(Report::Failed(format!(
+                                "source delivered more than once: {other:?}"
+                            )))
+                            .ok()?;
+                    }
+                }
+                return None;
+            }
+        }
+        peer.set_product_deadline(10_000_000).ok()?;
+        Some(peer.wait_state())
+    });
+
+    // Always quiesce the retained owner/pump before any assertion unwinds.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let next = || {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(|| "absolute owner regression deadline expired".to_owned())?;
+        reports
+            .recv_timeout(remaining)
+            .map_err(|error| error.to_string())
+    };
+    let result = (|| -> Result<Vec<(TimedPeerEvent, Vec<f32>)>, String> {
+        for _ in 0..3 {
+            match next()? {
+                Report::Service {
+                    status: 0,
+                    event_kind: crate::ffi::RPTADV_IAX2_EVENT_NONE,
+                    source_start: 0,
+                    retirement: Some(EgressRetirement::Pending),
+                    held: same,
+                } if same == held => (),
+                report => {
+                    return Err(format!(
+                        "SERVICE_ONLY must preserve refusal and service protocol: {report:?}"
+                    ));
+                }
+            }
+        }
+        let ack = serialize_full_frame(
+            &FullFrameHeader {
+                source_call_number: 5678,
+                destination_call_number: 1234,
+                retransmission: false,
+                timestamp: 0,
+                outgoing_sequence: 99,
+                incoming_sequence: 2,
+                frame_type: 6,
+                subclass: crate::protocol::IaxCommand::Ack.subclass_value() as u8,
+                subclass_is_log: false,
+            },
+            &[],
+        )
+        .unwrap();
+        remote.send_to(&ack, local).map_err(|e| e.to_string())?;
+        let voice = crate::protocol::serialize_mini_frame(
+            &crate::protocol::MiniFrameHeader {
+                source_call_number: 5678,
+                timestamp: 40,
+            },
+            &[0x80; 160],
+        )
+        .unwrap();
+        remote.send_to(&voice, local).map_err(|e| e.to_string())?;
+        remote
+            .send_to(&digit(3, b'7'), local)
+            .map_err(|e| e.to_string())?;
+
+        loop {
+            match next()? {
+                Report::Service {
+                    status: 0,
+                    event_kind: crate::ffi::RPTADV_IAX2_EVENT_NONE,
+                    source_start: 0,
+                    retirement: Some(retirement),
+                    held: same,
+                } if same == held => match retirement {
+                    EgressRetirement::Pending => (),
+                    EgressRetirement::Complete(2) => break,
+                    other => return Err(format!("unexpected real retirement receipt: {other:?}")),
+                },
+                report => {
+                    return Err(format!(
+                        "refused source changed before real ACK retirement: {report:?}"
+                    ));
+                }
+            }
+        }
+        permit.store(true, Ordering::Release);
+        driver.wake();
+        let mut events = Vec::new();
+        let mut finished = false;
+        while !finished {
+            match next()? {
+                Report::Delivered(event, pcm) => events.push((event, pcm)),
+                Report::Service {
+                    status: 0,
+                    event_kind: crate::ffi::RPTADV_IAX2_EVENT_NONE,
+                    ..
+                } => (),
+                Report::Failed(error) => return Err(error),
+                Report::Finished => finished = true,
+                report => return Err(format!("source release failed: {report:?}")),
+            }
+        }
+        if events.len() != 4 {
+            return Err(format!(
+                "expected four source items, received {}",
+                events.len()
+            ));
+        }
+        Ok(events)
+    })();
+    driver.detach();
+    pump.detach();
+
+    let events = result.expect("real ACK progress must not depend on source acceptance");
+    assert_eq!(
+        events
+            .iter()
+            .map(|(event, _)| event.event)
+            .collect::<Vec<_>>(),
+        [
+            IaxPeerEvent::Digit(b'5'),
+            IaxPeerEvent::Digit(b'6'),
+            IaxPeerEvent::Audio(160),
+            IaxPeerEvent::Digit(b'7'),
+        ]
+    );
+    assert_eq!(events[0].0, held);
+    assert_eq!(
+        events
+            .iter()
+            .map(|(event, _)| event.source_start)
+            .collect::<Vec<_>>(),
+        [0, 0, 0, 160]
+    );
+    assert_eq!(events[2].1.len(), 160);
+    assert!(
+        events[2].0.born_ns.is_some(),
+        "genuine original UDP receipt must survive staging"
+    );
+}
+
+/// Rejected request shapes must not enter timed mode or consume real ACK credit.
+#[test]
+fn invalid_service_request_leaves_protocol_and_source_state_unchanged() {
+    for (size, version, flags, reserved) in [
+        (72, 2, 1, 0),
+        (80, u32::MAX, 1, 0),
+        (80, 2, 2, 0),
+        (80, 2, 1, 1),
+    ] {
+        let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
+        remote
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut peer = linked_peer(remote.local_addr().unwrap());
+        peer.send_prepared_audio(&[0xff; 160], 160, 0).unwrap();
+        remote.recv_from(&mut [0; 2048]).unwrap();
+        assert_eq!(peer.retire_egress().unwrap(), EgressRetirement::Pending);
+        let ack = serialize_full_frame(
+            &FullFrameHeader {
+                source_call_number: 5678,
+                destination_call_number: 1234,
+                retransmission: false,
+                timestamp: 0,
+                outgoing_sequence: 99,
+                incoming_sequence: 2,
+                frame_type: 6,
+                subclass: crate::protocol::IaxCommand::Ack.subclass_value() as u8,
+                subclass_is_log: false,
+            },
+            &[],
+        )
+        .unwrap();
+        remote.send_to(&ack, peer.local_addr().unwrap()).unwrap();
+        let mut request = ServiceRequest {
+            prefix: crate::ffi::rptadv_iax2_timed_event_v1 {
+                struct_size: size,
+                abi_version: version,
+                host_clock_epoch: 7,
+                reference_now_ns: 5_000_000_000,
+                acknowledged_media_epoch: 1,
+                ..Default::default()
+            },
+            request_flags: flags,
+            reserved,
+        };
+        let api = unsafe { &*crate::ffi::rptadv_iax2_client_descriptor_v2() };
+        assert_eq!(
+            unsafe {
+                api.poll_timed.unwrap()(
+                    (&mut peer as *mut IaxPeer).cast(),
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                    &mut request.prefix,
+                )
+            },
+            -1
+        );
+        assert_eq!(
+            (
+                request.prefix.host_clock_epoch,
+                request.prefix.reference_now_ns,
+                request.prefix.acknowledged_media_epoch,
+                request.request_flags,
+                request.reserved,
+            ),
+            (7, 5_000_000_000, 1, flags, reserved)
+        );
+        assert_eq!(peer.retire_egress().unwrap(), EgressRetirement::Pending);
+        assert_eq!(
+            peer.poll_event(&mut [], &mut []).unwrap(),
+            IaxPeerEvent::None
+        );
+        assert_eq!(peer.retire_egress().unwrap(), EgressRetirement::Complete(2));
+    }
+}
+
+fn input() -> SourceTimeInput {
+    SourceTimeInput {
+        host_clock_epoch: 7,
+        reference_now_ns: 5_000_000_000,
+        acknowledged_media_epoch: 1,
+    }
+}
+
+fn service(peer: &mut IaxPeer) -> Result<TimedPeerEvent, DialError> {
+    peer.poll_timed_private(
+        &mut [],
+        &mut [],
+        input(),
+        crate::client::SourceDelivery::ServiceOnly,
+    )
+}
+
+fn control(sequence: u8, acknowledgement: u8, command: crate::protocol::IaxCommand) -> Vec<u8> {
+    serialize_full_frame(
+        &FullFrameHeader {
+            source_call_number: 5678,
+            destination_call_number: 1234,
+            retransmission: false,
+            timestamp: 0,
+            outgoing_sequence: sequence,
+            incoming_sequence: acknowledgement,
+            frame_type: 6,
+            subclass: command.subclass_value() as u8,
+            subclass_is_log: false,
+        },
+        &[],
+    )
+    .unwrap()
+}
+
+fn mini(timestamp: u16, value: u8) -> Vec<u8> {
+    crate::protocol::serialize_mini_frame(
+        &crate::protocol::MiniFrameHeader {
+            source_call_number: 5678,
+            timestamp,
+        },
+        &[value; 160],
+    )
+    .unwrap()
+}
+
+fn next_source(peer: &mut IaxPeer, pcm: &mut [f32]) -> TimedPeerEvent {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let event = peer.poll_timed(pcm, &mut [0; 1], input()).unwrap();
+        if event.event != IaxPeerEvent::None {
+            return event;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no source before absolute deadline"
+        );
+        std::thread::yield_now();
+    }
+}
+
+#[test]
+fn service_preserves_host_and_provider_pcm_suffix_birth_until_real_ack_retirement() {
+    let _probe = crate::source_time::tests::timestamp_probe();
+    let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let mut peer = linked_peer(remote.local_addr().unwrap());
+    let local = peer.local_addr().unwrap();
+    remote.send_to(&mini(20, 0x80), local).unwrap();
+    let mut held = [0.0; 40];
+    let first = next_source(&mut peer, &mut held);
+    assert_eq!(first.event, IaxPeerEvent::Audio(40));
+    assert_eq!(first.source_start, 0);
+    let birth = first.born_ns.expect("original Linux receipt");
+    let retained = held;
+    // A host accepted20; the exact remaining20 stays outside the provider.
+    let accepted = 20;
+    peer.send_prepared_audio(&[0xff; 160], 160, 0).unwrap();
+    assert_eq!(peer.retire_egress().unwrap(), EgressRetirement::Pending);
+    remote.send_to(&digit(1, b'5'), local).unwrap();
+    remote
+        .send_to(&control(99, 2, crate::protocol::IaxCommand::Ack), local)
+        .unwrap();
+    remote.send_to(&mini(40, 0xff), local).unwrap();
+    for _ in 0..3 {
+        let progress = service(&mut peer).unwrap();
+        assert_eq!(
+            (progress.event, progress.source_start),
+            (IaxPeerEvent::None, 40)
+        );
+        assert_eq!((held, accepted), (retained, 20));
+        assert_eq!(peer.direct_pcm.remaining(), 120);
+        assert_eq!(
+            peer.direct_pcm
+                .span
+                .birth(7, 99_000_000_000, Instant::now()),
+            Some(birth)
+        );
+    }
+    assert_eq!(peer.retire_egress().unwrap(), EgressRetirement::Complete(2));
+    let mut released = retained.to_vec();
+    for source_start in [40, 80, 120] {
+        let mut suffix = [0.0; 40];
+        let event = next_source(&mut peer, &mut suffix);
+        assert_eq!(
+            (event.event, event.source_start, event.born_ns),
+            (IaxPeerEvent::Audio(40), source_start, Some(birth))
+        );
+        released.extend_from_slice(&suffix);
+    }
+    assert_eq!(released.len(), 160);
+    assert!(released.iter().all(|sample| *sample == retained[0]));
+    let digit = next_source(&mut peer, &mut [0.0; 160]);
+    assert_eq!(
+        (digit.event, digit.source_start),
+        (IaxPeerEvent::Digit(b'5'), 160)
+    );
+    let later = next_source(&mut peer, &mut [0.0; 160]);
+    assert_eq!(
+        (later.event, later.source_start),
+        (IaxPeerEvent::Audio(160), 160)
+    );
+}
+
+#[test]
+fn full_source_queue_services_real_ack_then_fails_before_accepting_sixty_fifth_digit() {
+    let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
+    remote.set_nonblocking(true).unwrap();
+    let mut peer = linked_peer(remote.local_addr().unwrap());
+    let local = peer.local_addr().unwrap();
+    peer.send_prepared_audio(&[0xff; 160], 160, 0).unwrap();
+    assert_eq!(peer.retire_egress().unwrap(), EgressRetirement::Pending);
+    for sequence in 1..=64 {
+        remote.send_to(&digit(sequence, b'5'), local).unwrap();
+    }
+    service(&mut peer).unwrap();
+    assert_eq!(peer.pending_events.len(), 64);
+    assert_eq!(peer.pending_events.capacity(), 64);
+    remote
+        .send_to(&control(99, 2, crate::protocol::IaxCommand::Ack), local)
+        .unwrap();
+    remote.send_to(&digit(64, b'5'), local).unwrap();
+    service(&mut peer).unwrap();
+    assert_eq!(peer.pending_events.len(), 64);
+    assert_eq!(peer.retire_egress().unwrap(), EgressRetirement::Complete(2));
+    while remote.recv_from(&mut [0; 2048]).is_ok() {}
+    remote.send_to(&digit(65, b'6'), local).unwrap();
+    assert!(matches!(
+        service(&mut peer),
+        Err(DialError::EarlyEventsFull)
+    ));
+    assert_eq!(
+        peer.pending_events.len(),
+        64,
+        "accepted control is not evicted"
+    );
+    assert_eq!(
+        remote.recv_from(&mut [0; 2048]).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    assert!(
+        peer.poll_timed(&mut [0.0; 160], &mut [0; 1], input())
+            .is_err()
+    );
+    assert!(
+        peer.prepare_audio(&[0.0; 160], &mut [0; 160], false)
+            .is_err()
+    );
+    assert!(peer.reset_encoder().is_err());
+    assert!(peer.send_prepared_audio(&[0xff; 160], 160, 20).is_err());
+    assert!(peer.send_text(b"must not escape").is_err());
+    assert!(peer.send_dtmf(b'5').is_err());
+    assert!(
+        peer.retire_egress().is_err(),
+        "terminal invalidation is not a TX receipt"
+    );
+}
+
+#[test]
+fn service_timeout_and_real_remote_hangup_fence_source_and_tx_retirement() {
+    for hangup in [false, true] {
+        let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut peer = linked_peer(remote.local_addr().unwrap());
+        peer.send_prepared_audio(&[0xff; 160], 160, 0).unwrap();
+        assert_eq!(peer.retire_egress().unwrap(), EgressRetirement::Pending);
+        remote
+            .send_to(&digit(1, b'5'), peer.local_addr().unwrap())
+            .unwrap();
+        service(&mut peer).unwrap();
+        if hangup {
+            remote
+                .send_to(
+                    &control(2, 1, crate::protocol::IaxCommand::Hangup),
+                    peer.local_addr().unwrap(),
+                )
+                .unwrap();
+            assert!(matches!(service(&mut peer), Err(DialError::Hangup)));
+        } else {
+            // Shorten only the existing test frame's retry deadline, never source age
+            // or ACK state. Let the real clock expire it before the owner services it.
+            peer.pending_reliable[0].expires_at = Instant::now() + Duration::from_millis(5);
+            std::thread::sleep(Duration::from_millis(10));
+            assert!(matches!(service(&mut peer), Err(DialError::Timeout)));
+        }
+        assert_eq!(peer.pending_events.len(), 1);
+        assert!(peer.retire_egress().is_err());
+        assert!(
+            peer.prepare_audio(&[0.0; 160], &mut [0; 160], false)
+                .is_err()
+        );
+        assert!(peer.send_dtmf(b'5').is_err());
+        assert!(service(&mut peer).is_err());
+    }
+}
+
+#[test]
+fn deferred_original_receipt_expires_media_without_erasing_queued_digit() {
+    let _probe = crate::source_time::tests::timestamp_probe();
+    let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let mut peer = linked_peer(remote.local_addr().unwrap());
+    remote
+        .send_to(&mini(20, 0x80), peer.local_addr().unwrap())
+        .unwrap();
+    remote
+        .send_to(&digit(1, b'5'), peer.local_addr().unwrap())
+        .unwrap();
+    let first = service(&mut peer).unwrap();
+    assert_eq!(first.event, IaxPeerEvent::None);
+    assert_eq!(peer.pending_events.len(), 2);
+    assert!(peer.pending_events.front().unwrap().receipt().is_some());
+    std::thread::sleep(Duration::from_millis(510));
+    let expired = service(&mut peer).unwrap();
+    assert!(expired.discontinuity);
+    assert_eq!((expired.media_epoch, expired.source_start), (2, 0));
+    assert_eq!(peer.pending_events.len(), 1);
+    let digit = next_source(&mut peer, &mut [0.0; 160]);
+    assert_eq!(digit.event, IaxPeerEvent::Digit(b'5'));
+    assert!(digit.discontinuity);
+    assert_eq!(digit.born_ns, None);
+    assert_eq!(
+        peer.poll_timed(&mut [0.0; 160], &mut [0; 1], input())
+            .unwrap()
+            .event,
+        IaxPeerEvent::None
+    );
+}
+
+#[test]
+fn invalid_private_activation_keeps_early_text_and_existing_source_mode_unchanged() {
+    let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let mut peer = linked_peer(remote.local_addr().unwrap());
+    // An existing generic source history is not reinterpreted as20ms phone media.
+    peer.direct_pcm.samples = vec![0.5; 320];
+    peer.direct_pcm.position = 20;
+    peer.pending_events
+        .push_back(super::super::PendingSource::Ready(
+            super::super::PendingEvent {
+                event: IaxPeerEvent::Text(4),
+                pcm: super::super::PacketPcm::default(),
+                text: b"kept".to_vec(),
+            },
+        ));
+    assert!(matches!(service(&mut peer), Err(DialError::InvalidOptions)));
+    assert!(!peer.service.active);
+    assert_eq!(peer.direct_pcm.remaining(), 300);
+    let mut text = [0; 4];
+    assert_eq!(
+        peer.poll_event(&mut [], &mut text).unwrap(),
+        IaxPeerEvent::Text(4)
+    );
+    assert_eq!(&text, b"kept");
+}

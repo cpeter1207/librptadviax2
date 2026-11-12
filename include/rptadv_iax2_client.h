@@ -139,6 +139,24 @@ struct rptadv_iax2_timed_event_v1 {
     uint64_t born_ns; /**< OUTPUT immutable original birth, valid ONLY with TIMED_BIRTH. */
 };
 
+/** ABI2 opts into PCMU/PCMA8k20ms on this peer for its remaining lifetime.
+ * Validation rejects before peer mutation. Alpha12 rejects ABI2 safely.
+ * Ordinary ABI1 peers retain their generic behavior; an activated private peer
+ * cannot restore generic/visible-TEXT semantics through an ABI1 request.
+ */
+struct rptadv_iax2_timed_event_v2 {
+    struct rptadv_iax2_timed_event_v1 prefix; /**< Size80, ABI2; unchanged outputs. */
+    uint32_t request_flags; /**< Zero deliver, SERVICE_ONLY service. */
+    uint32_t reserved; /**< Must be zero. */
+};
+/** No source buffers/cursor advance, except actual media retirement/reset.
+ * Services real ACKs, protocol replies/retries and at most64 datagrams.
+ * Retains at most64 source records; no control eviction on overflow.
+ * Returns NONE/DISCONTINUITY only; terminal failures return negative and fence
+ * source, prepare, send and retire. Terminal state never supplies a TX token.
+ */
+#define RPTADV_IAX2_SERVICE_ONLY 1U
+
 /** Immutable prepared packet expiry,24 bytes on native64. Sample elapsed_ms FIRST,
  * then the Host clock reference and oldest contributing PCM age. Compute deadline
  * as that earlier native floor plus the remaining500ms age budget, rounding down.
@@ -262,6 +280,8 @@ struct rptadv_iax2_client_descriptor_v2 {
      * acknowledge only after genuine previous ring/DSP/RF retirement. Stale ack
      * never releases a later target. No fresh Audio/Gap while reset is pending.
      * Linux original RX/time qualification loss is sticky; control remains usable.
+     * ABI2 records add an explicit private-phone service request through the same
+     * pointer. Check its return before advertising private timed capability.
      */
     int32_t (*poll_timed)(void *peer, float *samples, size_t sample_capacity,
         uint8_t *text, size_t text_capacity, struct rptadv_iax2_timed_event_v1 *record);

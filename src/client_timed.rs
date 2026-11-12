@@ -1,5 +1,5 @@
 //! Opt-in source provenance for the existing exclusive peer/media owner.
-use super::{DialError, IaxPeer, IaxPeerEvent};
+use super::{DialError, IaxPeer, IaxPeerEvent, SourceDelivery};
 use crate::source_time::Span;
 use std::time::Instant;
 
@@ -71,6 +71,60 @@ impl IaxPeer {
         text: &mut [u8],
         input: SourceTimeInput,
     ) -> Result<TimedPeerEvent, DialError> {
+        self.poll_timed_mode(pcm, text, input, SourceDelivery::Deliver)
+    }
+
+    /// Opt into the fixed private G.711/20 ms source profile. Rejection before
+    /// activation leaves all peer state unchanged. The profile then persists.
+    pub fn poll_timed_private(
+        &mut self,
+        pcm: &mut [f32],
+        text: &mut [u8],
+        input: SourceTimeInput,
+        delivery: SourceDelivery,
+    ) -> Result<TimedPeerEvent, DialError> {
+        self.activate_private_source()?;
+        self.poll_timed_mode(pcm, text, input, delivery)
+    }
+
+    fn poll_timed_mode(
+        &mut self,
+        pcm: &mut [f32],
+        text: &mut [u8],
+        input: SourceTimeInput,
+        delivery: SourceDelivery,
+    ) -> Result<TimedPeerEvent, DialError> {
+        let result = self.poll_timed_inner(pcm, text, input, delivery);
+        if self.service.active
+            && matches!(
+                &result,
+                Err(DialError::Network(_)
+                    | DialError::Timeout
+                    | DialError::Hangup
+                    | DialError::EarlyEventsFull
+                    | DialError::Protocol(_)
+                    | DialError::Voice(_)
+                    | DialError::Jitter)
+            )
+        {
+            self.service.terminal = true;
+        }
+        if self.service.active
+            && matches!(&result, Err(DialError::Provider(error))
+            if error.status != crate::codec::providers::Status::OutputFull)
+        {
+            self.service.terminal = true;
+        }
+        result
+    }
+
+    fn poll_timed_inner(
+        &mut self,
+        pcm: &mut [f32],
+        text: &mut [u8],
+        input: SourceTimeInput,
+        delivery: SourceDelivery,
+    ) -> Result<TimedPeerEvent, DialError> {
         self.ensure_provider_live()?;
         if self.timed.failed {
             return Err(DialError::Jitter);
@@ -89,24 +143,19 @@ impl IaxPeer {
         }
         self.timed.host_epoch = Some(input.host_clock_epoch);
         self.timed.clock_revoked |= revoked;
-        let now = Instant::now();
-        if self
-            .timed
-            .history_receipt
-            .is_some_and(|receipt| receipt.expired(now))
-            || self.direct_pcm.span.expired(now)
-            || self
-                .pending_events
-                .iter()
-                .any(|event| event.pcm.remaining() != 0 && event.pcm.span.expired(now))
-            || self
-                .playout
-                .as_ref()
-                .is_some_and(|playout| playout.retained_expired(now))
-        {
+        if self.timed_media_expired(Instant::now()) {
             self.retire_timed_media()?;
         }
-        let mut event = self.poll_event_inner(pcm, text)?;
+        let mut event = match delivery {
+            SourceDelivery::Deliver => self.poll_event_inner(pcm, text)?,
+            SourceDelivery::ServiceOnly => {
+                self.service_private()?;
+                IaxPeerEvent::None
+            }
+        };
+        if self.timed_media_expired(Instant::now()) {
+            self.retire_timed_media()?;
+        }
         if matches!(event, IaxPeerEvent::Audio(_)) {
             // Native jitter can become quiet/clear while codec history remains.
             // Retain its real original receipt independently until actual reset.
@@ -152,6 +201,20 @@ impl IaxPeer {
         })
     }
 
+    fn timed_media_expired(&self, now: Instant) -> bool {
+        self.timed
+            .history_receipt
+            .is_some_and(|receipt| receipt.expired(now))
+            || self.direct_pcm.span.expired(now)
+            || self.pending_events.iter().any(|event| {
+                event.is_media() && event.receipt().is_some_and(|receipt| receipt.expired(now))
+            })
+            || self
+                .playout
+                .as_ref()
+                .is_some_and(|playout| playout.retained_expired(now))
+    }
+
     pub(super) fn retire_timed_media(&mut self) -> Result<(), DialError> {
         // Mark failure first: a failed native reset must never publish more PCM.
         self.timed.failed = true;
@@ -160,8 +223,8 @@ impl IaxPeer {
         self.timed.cursor = 0;
         self.timed.cutoff = Some(Instant::now());
         self.direct_pcm = super::PacketPcm::default();
-        self.pending_events
-            .retain(|event| !matches!(event.event, IaxPeerEvent::Audio(_) | IaxPeerEvent::Gap(_)));
+        self.pending_events.retain(|event| !event.is_media());
+        self.service.selected = false;
         self.timed.last_span = Span::default();
         self.timed.history_qualified = None;
         self.timed.history_receipt = None;
@@ -186,7 +249,7 @@ impl IaxPeer {
             .chain(
                 self.pending_events
                     .iter()
-                    .filter_map(|event| event.pcm.span.receipt),
+                    .filter_map(super::PendingSource::receipt),
             )
             .map(|receipt| receipt.instant)
             .chain(self.timed.history_receipt.map(|receipt| receipt.instant))

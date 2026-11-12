@@ -731,6 +731,7 @@ fn linked_peer(remote: SocketAddr) -> IaxPeer {
         pending_reliable: VecDeque::new(),
         pending_replies: VecDeque::new(),
         pending_events: VecDeque::new(),
+        service: super::service::State::default(),
         direct_pcm: super::PacketPcm::default(),
         incoming_receipt: None,
         timed: super::timed::State::default(),
@@ -1469,15 +1470,16 @@ fn ingress_large_direct_codec_packet_is_decoded_once_and_drained_in_caller_chunk
 fn ingress_pending_early_audio_can_be_read_with_smaller_buffers() {
     let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
     let mut peer = linked_peer(remote.local_addr().unwrap());
-    peer.pending_events.push_back(super::PendingEvent {
-        event: super::IaxPeerEvent::Audio(480),
-        pcm: super::PacketPcm {
-            samples: vec![0.25; 480],
-            position: 0,
-            span: crate::source_time::Span::default(),
-        },
-        text: Vec::new(),
-    });
+    peer.pending_events
+        .push_back(super::PendingSource::Ready(super::PendingEvent {
+            event: super::IaxPeerEvent::Audio(480),
+            pcm: super::PacketPcm {
+                samples: vec![0.25; 480],
+                position: 0,
+                span: crate::source_time::Span::default(),
+            },
+            text: Vec::new(),
+        }));
     assert!(
         matches!(peer.poll_event(&mut [], &mut []), Err(DialError::Provider(error)) if error.required_capacity == 1)
     );
@@ -2614,3 +2616,6 @@ fn inbound_accept_and_answer_retransmit_until_their_cumulative_ack() {
     assert_eq!(text.header.outgoing_sequence, 2);
     assert_eq!(text.payload, b"next");
 }
+
+#[path = "client_protocol_progress_tests.rs"]
+mod protocol_progress;

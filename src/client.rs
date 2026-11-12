@@ -27,6 +27,10 @@ pub use timed::{SourceTimeInput, TimedPeerEvent};
 #[path = "client_egress.rs"]
 mod egress;
 pub use egress::{EgressRetirement, EgressTime, TimedMediaSend};
+#[path = "client_service.rs"]
+mod service;
+pub use service::SourceDelivery;
+use service::{PendingSource, ReceivedEvent, VoiceInput};
 
 const IE_CALLED_NUMBER: u8 = 1;
 const IE_CALLING_NUMBER: u8 = 2;
@@ -158,7 +162,8 @@ pub struct IaxPeer {
     setup: OutboundCallSetup,
     pending_reliable: VecDeque<PendingReliableFrame>,
     pending_replies: VecDeque<Vec<u8>>,
-    pending_events: VecDeque<PendingEvent>,
+    pending_events: VecDeque<PendingSource>,
+    service: service::State,
     direct_pcm: PacketPcm,
     incoming_receipt: Option<crate::source_time::Receipt>,
     timed: timed::State,
@@ -361,6 +366,9 @@ pub struct IaxPeerObservation {
 
 impl IaxPeer {
     pub(crate) fn ensure_provider_live(&self) -> Result<(), DialError> {
+        if self.service.terminal {
+            return Err(DialError::Protocol(CallSetupError::CallFinished));
+        }
         if let Some(ownership) = &self.provider_ownership {
             ownership
                 .check()
@@ -570,6 +578,7 @@ impl IaxPeer {
             pending_reliable: VecDeque::new(),
             pending_replies: VecDeque::new(),
             pending_events: VecDeque::new(),
+            service: service::State::default(),
             direct_pcm: PacketPcm::default(),
             incoming_receipt: None,
             timed: timed::State::default(),
@@ -709,6 +718,7 @@ impl IaxPeer {
 
     /// Deliberately abandon expired/discontinuous encoder input, never a retry.
     pub fn reset_encoder(&mut self) -> Result<(), DialError> {
+        self.ensure_provider_live()?;
         self.codecs
             .as_mut()
             .ok_or(DialError::InvalidOptions)?
@@ -821,10 +831,11 @@ impl IaxPeer {
 
     /// Send and retain a reliable HANGUP frame until the peer acknowledges it.
     pub fn hangup(&mut self) -> Result<(), DialError> {
-        if self
-            .provider_ownership
-            .as_ref()
-            .is_some_and(|owner| owner.check().is_err())
+        if self.service.terminal
+            || self
+                .provider_ownership
+                .as_ref()
+                .is_some_and(|owner| owner.check().is_err())
         {
             // Retirement gates retained programme/control payloads too. Only
             // the new protocol HANGUP may leave this retired transport owner.
@@ -863,7 +874,10 @@ impl IaxPeer {
         text: &mut [u8],
     ) -> Result<IaxPeerEvent, DialError> {
         self.ensure_provider_live()?;
-        if let Some(pending) = self.pending_events.front_mut() {
+        if self.service.active {
+            return self.poll_private_source(pcm, text);
+        }
+        if let Some(PendingSource::Ready(pending)) = self.pending_events.front_mut() {
             self.timed.last_span = pending.pcm.span.clone();
             if let Some(count) = pending.pcm.render(pcm)? {
                 if pending.pcm.remaining() == 0 {
@@ -877,7 +891,12 @@ impl IaxPeer {
                 return Err(DialError::InvalidOptions);
             }
             text[..pending.text.len()].copy_from_slice(&pending.text);
-            return Ok(self.pending_events.pop_front().expect("front exists").event);
+            let PendingSource::Ready(pending) =
+                self.pending_events.pop_front().expect("front exists")
+            else {
+                unreachable!("ordinary polls contain only ready early events");
+            };
+            return Ok(pending.event);
         }
         self.poll_transport_event(pcm, text)
     }
@@ -897,21 +916,22 @@ impl IaxPeer {
                     if self.pending_events.len() == MAX_EARLY_EVENTS {
                         return Err(DialError::EarlyEventsFull);
                     }
-                    self.pending_events.push_back(PendingEvent {
-                        event,
-                        pcm: PacketPcm {
-                            samples: match event {
-                                IaxPeerEvent::Audio(count) => pcm[..count].to_vec(),
+                    self.pending_events
+                        .push_back(PendingSource::Ready(PendingEvent {
+                            event,
+                            pcm: PacketPcm {
+                                samples: match event {
+                                    IaxPeerEvent::Audio(count) => pcm[..count].to_vec(),
+                                    _ => Vec::new(),
+                                },
+                                position: 0,
+                                span: self.timed.last_span.clone(),
+                            },
+                            text: match event {
+                                IaxPeerEvent::Text(count) => text[..count].to_vec(),
                                 _ => Vec::new(),
                             },
-                            position: 0,
-                            span: self.timed.last_span.clone(),
-                        },
-                        text: match event {
-                            IaxPeerEvent::Text(count) => text[..count].to_vec(),
-                            _ => Vec::new(),
-                        },
-                    });
+                        }));
                 }
             }
         }
@@ -977,10 +997,19 @@ impl IaxPeer {
         pcm: &mut [f32],
         text: &mut [u8],
     ) -> Result<IaxPeerEvent, DialError> {
+        match self.admit_event(bytes, text)? {
+            ReceivedEvent::Event(event) => Ok(event),
+            ReceivedEvent::Voice(voice) => self.release_voice(bytes, arrived_at, voice, pcm),
+            ReceivedEvent::RadioKey(timestamp) => self.release_radio_key(timestamp),
+            ReceivedEvent::RadioUnkey => self.release_radio_unkey(),
+        }
+    }
+
+    fn admit_event(&mut self, bytes: &[u8], text: &mut [u8]) -> Result<ReceivedEvent, DialError> {
         if bytes.first().is_some_and(|byte| byte & 0x80 != 0) {
             let frame = parse_full_frame_packet(bytes)
                 .map_err(|_| DialError::Protocol(CallSetupError::InvalidFrame))?;
-            if frame.header.frame_type == 1 && text.is_empty() {
+            if frame.header.frame_type == 1 && text.is_empty() && !self.service.active {
                 return Err(DialError::InvalidOptions);
             }
             if matches!(frame.header.frame_type, 1 | 4 | 6 | 7 | 10) {
@@ -1016,7 +1045,7 @@ impl IaxPeer {
                     for packet in packets {
                         self.send_reply(packet)?;
                     }
-                    return Ok(IaxPeerEvent::None);
+                    return Ok(ReceivedEvent::Event(IaxPeerEvent::None));
                 }
                 // ACK itself is unsequenced; its OSeq never classifies its credit as old.
                 let old = decode_iax_command(&frame.header) != Ok(Some(IaxCommand::Ack))
@@ -1031,7 +1060,7 @@ impl IaxPeer {
                     && matches!(frame.header.subclass, 2 | 11)
                     && self.ensure_reliable_capacity().is_err()
                 {
-                    return Ok(IaxPeerEvent::None);
+                    return Ok(ReceivedEvent::Event(IaxPeerEvent::None));
                 }
                 let response = self
                     .setup
@@ -1040,11 +1069,11 @@ impl IaxPeer {
                 let reply = match response {
                     LinkedCallResponse::SendReliable(packet) => {
                         self.send_reliable(packet)?;
-                        return Ok(IaxPeerEvent::None);
+                        return Ok(ReceivedEvent::Event(IaxPeerEvent::None));
                     }
                     LinkedCallResponse::Send(packet) => {
                         self.send_reply(packet)?;
-                        return Ok(IaxPeerEvent::None);
+                        return Ok(ReceivedEvent::Event(IaxPeerEvent::None));
                     }
                     LinkedCallResponse::PongAcknowledged {
                         acknowledgement, ..
@@ -1055,47 +1084,43 @@ impl IaxPeer {
                     }
                     LinkedCallResponse::Ended { acknowledgement } => {
                         self.send_reply(acknowledgement)?;
-                        return Ok(IaxPeerEvent::Hangup);
+                        return Ok(ReceivedEvent::Event(IaxPeerEvent::Hangup));
                     }
                     LinkedCallResponse::Text {
                         text: received,
                         acknowledgement,
                     } => {
                         self.send_reply(acknowledgement)?;
+                        if self.service.active {
+                            return Ok(ReceivedEvent::Event(IaxPeerEvent::None));
+                        }
                         if received.len() > text.len() {
                             return Err(DialError::InvalidOptions);
                         }
                         text[..received.len()].copy_from_slice(&received);
-                        return Ok(IaxPeerEvent::Text(received.len()));
+                        return Ok(ReceivedEvent::Event(IaxPeerEvent::Text(received.len())));
                     }
                     LinkedCallResponse::Digit {
                         digit,
                         acknowledgement,
                     } => {
                         self.send_reply(acknowledgement)?;
-                        return Ok(IaxPeerEvent::Digit(digit));
+                        return Ok(ReceivedEvent::Event(IaxPeerEvent::Digit(digit)));
                     }
                     LinkedCallResponse::RadioKey { acknowledgement } => {
                         self.send_reply(acknowledgement)?;
-                        if let Some(playout) = &mut self.playout {
-                            if !playout.key(frame.header.timestamp)? {
-                                return Ok(IaxPeerEvent::None);
-                            }
-                        }
-                        return Ok(IaxPeerEvent::RadioKey);
+                        return Ok(ReceivedEvent::RadioKey(frame.header.timestamp));
                     }
                     LinkedCallResponse::RadioUnkey { acknowledgement } => {
                         self.send_reply(acknowledgement)?;
-                        if let Some(playout) = &mut self.playout {
-                            playout.unkey();
-                            return Ok(IaxPeerEvent::None);
-                        }
-                        return Ok(IaxPeerEvent::RadioUnkey);
+                        return Ok(ReceivedEvent::RadioUnkey);
                     }
-                    LinkedCallResponse::NoAction => return Ok(IaxPeerEvent::None),
+                    LinkedCallResponse::NoAction => {
+                        return Ok(ReceivedEvent::Event(IaxPeerEvent::None));
+                    }
                 };
                 self.send_reply(reply)?;
-                return Ok(IaxPeerEvent::None);
+                return Ok(ReceivedEvent::Event(IaxPeerEvent::None));
             }
         }
 
@@ -1121,7 +1146,7 @@ impl IaxPeer {
                 }
                 self.send_reply(acknowledgement)?;
                 if !deliver {
-                    return Ok(IaxPeerEvent::None);
+                    return Ok(ReceivedEvent::Event(IaxPeerEvent::None));
                 }
                 (payload, header.timestamp, false)
             }
@@ -1132,6 +1157,28 @@ impl IaxPeer {
             }
             _ => return Err(DialError::Voice(VoiceFrameError::NotVoiceFrame)),
         };
+        Ok(ReceivedEvent::Voice(VoiceInput {
+            timestamp,
+            offset: (bytes.len() - payload.len()) as u16,
+            length: payload.len() as u16,
+            mini,
+        }))
+    }
+
+    fn release_voice(
+        &mut self,
+        bytes: &[u8],
+        arrived_at: Instant,
+        voice: VoiceInput,
+        pcm: &mut [f32],
+    ) -> Result<IaxPeerEvent, DialError> {
+        let VoiceInput {
+            timestamp,
+            offset,
+            length,
+            mini,
+        } = voice;
+        let payload = &bytes[usize::from(offset)..usize::from(offset) + usize::from(length)];
         // Header-only voice marks idle media. Full-frame sequence/ACK handling
         // above still applies, but no samples or jitter time may be published.
         if payload.is_empty() {
@@ -1191,7 +1238,10 @@ impl IaxPeer {
     }
 
     fn validate_phone_payload(&self, payload: &[u8]) -> Result<(), DialError> {
-        if self.provider_ownership.is_some() && !payload.is_empty() && payload.len() != 160 {
+        if (self.provider_ownership.is_some() || self.service.active)
+            && !payload.is_empty()
+            && payload.len() != 160
+        {
             return Err(DialError::Provider(crate::codec::providers::Error {
                 status: crate::codec::providers::Status::Malformed,
                 required_capacity: 0,
@@ -1621,6 +1671,7 @@ pub(crate) fn dial_new_transport(
                     pending_reliable: VecDeque::new(),
                     pending_replies: VecDeque::new(),
                     pending_events: VecDeque::new(),
+                    service: service::State::default(),
                     direct_pcm: PacketPcm::default(),
                     incoming_receipt: None,
                     timed: timed::State::default(),
