@@ -174,6 +174,8 @@ impl IaxPeer {
         if bytes.first().is_some_and(|byte| byte & 0x80 != 0) {
             let frame = parse_full_frame_packet(bytes)
                 .map_err(|_| DialError::Protocol(crate::session::CallSetupError::InvalidFrame))?;
+            // Every constructed peer has linked, immutable call IDs. This
+            // canonical full-frame check also covers the voice match below.
             self.setup
                 .validate_call_ids(&frame.header)
                 .map_err(DialError::Protocol)?;
@@ -196,15 +198,10 @@ impl IaxPeer {
                 header,
                 format,
                 payload,
-            } if header.source_call_number == self.remote_call
-                && header.destination_call_number == self.local_call
-                && format == self.format =>
-            {
-                (
-                    payload,
-                    self.setup.admits_source(&header, self.playout.is_some()),
-                )
-            }
+            } if format == self.format => (
+                payload,
+                self.setup.admits_source(&header, self.playout.is_some()),
+            ),
             VoiceFrame::Mini {
                 header, payload, ..
             } if header.source_call_number == self.remote_call => (payload, true),
@@ -334,10 +331,9 @@ impl IaxPeer {
         self.service_private()?;
         for _ in 0..MAX_EARLY_EVENTS {
             if self.service.early_remaining == 0 && self.service.selected {
-                let event = self.poll_selected_source(pcm)?;
-                if event != IaxPeerEvent::None || self.service.selected {
-                    return Ok(event);
-                }
+                // Selected PCM or a deferred key owns this turn, including
+                // NotDue. Retirement clears that ownership before this loop.
+                return self.poll_selected_source(pcm);
             }
             if let Some(PendingSource::Ready(pending)) = self.pending_events.front_mut() {
                 self.timed.last_span = pending.pcm.span.clone();
