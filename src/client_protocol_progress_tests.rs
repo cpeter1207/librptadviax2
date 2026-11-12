@@ -1,6 +1,7 @@
 //! Proposed protocol-only request exercised through the real owner and UDP.
 use super::*;
 use crate::client::{EgressRetirement, IaxPeerEvent, SourceTimeInput, TimedPeerEvent};
+use crate::protocol::parse_full_frame_packet;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc,
@@ -650,34 +651,40 @@ fn service_timeout_and_real_remote_hangup_fence_source_and_tx_retirement() {
 
 #[test]
 fn deferred_original_receipt_expires_media_without_erasing_queued_digit() {
-    let _probe = crate::source_time::tests::timestamp_probe();
-    let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
-    let mut peer = linked_peer(remote.local_addr().unwrap());
-    remote
-        .send_to(&mini(20, 0x80), peer.local_addr().unwrap())
-        .unwrap();
-    remote
-        .send_to(&digit(1, b'5'), peer.local_addr().unwrap())
-        .unwrap();
-    let first = service(&mut peer).unwrap();
-    assert_eq!(first.event, IaxPeerEvent::None);
-    assert_eq!(peer.pending_events.len(), 2);
-    assert!(peer.pending_events.front().unwrap().receipt().is_some());
-    std::thread::sleep(Duration::from_millis(510));
-    let expired = service(&mut peer).unwrap();
-    assert!(expired.discontinuity);
-    assert_eq!((expired.media_epoch, expired.source_start), (2, 0));
-    assert_eq!(peer.pending_events.len(), 1);
-    let digit = next_source(&mut peer, &mut [0.0; 160]);
-    assert_eq!(digit.event, IaxPeerEvent::Digit(b'5'));
-    assert!(digit.discontinuity);
-    assert_eq!(digit.born_ns, None);
-    assert_eq!(
-        peer.poll_timed(&mut [0.0; 160], &mut [0; 1], input())
-            .unwrap()
-            .event,
-        IaxPeerEvent::None
-    );
+    for received_before_wait in [false, true] {
+        let _probe = crate::source_time::tests::timestamp_probe();
+        let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut peer = linked_peer(remote.local_addr().unwrap());
+        remote
+            .send_to(&mini(20, 0x80), peer.local_addr().unwrap())
+            .unwrap();
+        remote
+            .send_to(&digit(1, b'5'), peer.local_addr().unwrap())
+            .unwrap();
+        if received_before_wait {
+            let first = service(&mut peer).unwrap();
+            assert_eq!(first.event, IaxPeerEvent::None);
+            assert_eq!(peer.pending_events.len(), 2);
+            assert!(peer.pending_events.front().unwrap().receipt().is_some());
+        } else {
+            assert!(peer.pending_events.is_empty());
+        }
+        std::thread::sleep(Duration::from_millis(510));
+        let expired = service(&mut peer).unwrap();
+        assert!(expired.discontinuity);
+        assert_eq!((expired.media_epoch, expired.source_start), (2, 0));
+        assert_eq!(peer.pending_events.len(), 1);
+        let digit = next_source(&mut peer, &mut [0.0; 160]);
+        assert_eq!(digit.event, IaxPeerEvent::Digit(b'5'));
+        assert!(digit.discontinuity);
+        assert_eq!(digit.born_ns, None);
+        assert_eq!(
+            peer.poll_timed(&mut [0.0; 160], &mut [0; 1], input())
+                .unwrap()
+                .event,
+            IaxPeerEvent::None
+        );
+    }
 }
 
 #[test]
@@ -1160,17 +1167,19 @@ fn activation_preserves_early_prefix_before_later_selected_media() {
         next_source(&mut peer, &mut [0.0; 160]).event,
         IaxPeerEvent::Digit(b'5')
     );
+    for start in [0, 20] {
+        let mut output = [0.0; 20];
+        let early = next_source(&mut peer, &mut output);
+        assert_eq!(
+            (early.event, early.source_start),
+            (IaxPeerEvent::Audio(20), start)
+        );
+        assert_eq!(
+            output, [0.25; 20],
+            "later selected PCM must not pass either early suffix"
+        );
+    }
     let mut output = [0.0; 160];
-    let early = next_source(&mut peer, &mut output);
-    assert_eq!(
-        (early.event, early.source_start),
-        (IaxPeerEvent::Audio(40), 0)
-    );
-    assert_eq!(
-        &output[..40],
-        &[0.25; 40],
-        "later selected PCM must not pass the early prefix"
-    );
     let selected = next_source(&mut peer, &mut output);
     assert_eq!(
         (selected.event, selected.source_start),
@@ -1474,4 +1483,251 @@ fn recoverable_source_reservation_failure_precedes_ack_and_preserves_accepted_co
                 .is_err()
         );
     }
+}
+
+#[test]
+fn private_service_rejects_malformed_source_and_ignores_foreign_datagrams() {
+    let mut packets = vec![(vec![0x80], true)];
+    for (frame_type, subclass, subclass_is_log, payload, rejected) in [
+        (1, 5, true, vec![], true),
+        (4, 12, true, vec![], false),
+        (1, b'5', false, vec![1], true),
+        (1, b'!', false, vec![], true),
+        (2, 8, false, vec![0xff; 160], true),
+    ] {
+        packets.push((
+            serialize_full_frame(
+                &FullFrameHeader {
+                    source_call_number: 5678,
+                    destination_call_number: 1234,
+                    retransmission: false,
+                    timestamp: 20,
+                    outgoing_sequence: 1,
+                    incoming_sequence: 1,
+                    frame_type,
+                    subclass,
+                    subclass_is_log,
+                },
+                &payload,
+            )
+            .unwrap(),
+            rejected,
+        ));
+    }
+    for (source, destination) in [(5679, 1234), (5678, 1235)] {
+        let packet = full_voice(1, 1, 20, 0xff);
+        let mut header = parse_full_frame_packet(&packet).unwrap().header;
+        header.source_call_number = source;
+        header.destination_call_number = destination;
+        packets.push((serialize_full_frame(&header, &[0xff; 160]).unwrap(), true));
+    }
+    let mut foreign_call = mini(20, 0xff);
+    foreign_call[..2].copy_from_slice(&5679_u16.to_be_bytes());
+    packets.push((foreign_call, true));
+    for (packet, rejected) in packets {
+        let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut peer = linked_peer(remote.local_addr().unwrap());
+        service(&mut peer).unwrap();
+        remote.send_to(&packet, peer.local_addr().unwrap()).unwrap();
+        let result = service(&mut peer);
+        assert!(peer.pending_events.is_empty());
+        if rejected {
+            assert!(
+                matches!(result, Err(DialError::Protocol(_) | DialError::Voice(_))),
+                "malformed source must not be staged: {packet:?}"
+            );
+            assert!(peer.service.terminal);
+            assert!(peer.retire_egress().is_err());
+        } else {
+            // Log subclass12 means4096, an unknown radio control. Ordinary IAX
+            // acknowledges and ignores it; it must never become RADIO_KEY.
+            assert_eq!(result.unwrap().event, IaxPeerEvent::None);
+            assert!(!peer.service.terminal);
+            remote
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let mut bytes = [0; 128];
+            let (length, _) = remote.recv_from(&mut bytes).unwrap();
+            let acknowledgement = parse_full_frame_packet(&bytes[..length]).unwrap();
+            assert_eq!(
+                crate::protocol::decode_iax_command(&acknowledgement.header).unwrap(),
+                Some(crate::protocol::IaxCommand::Ack)
+            );
+            assert_eq!(acknowledgement.header.incoming_sequence, 2);
+            remote
+                .send_to(&digit(2, b'6'), peer.local_addr().unwrap())
+                .unwrap();
+            assert_eq!(
+                next_source(&mut peer, &mut []).event,
+                IaxPeerEvent::Digit(b'6')
+            );
+        }
+    }
+
+    let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let foreign = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let mut peer = linked_peer(remote.local_addr().unwrap());
+    service(&mut peer).unwrap();
+    foreign
+        .send_to(&digit(1, b'9'), peer.local_addr().unwrap())
+        .unwrap();
+    remote
+        .send_to(&digit(1, b'5'), peer.local_addr().unwrap())
+        .unwrap();
+    service(&mut peer).unwrap();
+    assert_eq!(
+        next_source(&mut peer, &mut []).event,
+        IaxPeerEvent::Digit(b'5')
+    );
+    assert!(peer.pending_events.is_empty());
+    assert!(!peer.service.terminal);
+}
+
+#[test]
+fn empty_voice_marker_and_radio_receipts_preserve_short_digit_retry() {
+    let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let mut peer = linked_peer(remote.local_addr().unwrap());
+    let local = peer.local_addr().unwrap();
+    let marker = full_voice(1, 1, 0, 0xff);
+    remote.send_to(&marker[..12], local).unwrap();
+    remote.send_to(&radio(2, 12), local).unwrap();
+    remote.send_to(&radio(3, 13), local).unwrap();
+    remote.send_to(&digit(4, b'5'), local).unwrap();
+    service(&mut peer).unwrap();
+    assert_eq!(peer.pending_events.len(), 3);
+    assert_eq!(
+        peer.timed_deadline(),
+        None,
+        "radio controls carry no source age"
+    );
+    assert_eq!(
+        next_source(&mut peer, &mut []).event,
+        IaxPeerEvent::RadioKey
+    );
+    assert_eq!(
+        next_source(&mut peer, &mut []).event,
+        IaxPeerEvent::RadioUnkey
+    );
+    assert!(matches!(
+        peer.poll_timed(&mut [], &mut [], input()),
+        Err(DialError::InvalidOptions)
+    ));
+    assert_eq!(peer.pending_events.len(), 1);
+    assert!(!peer.service.terminal);
+    let delivered = next_source(&mut peer, &mut []);
+    assert_eq!(delivered.event, IaxPeerEvent::Digit(b'5'));
+    assert_eq!((delivered.source_start, delivered.born_ns), (0, None));
+    assert!(peer.pending_events.is_empty());
+}
+
+#[test]
+fn failed_private_ingress_fences_source_but_allows_clean_hangup() {
+    let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let (mut peer, producer) = shared_peer(remote.local_addr().unwrap());
+    peer.compose_codec(crate::ffi::test_peer_catalog()).unwrap();
+    service(&mut peer).unwrap();
+    peer.send_dtmf(b'5').unwrap();
+    assert_eq!(peer.pending_reliable.len(), 1);
+    producer.fail();
+    assert!(matches!(
+        service(&mut peer),
+        Err(DialError::Network(error)) if error.kind() == std::io::ErrorKind::ConnectionAborted
+    ));
+    assert!(peer.service.terminal);
+    assert!(peer.send_dtmf(b'6').is_err());
+    assert!(peer.retire_egress().is_err());
+    peer.hangup().unwrap();
+    assert_eq!(peer.pending_reliable.len(), 1);
+    let frame = parse_full_frame_packet(&peer.pending_reliable[0].packet).unwrap();
+    assert_eq!(
+        crate::protocol::decode_iax_command(&frame.header).unwrap(),
+        Some(crate::protocol::IaxCommand::Hangup)
+    );
+}
+
+#[test]
+fn private_activation_rejects_uncomposed_codec_and_unqualified_jitter_backlog() {
+    let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let socket = Arc::new(SharedSocket::new(UdpSocket::bind("127.0.0.1:0").unwrap()));
+    let (_producer, ingress) = crate::ingress::producer_ingress(64, 1).unwrap();
+    let (mut generic, _released) = IaxPeer::from_inbound(
+        Arc::clone(&socket),
+        ingress,
+        socket.local_addr().unwrap(),
+        remote.local_addr().unwrap(),
+        1234,
+        5678,
+        crate::formats::IaxFormat::for_profile(crate::codec::providers::ProfileId::GsmFr).0,
+    )
+    .unwrap();
+    assert!(matches!(
+        service(&mut generic),
+        Err(DialError::InvalidOptions)
+    ));
+    assert_eq!(
+        generic.format(),
+        crate::formats::IaxFormat::for_profile(crate::codec::providers::ProfileId::GsmFr).0
+    );
+    assert!(!generic.service.active);
+    assert!(!generic.timed.enabled);
+    let (mut peer, _producer) = shared_peer(remote.local_addr().unwrap());
+    assert!(matches!(service(&mut peer), Err(DialError::InvalidOptions)));
+    assert!(!peer.service.active);
+    assert!(!peer.timed.enabled);
+    peer.compose_codec(crate::ffi::test_peer_catalog()).unwrap();
+    let fixture = crate::jitter::fixture::Fixture::new();
+    unsafe { peer.configure_jitter(fixture.descriptor()) }.unwrap();
+    fixture.observation(crate::jitter::Observation {
+        queued_packets: 1,
+        ..Default::default()
+    });
+    assert!(matches!(service(&mut peer), Err(DialError::InvalidOptions)));
+    assert!(!peer.service.active);
+    assert!(!peer.timed.enabled);
+    fixture.observation(crate::jitter::Observation::default());
+    service(&mut peer).unwrap();
+    assert!(peer.service.active);
+}
+
+#[test]
+fn private_selected_key_waits_for_real_jitter_tail_before_later_digit() {
+    let fixture = crate::jitter::fixture::Fixture::new();
+    let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let mut peer = linked_peer(remote.local_addr().unwrap());
+    unsafe { peer.configure_jitter(fixture.descriptor()) }.unwrap();
+    service(&mut peer).unwrap();
+    let timestamp = (0x1_0000_0000 + 20) * 8;
+    fixture.packet(u64::MAX, timestamp, &[0x80; 160], 0);
+    let local = peer.local_addr().unwrap();
+    remote.send_to(&full_voice(1, 1, 20, 0x80), local).unwrap();
+    remote.send_to(&radio(2, 13), local).unwrap();
+    remote.send_to(&radio(3, 12), local).unwrap();
+    remote.send_to(&digit(4, b'5'), local).unwrap();
+    service(&mut peer).unwrap();
+    let not_due = peer
+        .poll_timed(&mut [0.0; 160], &mut [0; 1], input())
+        .unwrap();
+    assert_eq!(not_due.event, IaxPeerEvent::None);
+    assert!(peer.service.selected);
+    assert_eq!(
+        peer.pending_events.len(),
+        1,
+        "later digit stays behind selected key"
+    );
+    assert_eq!(fixture.puts().len(), 1);
+    fixture.release_next();
+    let events = (0..4)
+        .map(|_| next_source(&mut peer, &mut [0.0; 160]).event)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        events,
+        [
+            IaxPeerEvent::Audio(160),
+            IaxPeerEvent::RadioUnkey,
+            IaxPeerEvent::RadioKey,
+            IaxPeerEvent::Digit(b'5'),
+        ]
+    );
+    assert!(peer.pending_events.is_empty());
+    assert!(!peer.service.selected);
 }

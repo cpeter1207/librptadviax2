@@ -891,12 +891,9 @@ impl IaxPeer {
                 return Err(DialError::InvalidOptions);
             }
             text[..pending.text.len()].copy_from_slice(&pending.text);
-            let PendingSource::Ready(pending) =
-                self.pending_events.pop_front().expect("front exists")
-            else {
-                unreachable!("ordinary polls contain only ready early events");
-            };
-            return Ok(pending.event);
+            let event = pending.event;
+            self.pending_events.pop_front();
+            return Ok(event);
         }
         self.poll_transport_event(pcm, text)
     }
