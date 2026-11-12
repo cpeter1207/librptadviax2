@@ -122,6 +122,55 @@ release a newer target. Private control can continue while retirement is pending
 A native reset failure stays closed until peer teardown. This timing capability
 does not itself authorize mailbox access or RF.
 
+## Protocol progress during source refusal
+
+The same `poll_timed` slot accepts the 80-byte
+`rptadv_iax2_timed_event_v2` request: set its prefix size to 80 and ABI to 2,
+`request_flags` to zero for source delivery or `RPTADV_IAX2_SERVICE_ONLY`
+for protocol service, and `reserved` to zero. Keep capturing the Host clock
+reference before each call. Pass a pointer derived from the complete request
+allocation, not a Rust reference narrowed to its 72-byte prefix.
+
+The unchanged 160-byte descriptor does not prove record-ABI2 support.
+Consumers must require a released package documenting this request and verify
+a successful SERVICE_ONLY opt-in before advertising the private timed capability. Alpha12
+rejects ABI2. Do not downgrade to ABI1 after rejection to claim protocol progress
+during source refusal. Unsupported versions, short records, invalid flags, or incompatible profile
+activation reject before peer mutation. Opt-in requires composed PCMU/PCMA at
+8 kHz, with exactly 160 bytes for each nonempty voice payload, and compatible
+retained media. Ordinary peers remain generic. Once activated, the private
+profile persists through later ABI1 or Rust timed delivery calls. Private TEXT
+has no application event or ASL interpretation; radio key/unkey playout effects
+remain ordered.
+
+While a downstream digit or PCM suffix is refused, retain that exact host item
+and call SERVICE_ONLY on the same serialized peer owner before retrying TX
+retirement. It services real ACKs, reliable deadlines, and replies, with at most
+64 received datagrams per turn. It returns no application source item and does
+not decode or advance source positions. Actual age/clock retirement may reset
+media and report a discontinuity; acknowledge its exact target only after the
+host's old owners retire. Resume source delivery only after the held item is
+accepted or invalidated. No second poller, independent scheduler, or host
+read-ahead buffer is needed.
+
+One existing 64-slot source queue owns early events and deferred encoded voice.
+Shared ingress transfers packet ownership; dedicated receive copies only the
+admitted packet. Reserve ownership before source acceptance or ACK. Pure ACKs,
+duplicates, and valid pre-cutoff media need no new source slot. A 65th new item
+or failed reservation is terminal before accepting that item: accepted controls
+are not evicted, and neither timeout nor teardown fabricates TX completion.
+Terminal failures fence source, preparation, sending, and retirement; the caller
+must use normal teardown. Retryable short output retains its selected source.
+
+Older early events and a selected direct/jitter remainder precede later source
+records and radio effects. Unselected jitter packets retain ordinary not-due
+and reordering behavior, so a later control may precede media not yet selected.
+Original receipts and mapped births remain unchanged. The measured 64-slot
+storage is 6,144 bytes; maximum admitted early-PCM payload is 40,960 bytes.
+A full encoded-voice-only queue instead retains 11,008 payload bytes. These
+bounds exclude existing ingress, jitter, protocol buffers, allocator bookkeeping,
+and Span mappings; they are not a total per-peer RSS claim.
+
 ## Timed prepared transmission
 
 The optional client slots `send_prepared_audio_timed` and `retire_egress` extend
