@@ -1021,8 +1021,16 @@ fn private_profile_checks_real_pending_and_decoded_generic_media() {
             .unwrap(),
         IaxPeerEvent::Audio(40)
     );
+    assert_eq!(
+        playout
+            .poll_with_codec(origin, &mut [0.0; 280], Some(&mut codec.decoder))
+            .unwrap(),
+        IaxPeerEvent::Audio(280)
+    );
+    assert!(playout.pending.is_none());
+    assert_eq!(playout.decoded.capacity(), 320);
     assert!(
         !playout.private_profile_ready(true),
-        "retained decoded allocation is oversized"
+        "retained decoded allocation is oversized even after the packet drains"
     );
 }

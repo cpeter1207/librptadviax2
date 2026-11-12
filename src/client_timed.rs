@@ -268,6 +268,7 @@ impl IaxPeer {
             .and_then(|instant| instant.checked_add(crate::source_time::MAXIMUM_AGE))
     }
 
+    /// Untimed peers have no source-age cutoff; absent receipts are not retired.
     pub(super) fn receipt_before_timed_cutoff(
         &self,
         receipt: Option<crate::source_time::Receipt>,

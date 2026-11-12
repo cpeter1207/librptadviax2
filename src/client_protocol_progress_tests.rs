@@ -1731,3 +1731,33 @@ fn private_selected_key_waits_for_real_jitter_tail_before_later_digit() {
     assert!(peer.pending_events.is_empty());
     assert!(!peer.service.selected);
 }
+
+// Internal helper-contract coverage, not a reachable whole-provider service
+// path: current timed callers establish a stronger enabled-mode invariant.
+#[test]
+fn receipt_cutoff_helper_accepts_real_untimed_peer_and_receipt() {
+    let _probe = crate::source_time::tests::timestamp_probe();
+    let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let mut peer = linked_peer(remote.local_addr().unwrap());
+    assert!(!peer.timed.enabled);
+    assert!(!peer.receipt_before_timed_cutoff(None));
+
+    remote
+        .send_to(&digit(1, b'5'), peer.local_addr().unwrap())
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        let event = peer.poll_event(&mut [], &mut [0; 1]).unwrap();
+        if event != IaxPeerEvent::None {
+            assert_eq!(event, IaxPeerEvent::Digit(b'5'));
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    let receipt = peer
+        .incoming_receipt
+        .expect("genuine timestamped UDP receipt");
+    assert!(!peer.timed.enabled);
+    assert!(!peer.receipt_before_timed_cutoff(Some(receipt)));
+}
