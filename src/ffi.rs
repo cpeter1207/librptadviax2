@@ -84,6 +84,17 @@ pub struct rptadv_iax2_timed_event_v1 {
     pub born_ns: u64,
 }
 
+/// Private G.711/20 ms timed request, preserving the ABI1 72-byte prefix.
+#[repr(C)]
+pub struct rptadv_iax2_timed_event_v2 {
+    /// Set struct_size to80 and abi_version to2; ordinary outputs stay unchanged.
+    pub prefix: rptadv_iax2_timed_event_v1,
+    /// Zero releases source; one services protocol without source delivery.
+    pub request_flags: u32,
+    /// Must be zero.
+    pub reserved: u32,
+}
+
 /// Immutable ABI1 prepared-packet expiry, retained unchanged across WouldBlock.
 #[repr(C)]
 pub struct rptadv_iax2_timed_send_v1 {
@@ -940,6 +951,28 @@ unsafe extern "C" fn poll_timed(
         {
             return -1;
         }
+        // Retain the caller allocation's raw provenance while validating the
+        // optional tail. Do not widen a pointer derived from a V1 reference.
+        let size = unsafe { ptr::addr_of!((*record).struct_size).read() };
+        let version = unsafe { ptr::addr_of!((*record).abi_version).read() };
+        let delivery = match version {
+            1 => Ok(None),
+            2 if size >= size_of::<rptadv_iax2_timed_event_v2>() as u32 => {
+                let tail = record.cast::<u8>();
+                let flags = unsafe { tail.add(72).cast::<u32>().read() };
+                let reserved = unsafe { tail.add(76).cast::<u32>().read() };
+                if reserved != 0 || flags > 1 {
+                    Err(())
+                } else {
+                    Ok(Some(if flags == 1 {
+                        crate::client::SourceDelivery::ServiceOnly
+                    } else {
+                        crate::client::SourceDelivery::Deliver
+                    }))
+                }
+            }
+            _ => Err(()),
+        };
         let record = unsafe { &mut *record };
         record.event_kind = RPTADV_IAX2_EVENT_NONE;
         record.flags = 0;
@@ -947,9 +980,9 @@ unsafe extern "C" fn poll_timed(
         record.media_epoch = 0;
         record.source_start = 0;
         record.born_ns = 0;
-        if record.abi_version != 1 {
+        let Ok(delivery) = delivery else {
             return -1;
-        }
+        };
         let (Some(peer), Some(samples), Some(text)) = (
             unsafe { peer.cast::<IaxPeer>().as_mut() },
             unsafe { output_slice(samples, sample_capacity) },
@@ -962,7 +995,11 @@ unsafe extern "C" fn poll_timed(
             reference_now_ns: record.reference_now_ns,
             acknowledged_media_epoch: record.acknowledged_media_epoch,
         };
-        let event = match peer.poll_timed(samples, text, input) {
+        let polled = match delivery {
+            Some(delivery) => peer.poll_timed_private(samples, text, input, delivery),
+            None => peer.poll_timed(samples, text, input),
+        };
+        let event = match polled {
             Ok(event) => {
                 record.media_epoch = event.media_epoch;
                 record.source_start = event.source_start;

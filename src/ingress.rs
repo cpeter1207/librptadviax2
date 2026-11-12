@@ -79,6 +79,11 @@ pub struct InboundDatagram {
 }
 
 impl InboundDatagram {
+    /// Move the original payload to the same exclusive peer owner without a copy.
+    pub(crate) fn into_payload(self) -> Box<[u8]> {
+        self.payload
+    }
+
     pub(crate) fn receipt(&self) -> Option<crate::source_time::Receipt> {
         self.receipt
     }

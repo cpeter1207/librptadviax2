@@ -45,6 +45,17 @@ impl Fixture {
             payload.to_vec(),
         ));
     }
+    /// Make the next scripted decision due without wall-clock sleeps.
+    pub(crate) fn release_next(&self) {
+        self.0
+            .lock()
+            .unwrap()
+            .decisions
+            .front_mut()
+            .unwrap()
+            .0
+            .deadline_ns = 0;
+    }
     pub(crate) fn policy(&self) -> (u32, u32, u32, u32) {
         self.0.lock().unwrap().policy
     }

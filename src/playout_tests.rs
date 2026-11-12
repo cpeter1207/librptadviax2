@@ -983,3 +983,54 @@ fn unkey_keeps_missing_media_before_tail_but_never_emits_gaps_past_it() {
         assert_eq!(fixture.advances(), [(0, 0)]);
     }
 }
+
+#[test]
+fn private_profile_checks_real_pending_and_decoded_generic_media() {
+    let fixture = Fixture::new();
+    let origin = Instant::now();
+    let mut playout = Playout::new(
+        unsafe { Jitter::new(fixture.descriptor()) }.unwrap(),
+        origin,
+    );
+    assert!(playout.private_profile_ready(false));
+    fixture.observation(Observation {
+        queued_packets: 1,
+        ..Observation::default()
+    });
+    assert!(!playout.private_profile_ready(false));
+    assert!(playout.private_profile_ready(true));
+    fixture.observation(Observation::default());
+
+    let mut codec = provider_decoder("g711", crate::codec::providers::ProfileId::G711Mu);
+    let payload = [0x80; 320];
+    playout
+        .put_with_codec(20, false, origin, &payload, Some(&codec.decoder))
+        .unwrap();
+    fixture.packet(0, (0x1_0000_0000 + 20) * 8, &payload, 0);
+    assert!(matches!(
+        playout.poll_with_codec(origin, &mut [], Some(&mut codec.decoder)),
+        Err(DialError::Decode(_))
+    ));
+    assert!(
+        !playout.private_profile_ready(true),
+        "pending encoded packet is oversized"
+    );
+    assert_eq!(
+        playout
+            .poll_with_codec(origin, &mut [0.0; 40], Some(&mut codec.decoder))
+            .unwrap(),
+        IaxPeerEvent::Audio(40)
+    );
+    assert_eq!(
+        playout
+            .poll_with_codec(origin, &mut [0.0; 280], Some(&mut codec.decoder))
+            .unwrap(),
+        IaxPeerEvent::Audio(280)
+    );
+    assert!(playout.pending.is_none());
+    assert_eq!(playout.decoded.capacity(), 320);
+    assert!(
+        !playout.private_profile_ready(true),
+        "retained decoded allocation is oversized even after the packet drains"
+    );
+}

@@ -731,6 +731,7 @@ fn linked_peer(remote: SocketAddr) -> IaxPeer {
         pending_reliable: VecDeque::new(),
         pending_replies: VecDeque::new(),
         pending_events: VecDeque::new(),
+        service: super::service::State::default(),
         direct_pcm: super::PacketPcm::default(),
         incoming_receipt: None,
         timed: super::timed::State::default(),
@@ -925,7 +926,7 @@ fn actual_clock_loss_before_or_after_decode_retires_media_and_preserves_private_
     const CHILD: &str = "RPTADV_IAX_PEER_CLOCK_CHILD";
     let Some(selection) = std::env::var_os(CHILD) else {
         let (path, _library) = crate::source_time::tests::fault_library();
-        for selection in ["before", "publish"] {
+        for selection in ["before", "publish", "service"] {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "client::unit_tests::actual_clock_loss_before_or_after_decode_retires_media_and_preserves_private_untimed_control", "--nocapture"])
                 .env(CHILD, selection).env("LD_PRELOAD", &path).output().unwrap();
@@ -946,11 +947,12 @@ fn actual_clock_loss_before_or_after_decode_retires_media_and_preserves_private_
         reference_now_ns: 5_000_000_000,
         acknowledged_media_epoch: 0,
     };
-    assert!(
+    let initial = if selection == "service" {
+        peer.poll_timed_private(&mut [], &mut [], input, super::SourceDelivery::ServiceOnly)
+    } else {
         peer.poll_timed(&mut [], &mut [], input)
-            .unwrap()
-            .discontinuity
-    );
+    };
+    assert!(initial.unwrap().discontinuity);
     let input = super::SourceTimeInput {
         acknowledged_media_epoch: 1,
         ..input
@@ -964,12 +966,45 @@ fn actual_clock_loss_before_or_after_decode_retires_media_and_preserves_private_
     )
     .unwrap();
     remote.send_to(&packet, peer.local_addr().unwrap()).unwrap();
-    let mut first_pcm = vec![0.0; if selection == "before" { 40 } else { 160 }];
+    let mut first_pcm = vec![0.0; if selection != "publish" { 40 } else { 160 }];
     let first = peer.poll_timed(&mut first_pcm, &mut [], input).unwrap();
     assert!(first.born_ns.is_some());
+    let held_pcm = first_pcm.clone();
+    if selection == "service" {
+        remote.send_to(&packet, peer.local_addr().unwrap()).unwrap();
+        let digit = serialize_full_frame(
+            &FullFrameHeader {
+                source_call_number: 5678,
+                destination_call_number: 1234,
+                retransmission: false,
+                timestamp: 40,
+                outgoing_sequence: 1,
+                incoming_sequence: 1,
+                frame_type: 1,
+                subclass_is_log: false,
+                subclass: b'6',
+            },
+            &[],
+        )
+        .unwrap();
+        remote.send_to(&digit, peer.local_addr().unwrap()).unwrap();
+        let held = peer
+            .poll_timed_private(&mut [], &mut [], input, super::SourceDelivery::ServiceOnly)
+            .unwrap();
+        assert_eq!(
+            (held.event, held.source_start),
+            (super::IaxPeerEvent::None, 40)
+        );
+        assert_eq!(peer.pending_events.len(), 2);
+        assert_eq!(peer.direct_pcm.remaining(), 120);
+        assert_eq!(
+            peer.direct_pcm.span.birth(1, u64::MAX, Instant::now()),
+            first.born_ns
+        );
+    }
     let library =
         unsafe { libloading::Library::new(std::env::var_os("LD_PRELOAD").unwrap()) }.unwrap();
-    if selection == "before" {
+    if selection != "publish" {
         let fd = match &peer.endpoint {
             PeerEndpoint::Dedicated(endpoint) => {
                 endpoint.shared_socket().source_clock.monitor_fd().unwrap()
@@ -995,25 +1030,55 @@ fn actual_clock_loss_before_or_after_decode_retires_media_and_preserves_private_
     } else {
         assert_eq!(peer.direct_pcm.remaining(), 120);
     }
-    let reset = peer.poll_timed(&mut [0.0; 40], &mut [], input).unwrap();
+    let reset = if selection == "service" {
+        peer.poll_timed_private(&mut [], &mut [], input, super::SourceDelivery::ServiceOnly)
+    } else {
+        peer.poll_timed(&mut [0.0; 40], &mut [], input)
+    }
+    .unwrap();
     assert_eq!(
         (reset.media_epoch, reset.event, reset.born_ns),
         (2, super::IaxPeerEvent::None, None)
     );
     assert!(reset.discontinuity);
     assert_eq!(peer.direct_pcm.remaining(), 0);
-    assert!(
-        peer.poll_timed(&mut [], &mut [], input)
-            .unwrap()
-            .discontinuity
-    );
+    if selection == "service" {
+        assert_eq!(first_pcm, held_pcm);
+        assert_eq!(peer.pending_events.len(), 1, "retire only deferred media");
+        let waiting = peer
+            .poll_timed_private(&mut [], &mut [], input, super::SourceDelivery::ServiceOnly)
+            .unwrap();
+        assert_eq!(
+            (waiting.event, waiting.media_epoch, waiting.source_start),
+            (super::IaxPeerEvent::None, 2, 0)
+        );
+        assert!(waiting.discontinuity);
+    } else {
+        assert!(
+            peer.poll_timed(&mut [], &mut [], input)
+                .unwrap()
+                .discontinuity
+        );
+    }
     let acknowledged = super::SourceTimeInput {
         acknowledged_media_epoch: 2,
         ..input
     };
-    let _ = peer
-        .poll_timed(&mut [0.0; 160], &mut [], acknowledged)
+    let after_ack = peer
+        .poll_timed(&mut [0.0; 160], &mut [0; 1], acknowledged)
         .unwrap();
+    if selection == "service" {
+        assert_eq!(
+            (
+                after_ack.event,
+                after_ack.media_epoch,
+                after_ack.source_start,
+                after_ack.born_ns
+            ),
+            (super::IaxPeerEvent::Digit(b'6'), 2, 0, None)
+        );
+        assert!(peer.pending_events.is_empty());
+    }
     remote.send_to(&packet, peer.local_addr().unwrap()).unwrap();
     let private = peer
         .poll_timed(&mut [0.0; 160], &mut [], acknowledged)
@@ -1028,7 +1093,7 @@ fn actual_clock_loss_before_or_after_decode_retires_media_and_preserves_private_
             destination_call_number: 1234,
             retransmission: false,
             timestamp: 40,
-            outgoing_sequence: 1,
+            outgoing_sequence: if selection == "service" { 2 } else { 1 },
             incoming_sequence: 1,
             frame_type: 1,
             subclass_is_log: false,
@@ -1469,15 +1534,16 @@ fn ingress_large_direct_codec_packet_is_decoded_once_and_drained_in_caller_chunk
 fn ingress_pending_early_audio_can_be_read_with_smaller_buffers() {
     let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
     let mut peer = linked_peer(remote.local_addr().unwrap());
-    peer.pending_events.push_back(super::PendingEvent {
-        event: super::IaxPeerEvent::Audio(480),
-        pcm: super::PacketPcm {
-            samples: vec![0.25; 480],
-            position: 0,
-            span: crate::source_time::Span::default(),
-        },
-        text: Vec::new(),
-    });
+    peer.pending_events
+        .push_back(super::PendingSource::Ready(super::PendingEvent {
+            event: super::IaxPeerEvent::Audio(480),
+            pcm: super::PacketPcm {
+                samples: vec![0.25; 480],
+                position: 0,
+                span: crate::source_time::Span::default(),
+            },
+            text: Vec::new(),
+        }));
     assert!(
         matches!(peer.poll_event(&mut [], &mut []), Err(DialError::Provider(error)) if error.required_capacity == 1)
     );
@@ -2614,3 +2680,6 @@ fn inbound_accept_and_answer_retransmit_until_their_cumulative_ack() {
     assert_eq!(text.header.outgoing_sequence, 2);
     assert_eq!(text.payload, b"next");
 }
+
+#[path = "client_protocol_progress_tests.rs"]
+mod protocol_progress;
