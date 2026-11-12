@@ -682,28 +682,58 @@ fn deferred_original_receipt_expires_media_without_erasing_queued_digit() {
 
 #[test]
 fn invalid_private_activation_keeps_early_text_and_existing_source_mode_unchanged() {
-    let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
-    let mut peer = linked_peer(remote.local_addr().unwrap());
-    // An existing generic source history is not reinterpreted as20ms phone media.
-    peer.direct_pcm.samples = vec![0.5; 320];
-    peer.direct_pcm.position = 20;
-    peer.pending_events
-        .push_back(super::super::PendingSource::Ready(
-            super::super::PendingEvent {
-                event: IaxPeerEvent::Text(4),
-                pcm: super::super::PacketPcm::default(),
-                text: b"kept".to_vec(),
-            },
-        ));
-    assert!(matches!(service(&mut peer), Err(DialError::InvalidOptions)));
-    assert!(!peer.service.active);
-    assert_eq!(peer.direct_pcm.remaining(), 300);
-    let mut text = [0; 4];
-    assert_eq!(
-        peer.poll_event(&mut [], &mut text).unwrap(),
-        IaxPeerEvent::Text(4)
-    );
-    assert_eq!(&text, b"kept");
+    for early_pcm in [false, true] {
+        let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut peer = linked_peer(remote.local_addr().unwrap());
+        // Neither direct nor accepted early generic PCM becomes20ms phone media.
+        let pcm = super::super::PacketPcm {
+            samples: vec![0.5; 320],
+            position: 20,
+            span: crate::source_time::Span::default(),
+        };
+        peer.pending_events
+            .push_back(super::super::PendingSource::Ready(
+                super::super::PendingEvent {
+                    event: IaxPeerEvent::Text(4),
+                    pcm: super::super::PacketPcm::default(),
+                    text: b"kept".to_vec(),
+                },
+            ));
+        if early_pcm {
+            peer.pending_events
+                .push_back(super::super::PendingSource::Ready(
+                    super::super::PendingEvent {
+                        event: IaxPeerEvent::Audio(320),
+                        pcm,
+                        text: Vec::new(),
+                    },
+                ));
+        } else {
+            peer.direct_pcm = pcm;
+        }
+        assert!(matches!(service(&mut peer), Err(DialError::InvalidOptions)));
+        assert!(!peer.service.active);
+        if early_pcm {
+            let super::super::PendingSource::Ready(pending) = &peer.pending_events[1] else {
+                unreachable!()
+            };
+            assert_eq!(pending.pcm.remaining(), 300);
+        } else {
+            assert_eq!(peer.direct_pcm.remaining(), 300);
+        }
+        let mut text = [0; 4];
+        assert_eq!(
+            peer.poll_event(&mut [], &mut text).unwrap(),
+            IaxPeerEvent::Text(4)
+        );
+        assert_eq!(&text, b"kept");
+        let mut output = [0.0; 40];
+        assert_eq!(
+            peer.poll_event(&mut output, &mut []).unwrap(),
+            IaxPeerEvent::Audio(40)
+        );
+        assert_eq!(output, [0.5; 40]);
+    }
 }
 
 fn installed_jitter() -> libloading::Library {
@@ -890,12 +920,14 @@ fn private_source_queue_moves_owned_payloads_without_new_phone_allocations() {
             };
             producer.try_push(address, &bytes).unwrap();
         }
-        let (result, allocations, copies) =
-            crate::allocation_test_support::measure_phone_payload(|| service(&mut peer));
+        let (result, allocations, payload_allocations) =
+            crate::allocation_test_support::measure_phone_payload_allocations(|| {
+                service(&mut peer)
+            });
         result.unwrap();
         assert_eq!(
-            copies, 0,
-            "shared ingress payload ownership must move, not copy"
+            payload_allocations, 0,
+            "shared ingress must not allocate a second phone payload"
         );
         if !full {
             assert_eq!(
@@ -922,7 +954,7 @@ fn private_source_queue_moves_owned_payloads_without_new_phone_allocations() {
         let slot = std::mem::size_of::<super::super::PendingSource>();
         assert_eq!(slot, std::mem::size_of::<super::super::PendingEvent>());
         eprintln!(
-            "ACTUAL_PHONE_QUEUE full={full} early={early} slots=64 slot_bytes={slot} metadata={} payload={bytes} allocations={allocations} payload_copies={copies}",
+            "ACTUAL_PHONE_QUEUE full={full} early={early} slots=64 slot_bytes={slot} metadata={} payload={bytes} allocations={allocations} payload_allocations={payload_allocations}",
             64 * slot
         );
     }

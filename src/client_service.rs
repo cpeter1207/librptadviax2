@@ -68,14 +68,6 @@ impl PendingSource {
             Self::RadioKey(_) | Self::RadioUnkey => false,
         }
     }
-
-    fn valid_phone_shape(&self) -> bool {
-        match self {
-            Self::Ready(event) => event.pcm.samples.capacity() <= 160,
-            Self::Voice(voice) => voice.bytes.len() <= 172 && voice.voice.length == 160,
-            Self::RadioKey(_) | Self::RadioUnkey => true,
-        }
-    }
 }
 
 pub(super) enum ReceivedEvent {
@@ -133,6 +125,7 @@ impl IaxPeer {
         if self.service.active {
             return Ok(());
         }
+        // Only accepted early Ready entries exist before the first activation.
         if !matches!(
             crate::formats::IaxFormat(self.format).profile(),
             Some(
@@ -141,10 +134,10 @@ impl IaxPeer {
             )
         ) || self.codecs.is_none()
             || self.direct_pcm.samples.capacity() > 160
-            || self
-                .pending_events
-                .iter()
-                .any(|event| !event.valid_phone_shape())
+            || self.pending_events.iter().any(|event| {
+                matches!(event, PendingSource::Ready(event)
+                    if event.pcm.samples.capacity() > 160)
+            })
             || self.playout.as_ref().is_some_and(|playout| {
                 !playout.private_profile_ready(self.provider_ownership.is_some())
             })
