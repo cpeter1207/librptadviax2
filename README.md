@@ -132,8 +132,9 @@ reference before each call. Pass a pointer derived from the complete request
 allocation, not a Rust reference narrowed to its 72-byte prefix.
 
 The unchanged 160-byte descriptor does not prove record-ABI2 support.
-Consumers must require a released package documenting this request and verify
-a successful SERVICE_ONLY opt-in before advertising the private timed capability. Alpha12
+Consumers using source-refusal service must require release `v0.1.0-alpha13`
+or later (Debian package version `0.1.0~alpha13` or later) and verify a successful
+SERVICE_ONLY opt-in before advertising the private timed capability. Alpha12
 rejects ABI2. Do not downgrade to ABI1 after rejection to claim protocol progress
 during source refusal. Unsupported versions, short records, invalid flags, or incompatible profile
 activation reject before peer mutation. Opt-in requires composed PCMU/PCMA at
@@ -274,6 +275,14 @@ Debian 13 release assets provide `librptadv-iax2-client2` and
 `librptadv-iax2-client-dev` for amd64 and arm64. Consumers select an explicit
 release tag and use the versioned dynamic library. Packages are also available
 from the [shared signed APT repository](https://cpeter1207.github.io/USBRadioPlus/).
+
+Alpha13 retains the runtime/development package names, SONAME 2 and the 160-byte
+client descriptor. The new timed request is caller-sized record ABI 2, not a new
+descriptor or shared-object ABI. Upgrade both packages together; the development
+package requires the matching runtime version. Existing ordinary callers need no
+migration. A private phone consumer needing progress during source refusal must
+use the alpha13 header and package floor, perform the opt-in above, and retain
+one serialized peer owner. A descriptor-size check alone is insufficient.
 
 Generic/numeric packet-jitter buffering starts at 180 ms, with a 160 ms minimum
 and a 500 ms maximum. Valid voice resumes playout after a radio-unkey event even when the

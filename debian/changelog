@@ -1,3 +1,16 @@
+librptadviax2 (0.1.0~alpha13) unstable; urgency=medium
+
+  * Add opt-in bounded protocol service while private phone source delivery is
+    refused, allowing real acknowledgments to complete transmit retirement.
+  * Reuse the existing timed-poll slot with an 80-byte ABI 2 request; preserve
+    client/server descriptors, ordinary timed ABI 1 behavior and SONAME 2.
+  * Preserve selected-source order, original receive age and fixed queue limits;
+    reject unsupported private media and fail closed on capacity or terminal loss.
+  * Document alpha13 package negotiation and retain measured ownership,
+    allocation, clock-loss and real-acknowledgment regression evidence.
+
+ -- Chris Peterson <cpeter1207@users.noreply.github.com>  Thu, 12 Nov 2026 14:16:00 +0000
+
 librptadviax2 (0.1.0~alpha12) unstable; urgency=medium
 
   * Add reserved preparation and allocation-free commit/abort for complete
