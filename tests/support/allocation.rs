@@ -9,6 +9,8 @@ thread_local! {
     static COUNT: Cell<usize> = const { Cell::new(0) };
     static IDENTITY_COPIES: Cell<usize> = const { Cell::new(0) };
     static PHONE_PAYLOAD_COPIES: Cell<usize> = const { Cell::new(0) };
+    static FAIL_SIZE: Cell<Option<usize>> = const { Cell::new(None) };
+    static FAILURES: Cell<usize> = const { Cell::new(0) };
 }
 struct Allocator;
 #[global_allocator]
@@ -16,6 +18,11 @@ static ALLOCATOR: Allocator = Allocator;
 
 unsafe impl GlobalAlloc for Allocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        if FAIL_SIZE.try_with(Cell::get).ok().flatten() == Some(layout.size()) {
+            FAIL_SIZE.set(None);
+            FAILURES.set(FAILURES.get() + 1);
+            return std::ptr::null_mut();
+        }
         if TRACK.try_with(Cell::get).unwrap_or(false) {
             COUNT.with(|count| count.set(count.get() + 1));
             if matches!(layout.size(), 164 | 172) {
@@ -52,4 +59,21 @@ pub(crate) fn measure<T>(work: impl FnOnce() -> T) -> (T, usize, usize) {
 pub(crate) fn measure_phone_payload<T>(work: impl FnOnce() -> T) -> (T, usize, usize) {
     let (result, total, _) = measure(work);
     (result, total, PHONE_PAYLOAD_COPIES.get())
+}
+
+/// Fail one actual allocation of the selected layout size on this test thread.
+pub(crate) fn fail_once_with_size<T>(size: usize, work: impl FnOnce() -> T) -> (T, usize) {
+    struct Stop;
+    impl Drop for Stop {
+        fn drop(&mut self) {
+            FAIL_SIZE.set(None);
+        }
+    }
+    assert_eq!(FAIL_SIZE.get(), None);
+    FAILURES.set(0);
+    FAIL_SIZE.set(Some(size));
+    let stop = Stop;
+    let result = work();
+    drop(stop);
+    (result, FAILURES.get())
 }

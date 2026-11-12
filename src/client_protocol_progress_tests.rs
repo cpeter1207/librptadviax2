@@ -462,6 +462,24 @@ fn mini(timestamp: u16, value: u8) -> Vec<u8> {
     .unwrap()
 }
 
+fn full_voice(sequence: u8, acknowledgement: u8, timestamp: u32, value: u8) -> Vec<u8> {
+    serialize_full_frame(
+        &FullFrameHeader {
+            source_call_number: 5678,
+            destination_call_number: 1234,
+            retransmission: false,
+            timestamp,
+            outgoing_sequence: sequence,
+            incoming_sequence: acknowledgement,
+            frame_type: 2,
+            subclass: 4,
+            subclass_is_log: false,
+        },
+        &[value; 160],
+    )
+    .unwrap()
+}
+
 fn next_source(peer: &mut IaxPeer, pcm: &mut [f32]) -> TimedPeerEvent {
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
@@ -784,22 +802,46 @@ fn installed_jitter_selected_suffix_stays_before_deferred_radio_effects_and_digi
 
 #[test]
 fn installed_jitter_unselected_voice_preserves_ordinary_not_due_control_order() {
-    let library = installed_jitter();
-    let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
-    let mut peer = linked_peer(remote.local_addr().unwrap());
-    configure_installed_jitter(&mut peer, &library);
-    service(&mut peer).unwrap();
-    remote
-        .send_to(&mini(20, 0x80), peer.local_addr().unwrap())
-        .unwrap();
-    remote
-        .send_to(&digit(1, b'5'), peer.local_addr().unwrap())
-        .unwrap();
-    service(&mut peer).unwrap();
-    let control = next_source(&mut peer, &mut [0.0; 160]);
-    assert_eq!(control.event, IaxPeerEvent::Digit(b'5'));
-    let media = next_source(&mut peer, &mut [0.0; 160]);
-    assert_eq!(media.event, IaxPeerEvent::Audio(160));
+    for reordered_full in [false, true] {
+        let library = installed_jitter();
+        let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut peer = linked_peer(remote.local_addr().unwrap());
+        configure_installed_jitter(&mut peer, &library);
+        service(&mut peer).unwrap();
+        let packet = if reordered_full {
+            peer.send_prepared_audio(&[0xff; 160], 160, 0).unwrap();
+            assert_eq!(peer.retire_egress().unwrap(), EgressRetirement::Pending);
+            // Real future media owns sequence2 while the following digit closes1.
+            full_voice(2, 2, 20, 0x80)
+        } else {
+            mini(20, 0x80)
+        };
+        let local = peer.local_addr().unwrap();
+        remote.send_to(&packet, local).unwrap();
+        remote.send_to(&digit(1, b'5'), local).unwrap();
+        if reordered_full {
+            // The identical retransmission must not create a second source owner.
+            remote.send_to(&packet, local).unwrap();
+        }
+        service(&mut peer).unwrap();
+        assert_eq!(peer.pending_events.len(), 2);
+        if reordered_full {
+            assert_eq!(peer.retire_egress().unwrap(), EgressRetirement::Complete(2));
+        }
+        let control = next_source(&mut peer, &mut [0.0; 160]);
+        assert_eq!(
+            (control.event, control.source_start),
+            (IaxPeerEvent::Digit(b'5'), 0)
+        );
+        let mut samples = [0.0; 160];
+        let media = next_source(&mut peer, &mut samples);
+        assert_eq!(
+            (media.event, media.source_start),
+            (IaxPeerEvent::Audio(160), 0)
+        );
+        assert!(samples.iter().all(|sample| *sample > 0.9));
+        assert!(peer.pending_events.is_empty());
+    }
 }
 
 #[test]
@@ -807,31 +849,42 @@ fn private_source_queue_moves_owned_payloads_without_new_phone_allocations() {
     let state_bytes = std::mem::size_of::<super::super::service::State>();
     assert_eq!(state_bytes, 4);
     eprintln!("ACTUAL_PHONE_STATE bytes={state_bytes} prior_state_bytes=3 early_counter_bytes=1");
-    for full in [false, true] {
+    for (full, early) in [(false, 0), (true, 0), (false, 32), (true, 32), (false, 64)] {
         let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
         let address = remote.local_addr().unwrap();
         let (mut peer, mut producer) = shared_peer(address);
         peer.compose_codec(crate::ffi::test_peer_catalog()).unwrap();
-        service(&mut peer).unwrap();
         peer.pending_events.reserve(64);
         peer.pending_replies.reserve(64);
-        for sequence in 1..=64 {
-            let bytes = if full {
-                serialize_full_frame(
-                    &FullFrameHeader {
-                        source_call_number: 5678,
-                        destination_call_number: 1234,
-                        retransmission: false,
-                        timestamp: u32::from(sequence) * 20,
-                        outgoing_sequence: sequence,
-                        incoming_sequence: 1,
-                        frame_type: 2,
-                        subclass: 4,
-                        subclass_is_log: false,
+        for _ in 0..early {
+            peer.pending_events
+                .push_back(super::super::PendingSource::Ready(
+                    super::super::PendingEvent {
+                        event: IaxPeerEvent::Audio(160),
+                        pcm: super::super::PacketPcm {
+                            samples: vec![0.25; 160],
+                            position: 0,
+                            span: crate::source_time::Span::default(),
+                        },
+                        text: Vec::new(),
                     },
-                    &[0x80; 160],
-                )
-                .unwrap()
+                ));
+        }
+        let early_pointers = peer
+            .pending_events
+            .iter()
+            .map(|event| {
+                let super::super::PendingSource::Ready(event) = event else {
+                    unreachable!()
+                };
+                event.pcm.samples.as_ptr() as usize
+            })
+            .collect::<Vec<_>>();
+        service(&mut peer).unwrap();
+        assert_eq!(usize::from(peer.service.early_remaining), early);
+        for sequence in 1..=(64 - early) as u8 {
+            let bytes = if full {
+                full_voice(sequence, 1, u32::from(sequence) * 20, 0x80)
             } else {
                 mini(u16::from(sequence) * 20, 0x80)
             };
@@ -852,12 +905,24 @@ fn private_source_queue_moves_owned_payloads_without_new_phone_allocations() {
         }
         assert_eq!(peer.pending_events.len(), 64);
         assert_eq!(peer.pending_events.capacity(), 64);
+        assert_eq!(usize::from(peer.service.early_remaining), early);
+        for (source, pointer) in peer.pending_events.iter().zip(early_pointers) {
+            let super::super::PendingSource::Ready(event) = source else {
+                panic!("early owner moved")
+            };
+            assert_eq!(event.pcm.samples.as_ptr() as usize, pointer);
+            assert_eq!(event.pcm.position, 0);
+            assert_eq!(event.pcm.samples, [0.25; 160]);
+        }
         let bytes = super::super::service::retained_payload_bytes(&peer);
-        assert_eq!(bytes, 64 * if full { 172 } else { 164 });
+        assert_eq!(
+            bytes,
+            early * 640 + (64 - early) * if full { 172 } else { 164 }
+        );
         let slot = std::mem::size_of::<super::super::PendingSource>();
         assert_eq!(slot, std::mem::size_of::<super::super::PendingEvent>());
         eprintln!(
-            "ACTUAL_PHONE_QUEUE full={full} slots=64 slot_bytes={slot} metadata={} payload={bytes} allocations={allocations} payload_copies={copies}",
+            "ACTUAL_PHONE_QUEUE full={full} early={early} slots=64 slot_bytes={slot} metadata={} payload={bytes} allocations={allocations} payload_copies={copies}",
             64 * slot
         );
     }
@@ -1135,10 +1200,9 @@ fn ffi_timed_request_respects_exact_prefix_tail_and_caller_guards() {
     let poll = api.poll_timed.unwrap();
     assert_eq!(std::mem::size_of::<Prefix>(), 72);
     assert_eq!(std::mem::size_of::<ServiceRequest>(), 80);
-    for version in [1, 2] {
+    for (version, flags) in [(1, u32::MAX), (2, 0), (2, 1)] {
         let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut peer = linked_peer(remote.local_addr().unwrap());
-        let flags = if version == 1 { u32::MAX } else { 1 };
         let reserved = if version == 1 { u32::MAX } else { 0 };
         let mut guarded = Guarded {
             request: ServiceRequest {
@@ -1155,14 +1219,18 @@ fn ffi_timed_request_respects_exact_prefix_tail_and_caller_guards() {
             },
             guard: [0x1234_5678_90ab_cdef; 2],
         };
+        remote
+            .send_to(&digit(1, b'5'), peer.local_addr().unwrap())
+            .unwrap();
+        let mut text = [0xa5; 1];
         assert_eq!(
             unsafe {
                 poll(
                     std::ptr::from_mut(&mut peer).cast(),
                     std::ptr::null_mut(),
                     0,
-                    std::ptr::null_mut(),
-                    0,
+                    text.as_mut_ptr(),
+                    text.len(),
                     std::ptr::from_mut(&mut guarded).cast(),
                 )
             },
@@ -1175,6 +1243,37 @@ fn ffi_timed_request_respects_exact_prefix_tail_and_caller_guards() {
         assert_eq!(guarded.request.reserved, reserved);
         assert_eq!(guarded.guard, [0x1234_5678_90ab_cdef; 2]);
         assert_eq!(peer.service.active, version == 2);
+        if flags == 1 {
+            assert_eq!(
+                guarded.request.prefix.event_kind,
+                crate::ffi::RPTADV_IAX2_EVENT_NONE
+            );
+            assert_eq!(text, [0xa5]);
+            assert_eq!(peer.pending_events.len(), 1);
+            guarded.request.request_flags = 0;
+            assert_eq!(
+                unsafe {
+                    poll(
+                        std::ptr::from_mut(&mut peer).cast(),
+                        std::ptr::null_mut(),
+                        0,
+                        text.as_mut_ptr(),
+                        text.len(),
+                        std::ptr::from_mut(&mut guarded).cast(),
+                    )
+                },
+                0
+            );
+        }
+        assert_eq!(
+            guarded.request.prefix.event_kind,
+            crate::ffi::RPTADV_IAX2_EVENT_DIGIT
+        );
+        assert_eq!(guarded.request.prefix.event_length, 1);
+        assert_eq!(guarded.request.prefix.source_start, 0);
+        assert_eq!(text, [b'5']);
+        assert!(peer.pending_events.is_empty());
+        assert_eq!(guarded.guard, [0x1234_5678_90ab_cdef; 2]);
     }
     // The actual allocation stops at byte72. ABI2 must reject before reading tail.
     let mut short = Prefix {
@@ -1289,4 +1388,58 @@ fn retired_full_voice_still_advances_real_protocol_sequence_and_ack() {
         (IaxPeerEvent::Digit(b'6'), 2, 0)
     );
     assert!(!next.discontinuity);
+}
+
+#[test]
+fn recoverable_source_reservation_failure_precedes_ack_and_preserves_accepted_control() {
+    let slot = std::mem::size_of::<super::super::PendingSource>();
+    for (capacity, failed_size) in [(4, 8 * slot), (64, 172)] {
+        let remote = UdpSocket::bind("127.0.0.1:0").unwrap();
+        remote.set_nonblocking(true).unwrap();
+        let mut peer = linked_peer(remote.local_addr().unwrap());
+        service(&mut peer).unwrap();
+        peer.pending_events.reserve(capacity);
+        let local = peer.local_addr().unwrap();
+        for sequence in 1..=4 {
+            remote
+                .send_to(&digit(sequence, b'0' + sequence), local)
+                .unwrap();
+        }
+        service(&mut peer).unwrap();
+        assert_eq!(peer.pending_events.len(), 4);
+        assert_eq!(peer.pending_events.capacity(), capacity);
+        peer.send_prepared_audio(&[0xff; 160], 160, 0).unwrap();
+        assert_eq!(peer.retire_egress().unwrap(), EgressRetirement::Pending);
+        let mut scratch = [0; 2048];
+        while remote.recv_from(&mut scratch).is_ok() {}
+        // This valid full voice would carry real ACK credit if acceptance ran.
+        remote.send_to(&full_voice(5, 2, 20, 0x80), local).unwrap();
+        let (result, failures) =
+            crate::allocation_test_support::fail_once_with_size(failed_size, || service(&mut peer));
+        assert_eq!(failures, 1, "must exercise the real recoverable allocation");
+        assert!(matches!(result, Err(DialError::EarlyEventsFull)));
+        assert_eq!(peer.pending_events.capacity(), capacity);
+        assert_eq!(peer.pending_events.len(), 4);
+        for (index, event) in peer.pending_events.iter().enumerate() {
+            let super::super::PendingSource::Ready(event) = event else {
+                panic!("lost control owner")
+            };
+            assert_eq!(event.event, IaxPeerEvent::Digit(b'1' + index as u8));
+        }
+        assert_eq!(
+            peer.pending_reliable.len(),
+            1,
+            "rejected source spent ACK credit"
+        );
+        assert_eq!(
+            remote.recv_from(&mut scratch).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert!(peer.retire_egress().is_err());
+        assert!(peer.send_prepared_audio(&[0xff; 160], 160, 40).is_err());
+        assert!(
+            peer.poll_timed(&mut [0.0; 160], &mut [0; 1], input())
+                .is_err()
+        );
+    }
 }
