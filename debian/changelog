@@ -1,3 +1,10 @@
+librptadviax2 (0.1.0~alpha14) unstable; urgency=medium
+
+  * Expose an optional nonmutating negotiated IAX format query for existing peers.
+  * Preserve the ABI 2 descriptor prefix, SONAME 2 and all media custody behavior.
+
+ -- codex <codex@localhost>  Sat, 14 Nov 2026 12:00:00 +0000
+
 librptadviax2 (0.1.0~alpha13) unstable; urgency=medium
 
   * Add opt-in bounded protocol service while private phone source delivery is

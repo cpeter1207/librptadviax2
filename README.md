@@ -330,3 +330,19 @@ Live-provider, NAT and radio acceptance remain unverified.
 
 The client ABI is versioned and released as a shared object. Complete ASL3
 call/session behavior and live peer interoperability remain to be verified.
+
+## Negotiated-format inspection (alpha14)
+
+The ABI 2 client descriptor appends an optional `negotiated_format` callback at
+offset 160 (complete size 168 on the supported 64-bit platforms). Callers check
+the descriptor size through that field before reading it. On the exclusive peer
+owner it returns the immutable negotiated IAX wire-format bit, or zero for a null
+handle. It does not poll, change receive mode, retire encoder history, or opt into
+timed transmission. Linear PCM rate alone does not identify the negotiated codec.
+
+The released 160-byte prefix and `librptadviax2.so.2` SONAME are unchanged, so
+existing consumers need no migration. Consumers requiring the new query must
+require alpha14 runtime/development packages. The current timed sender still
+supports only PCMU/PCMA at 8 kHz with 160-frame packets, and still requires actual
+completed egress retirement before use. The query is not a retirement receipt,
+permission to attach phone audio, or proof of support for other timed codecs.
