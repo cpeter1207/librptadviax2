@@ -297,6 +297,9 @@ pub struct rptadv_iax2_client_descriptor_v2 {
     /// Optional offset152/full160:0 completed local retirement/new epoch,1 Pending.
     /// Clears epoch output on failure/Pending; no remote delivery/ACK is claimed.
     pub retire_egress: Option<unsafe extern "C" fn(*mut c_void, *mut u64) -> i32>,
+    /// Optional offset160/full168: immutable negotiated IAX format bit; NULL returns zero.
+    /// Does not change polling, encoder, protocol, or egress ownership.
+    pub negotiated_format: Option<unsafe extern "C" fn(*const c_void) -> u64>,
 }
 
 /// Caller-owned options for a single UDP endpoint serving configured local nodes.
@@ -429,6 +432,7 @@ const DESCRIPTOR: rptadv_iax2_client_descriptor_v2 = rptadv_iax2_client_descript
     poll_timed: Some(poll_timed),
     send_prepared_audio_timed: Some(send_prepared_audio_timed),
     retire_egress: Some(retire_egress),
+    negotiated_format: Some(negotiated_format),
 };
 
 const SERVER_DESCRIPTOR: rptadv_iax2_server_descriptor_v2 = rptadv_iax2_server_descriptor_v2 {
@@ -666,6 +670,12 @@ unsafe extern "C" fn dial(
             }
             Err(error) => dial_error_code(error),
         }
+    })
+}
+
+unsafe extern "C" fn negotiated_format(peer: *const c_void) -> u64 {
+    boundary(0, || {
+        unsafe { peer.cast::<IaxPeer>().as_ref() }.map_or(0, IaxPeer::format)
     })
 }
 

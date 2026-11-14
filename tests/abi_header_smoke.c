@@ -41,6 +41,8 @@ _Static_assert(offsetof(struct rptadv_iax2_timed_event_v2, reserved) == 76,
 _Static_assert(offsetof(struct rptadv_iax2_client_descriptor_v2, send_prepared_audio_timed) == 144, "timed send tail order");
 _Static_assert(offsetof(struct rptadv_iax2_client_descriptor_v2, retire_egress) == 152, "egress retirement tail order");
 _Static_assert(sizeof(struct rptadv_iax2_timed_send_v1) == 24, "timed send record layout");
+_Static_assert(offsetof(struct rptadv_iax2_client_descriptor_v2, negotiated_format) == 160,
+    "negotiated format query must preserve the released160 prefix");
 
 _Static_assert(offsetof(struct rptadv_iax2_server_descriptor_v2, prepare_configuration_batch) == 88,
     "prepared configuration must preserve released88 prefix");

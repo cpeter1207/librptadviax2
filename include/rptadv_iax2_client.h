@@ -302,6 +302,12 @@ struct rptadv_iax2_client_descriptor_v2 {
      * Empty reliable markers remain protocol obligations, with no remote ACK claim.
      */
     int32_t (*retire_egress)(void *peer, uint64_t *egress_epoch);
+    /** Optional offset160/full168: read the immutable negotiated IAX wire-format
+     * bit on the exclusive peer owner; NULL returns zero. Check struct_size
+     * through this field before reading it. No polling, encoder, protocol or
+     * egress state changes. This query alone does not grant timed-send custody.
+     */
+    uint64_t (*negotiated_format)(const void *peer);
 };
 
 /**

@@ -35,7 +35,7 @@ fn server_account_operations_extend_the_released_table_prefix() {
         48
     );
     assert_eq!(descriptor.abi_version, 2);
-    assert_eq!(DESCRIPTOR.struct_size as usize, 160);
+    assert_eq!(DESCRIPTOR.struct_size as usize, 168);
     assert_eq!(size_of::<rptadv_iax2_server_options_v2>(), 64);
     assert!(descriptor.configure_accounts.is_some());
     assert!(descriptor.register_account.is_some());
@@ -665,10 +665,10 @@ fn establish_kind(profile: ProfileId, account: bool) -> (*mut c_void, UdpSocket,
     let destination = b"506315";
     let secret = b"";
     let directory = PathBuf::from(std::env::var_os("RPTADV_CODEC_DIR").unwrap_or_default());
-    let backend = if profile == ProfileId::Opus {
-        "opus"
-    } else {
-        "g711"
+    let backend = match profile {
+        ProfileId::Opus => "opus",
+        ProfileId::GsmFr => "gsm",
+        _ => "g711",
     };
     let catalog = Arc::new(
         FormatCatalog::new(
@@ -1607,7 +1607,7 @@ fn native_plc_output_capacity_is_retryable_not_a_peer_failure() {
 #[test]
 fn egress_abi2_layout_and_prepared_codec() {
     let api = unsafe { &*super::rptadv_iax2_client_descriptor_v2() };
-    assert_eq!(api.struct_size as usize, 24 + 17 * size_of::<usize>());
+    assert_eq!(api.struct_size as usize, 24 + 18 * size_of::<usize>());
     assert_eq!(
         std::mem::offset_of!(rptadv_iax2_client_descriptor_v2, dial_account),
         24 + 13 * size_of::<usize>()
@@ -2100,4 +2100,76 @@ fn timed_phone_sender_rejects_actual_negotiated_opus_without_relabeling_its_cloc
     );
     assert_eq!(unsafe { sample_rate_hz(peer) }, 48000);
     unsafe { destroy(peer) };
+}
+
+#[test]
+fn negotiated_format_tail_is_nonmutating_for_g711_and_other_ordinary_profiles() {
+    // Read the proposed sized tail like an independent C consumer. This remains
+    // a runtime assertion against the old descriptor during the RED stage.
+    #[repr(C)]
+    struct QueryDescriptor {
+        released: [u8; 160],
+        query: Option<unsafe extern "C" fn(*const c_void) -> u64>,
+    }
+    let descriptor = rptadv_iax2_client_descriptor_v2();
+    assert_eq!(
+        unsafe { (*descriptor).struct_size } as usize,
+        size_of::<QueryDescriptor>(),
+        "a nonmutating negotiated-format query must follow the released prefix"
+    );
+    let query = unsafe { (*descriptor.cast::<QueryDescriptor>()).query }.unwrap();
+    assert_eq!(unsafe { query(ptr::null()) }, 0);
+    for (profile, format) in [
+        (ProfileId::G711Mu, 4),
+        (ProfileId::G711A, 8),
+        (ProfileId::GsmFr, 2),
+        (ProfileId::Opus, 1u64 << 34),
+    ] {
+        let (peer, server, _) = establish_profile(profile);
+        assert_eq!(unsafe { query(peer) }, format);
+        assert_eq!(
+            unsafe { send_text(peer, b"query leaves ASL intact".as_ptr(), 22) },
+            0
+        );
+        let mut wire = [0; 4096];
+        server.recv_from(&mut wire).unwrap();
+        assert_eq!(wire[10], 7);
+        let pcm = vec![0.25; unsafe { sample_rate_hz(peer) } as usize / 50];
+        let mut encoded = [0; 4096];
+        let mut result = EncodeResultRaw {
+            struct_size: size_of::<EncodeResultRaw>() as u32,
+            ..Default::default()
+        };
+        assert!(
+            unsafe {
+                prepare_audio(
+                    peer,
+                    pcm.as_ptr(),
+                    pcm.len(),
+                    encoded.as_mut_ptr(),
+                    encoded.len(),
+                    0,
+                    &mut result,
+                )
+            } >= 0
+        );
+        assert!(result.encoded_bytes > 0);
+        assert_eq!(
+            unsafe {
+                send_prepared_audio(
+                    peer,
+                    encoded.as_ptr(),
+                    result.encoded_bytes,
+                    result.packet_frames,
+                    0,
+                )
+            },
+            0,
+            "query must not opt the existing ordinary owner into timed custody"
+        );
+        server.recv_from(&mut wire).unwrap();
+        assert_eq!(wire[10], 2);
+        assert_eq!(unsafe { query(peer) }, format);
+        unsafe { destroy(peer) };
+    }
 }
