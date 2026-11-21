@@ -13,7 +13,7 @@ crate-type = ["rlib", "cdylib"]
 [dependencies]
 audio-codec-algorithms = "0.7.0"
 rptadv-codec-client = { git = "https://github.com/cpeter1207/rptadv-codec-adapters", rev = "becbff939a0817cc91df6dcb0d40e85e381ec87b" }
-rptadv-jitter-client = { git = "https://github.com/cpeter1207/rpt_advanced", rev = "b244eb17cf96ca839c92125f9062f34f03f644bd" }
+rptadv-jitter-client = { git = "https://github.com/cpeter1207/rpt_advanced", rev = "24a050878a4794138e0ecad346a63e7eca3d4292" }
 getrandom = "0.2"
 libc = "=0.2.189"
 md-5 = "0.10.6"

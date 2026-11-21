@@ -288,6 +288,26 @@ Generic/numeric packet-jitter buffering starts at 180 ms, with a 160 ms minimum
 and a 500 ms maximum. Valid voice resumes playout after a radio-unkey event even when the
 peer does not send another radio-key event.
 
+For a private G.711 call at 8 kHz with 20 ms packets, the released
+`peer_configure_jitter` operation selects 20/40/100 ms. An account with authored
+minimum, initial and maximum delay can use `peer_configure_private_jitter` in
+the optional async descriptor. Check that the complete function pointer is
+inside `struct_size` and present before selecting an account needing this
+operation. Call it on the exclusive private peer before attaching the
+executor, with nondecreasing millisecond bounds. A successful call creates
+one native packet jitter context using the negotiated rate. Attempts to
+replace an existing context fail and retain its buffered media. Keep the
+jitter DSO loaded through peer destruction.
+
+To change bounds on a live private call, check the subsequent
+`peer_set_private_jitter` slot's complete extent and pointer. Call it from
+the exclusive peer owner (inside the serialized callback once attached).
+A changed tuple requires a neutral jitter provider with in-place updates.
+The call keeps its packet queue, decoder, source clock and media epoch.
+An existing excess drains through ordinary releases and the new initial
+delay applies at the next priming epoch. An unsupported or invalid change
+returns a negative status and leaves the existing call's policy intact.
+
 Validated empty voice packets do not enter audio playout. Unexpected peer
 termination writes one error with the local/remote call identifiers and protocol
 sequence state. Explicit local hangup and peer destruction do not log that error.

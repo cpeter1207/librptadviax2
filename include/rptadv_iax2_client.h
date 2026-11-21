@@ -95,6 +95,27 @@ struct rptadv_iax2_async_descriptor_v1 {
      * UINT64_MAX clears the deadline; zero is due now. Call only on the peer
      * owner. Protocol and jitter deadlines remain independently scheduled. */
     int32_t (*peer_set_deadline)(void *peer, uint64_t wake_after_ns);
+    /** Optional append-only private-call suffix. Check struct_size and this
+     * pointer before calling. On a unique, unattached provider-owned G.711
+     * call, create packet jitter with ordered millisecond delays. An invalid
+     * range, overflow, ordinary repeater, or second setup fails without
+     * changing the call or an existing jitter context. The released prefix
+     * peer_configure_jitter continues to supply its fixed default policy.
+     * Supply a valid jitter ABI 1 provider with exclusive, serially movable
+     * contexts. Callbacks may neither retain borrowed inputs nor unwind.
+     * Keep descriptor/code live until the peer is destroyed after detach. */
+    int32_t (*peer_configure_private_jitter)(void *peer, const void *descriptor,
+                                            uint32_t minimum_ms, uint32_t initial_ms,
+                                            uint32_t maximum_ms);
+    /** Optional suffix. On the exclusive private call owner, before attachment
+     * or inside its serialized callback, edit the existing jitter context in
+     * place. Check struct_size and pointer before use. Zero succeeds, including
+     * an identical tuple; negative rejects an invalid tuple, retired account,
+     * unconfigured peer or changed tuple unsupported by the neutral provider.
+     * A successful edit preserves queued media, codec state and source clock.
+     * The new initial delay applies at the next genuine priming epoch. */
+    int32_t (*peer_set_private_jitter)(void *peer, uint32_t minimum_ms,
+                                       uint32_t initial_ms, uint32_t maximum_ms);
 };
 
 /** Obtain optional async ABI 1; existing synchronous clients need not use it. */

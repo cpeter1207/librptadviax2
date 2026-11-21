@@ -4,22 +4,38 @@
 The quality image supplies a test-only Asterisk; installed IAX media is PBX-free.
 """
 
+import argparse
 import json
 import select
 import socket
 import subprocess
-import sys
 import tempfile
 import time
 from pathlib import Path
 
 
-def listener_fixture(binary, port, configuration, codec="ulaw"):
+def listener_fixture(
+    binary,
+    port,
+    configuration,
+    codec="ulaw",
+    configured=False,
+    jitter=None,
+    mixed=False,
+    live=False,
+):
     """Actual public server tails, dynamic provider calls, and exact owned cleanup."""
-    jitter = list(Path("/usr/lib").glob("*/rpt_advanced/librptadv_jitter_adapter.so.1"))
-    assert len(jitter) == 1, "exactly one native neutral jitter DSO is required"
+    if jitter is None:
+        [jitter] = Path("/usr/lib").glob("*/rpt_advanced/librptadv_jitter_adapter.so.1")
+    args = [str(Path(binary).resolve()), f"127.0.0.1:{port}", codec, str(jitter)]
+    if live:
+        args.append("live")
+    elif mixed:
+        args.append("mixed")
+    elif configured:
+        args.append("configured")
     with subprocess.Popen(
-        [str(Path(binary).resolve()), f"127.0.0.1:{port}", codec, str(jitter[0])],
+        args,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -32,7 +48,7 @@ def listener_fixture(binary, port, configuration, codec="ulaw"):
             first = json.loads(first_line)
             assert first["ready"] and first["outgoing_echo_samples"] > 0
             assert first["format"] == (8 if codec == "alaw" else 4)
-            assert first["initial_jitter_samples"] == 320
+            assert first["initial_jitter_samples"] == (680 if configured else 320)
             originated = subprocess.run(
                 [
                     "asterisk",
@@ -48,13 +64,21 @@ def listener_fixture(binary, port, configuration, codec="ulaw"):
             )
             remaining, errors = fixture.communicate(timeout=12)
             assert fixture.returncode == 0, originated.stdout + errors
+            if live:
+                assert (
+                    "native live policy queued=" in errors
+                    and "restore=1 attached=1" in errors
+                )
+                print(errors.strip())
             final = json.loads(remaining)
             assert final["outgoing_echo_samples"] > 0
             assert final["incoming_echo_samples"] > 0
             assert final["released"] and final["bad_secret_rejected"]
             assert final["port_rebound"]
             assert final["format"] == first["format"]
-            assert final["incoming_initial_jitter_samples"] == 320
+            assert final["incoming_initial_jitter_samples"] == (
+                680 if configured or mixed or live else 320
+            )
             print(json.dumps(first))
             print(json.dumps(final))
         finally:
@@ -68,6 +92,19 @@ def listener_fixture(binary, port, configuration, codec="ulaw"):
 
 
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("client", nargs="?")
+    parser.add_argument("listener")
+    parser.add_argument("--configured-listener-only", action="store_true")
+    parser.add_argument("--live-listener-only", action="store_true")
+    parser.add_argument("--jitter", type=Path)
+    args = parser.parse_args()
+    if (
+        not args.configured_listener_only
+        and not args.live_listener_only
+        and not args.client
+    ):
+        parser.error("full provider qualification requires a client and listener")
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as reserve:
         reserve.bind(("127.0.0.1", 0))
         port = reserve.getsockname()[1]
@@ -132,39 +169,89 @@ def main():
                     time.sleep(0.1)
                 else:
                     raise AssertionError("Asterisk provider did not become ready")
-                checked = subprocess.run(
-                    [
-                        str(Path(sys.argv[1]).resolve()),
-                        "--provider",
-                        f"127.0.0.1:{port}",
-                    ],
-                    capture_output=True,
-                    text=True,
-                    timeout=15,
-                    check=True,
-                )
-                result = json.loads(checked.stdout)
-                assert result["echo_samples"] > 0 and result["bad_password_rejected"]
-                print(checked.stdout.strip())
-                listener_fixture(sys.argv[2], port, root / "asterisk.conf")
-                # The same independent registrar now accepts PCMA only. A new
-                # listener/account owns its own exact port and codec contexts.
-                iax = root / "iax.conf"
-                iax.write_text(iax.read_text().replace("allow=ulaw", "allow=alaw"))
-                subprocess.run(
-                    [
-                        "asterisk",
-                        "-C",
-                        str(root / "asterisk.conf"),
-                        "-rx",
-                        "iax2 reload",
-                    ],
-                    capture_output=True,
-                    text=True,
-                    timeout=3,
-                    check=True,
-                )
-                listener_fixture(sys.argv[2], port, root / "asterisk.conf", "alaw")
+                if args.live_listener_only:
+                    listener_fixture(
+                        args.listener,
+                        port,
+                        root / "asterisk.conf",
+                        live=True,
+                        jitter=args.jitter,
+                    )
+                elif args.configured_listener_only:
+                    listener_fixture(
+                        args.listener,
+                        port,
+                        root / "asterisk.conf",
+                        configured=True,
+                        jitter=args.jitter,
+                    )
+                    listener_fixture(
+                        args.listener,
+                        port,
+                        root / "asterisk.conf",
+                        mixed=True,
+                        jitter=args.jitter,
+                    )
+                else:
+                    checked = subprocess.run(
+                        [
+                            str(Path(args.client).resolve()),
+                            "--provider",
+                            f"127.0.0.1:{port}",
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=15,
+                        check=True,
+                    )
+                    result = json.loads(checked.stdout)
+                    assert (
+                        result["echo_samples"] > 0 and result["bad_password_rejected"]
+                    )
+                    print(checked.stdout.strip())
+                    listener_fixture(
+                        args.listener, port, root / "asterisk.conf", jitter=args.jitter
+                    )
+                    # The same independent registrar now accepts PCMA only. A new
+                    # listener/account owns its own exact port and codec contexts.
+                    iax = root / "iax.conf"
+                    iax.write_text(iax.read_text().replace("allow=ulaw", "allow=alaw"))
+                    subprocess.run(
+                        [
+                            "asterisk",
+                            "-C",
+                            str(root / "asterisk.conf"),
+                            "-rx",
+                            "iax2 reload",
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=3,
+                        check=True,
+                    )
+                    listener_fixture(
+                        args.listener,
+                        port,
+                        root / "asterisk.conf",
+                        "alaw",
+                        jitter=args.jitter,
+                    )
+                    listener_fixture(
+                        args.listener,
+                        port,
+                        root / "asterisk.conf",
+                        "alaw",
+                        configured=True,
+                        jitter=args.jitter,
+                    )
+                    listener_fixture(
+                        args.listener,
+                        port,
+                        root / "asterisk.conf",
+                        "alaw",
+                        mixed=True,
+                        jitter=args.jitter,
+                    )
             except BaseException:
                 log.flush()
                 print((root / "asterisk.log").read_text()[-8000:])

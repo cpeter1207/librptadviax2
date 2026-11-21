@@ -228,6 +228,15 @@ pub(crate) fn catalog() -> Arc<crate::formats::FormatCatalog> {
 
 #[test]
 fn configured_provider_dial_uses_the_listener_and_retirement_fences_retained_media() {
+    exercise_registered_dial(None);
+}
+
+#[test]
+fn authored_private_jitter_uses_checked_native_delay_on_a_real_registered_call() {
+    exercise_registered_dial(Some([30, 85, 140]));
+}
+
+fn exercise_registered_dial(policy: Option<[u32; 3]>) {
     let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
     socket
         .set_read_timeout(Some(Duration::from_secs(3)))
@@ -361,8 +370,58 @@ fn configured_provider_dial_uses_the_listener_and_retirement_fences_retained_med
     assert!(matches!(peer.send_prepared_audio(&[0xff; 80], 80, 0),
         Err(crate::client::DialError::Provider(error)) if error.status == crate::codec::providers::Status::Malformed));
     let jitter = crate::jitter::fixture::Fixture::new();
-    unsafe { peer.configure_jitter(jitter.descriptor()) }.unwrap();
-    assert_eq!(jitter.policy(), (160, 320, 800, 160));
+    if let Some([minimum, initial, maximum]) = policy {
+        // Read the optional function with the same byte-extent check as an external C consumer.
+        // The released default call supplies a measured baseline when testing the old table.
+        use crate::async_ffi::{AsyncDescriptor, rptadv_iax2_async_descriptor_v1};
+        use std::{
+            ffi::c_void,
+            mem::{offset_of, size_of},
+        };
+        type Configure = unsafe extern "C" fn(*mut c_void, *const c_void, u32, u32, u32) -> i32;
+        let api = unsafe { &*rptadv_iax2_async_descriptor_v1() };
+        let offset = offset_of!(AsyncDescriptor, peer_set_deadline) + size_of::<usize>();
+        if api.struct_size as usize >= offset + size_of::<Configure>() {
+            let configure = unsafe {
+                std::ptr::from_ref(api)
+                    .cast::<u8>()
+                    .add(offset)
+                    .cast::<Configure>()
+                    .read_unaligned()
+            };
+            let raw = std::ptr::from_mut(&mut peer).cast();
+            // Bad ordering and an unrepresentable delay must leave the call unconfigured.
+            assert_ne!(
+                unsafe { configure(raw, jitter.descriptor(), initial, minimum, maximum) },
+                0
+            );
+            assert_ne!(
+                unsafe { configure(raw, jitter.descriptor(), minimum, initial, u32::MAX) },
+                0
+            );
+            assert_eq!(
+                unsafe { configure(raw, jitter.descriptor(), minimum, initial, maximum) },
+                0
+            );
+            assert_ne!(
+                unsafe { configure(raw, jitter.descriptor(), minimum, initial, maximum) },
+                0
+            );
+        } else {
+            unsafe { peer.configure_jitter(jitter.descriptor()) }.unwrap();
+        }
+        // This fixture advertises exactly the old neutral prefix: the original
+        // tuple is valid, while an actual change must preserve that context.
+        assert!(peer.set_private_jitter([minimum, initial, maximum]).is_ok());
+        assert!(peer.set_private_jitter([20, 20, 40]).is_err());
+        assert_eq!(
+            jitter.policy(),
+            (minimum * 8, initial * 8, maximum * 8, 160)
+        );
+    } else {
+        unsafe { peer.configure_jitter(jitter.descriptor()) }.unwrap();
+        assert_eq!(jitter.policy(), (160, 320, 800, 160));
+    }
     assert_eq!(
         peer.send_prepared_audio(&[], 0, 0).unwrap(),
         crate::client::MediaSend::Accepted
@@ -380,6 +439,7 @@ fn configured_provider_dial_uses_the_listener_and_retirement_fences_retained_med
             .is_err()
     );
     assert!(peer.send_dtmf(b'9').is_err());
+    assert!(peer.set_private_jitter([20, 40, 100]).is_err());
     // Local protocol cleanup remains available after admission/media retirement.
     peer.hangup().unwrap();
     drop(peer);

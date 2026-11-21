@@ -52,6 +52,12 @@ impl Playout {
         }
         self.release_deadline.or_else(|| self.tail_end.map(|_| now))
     }
+    pub(crate) fn set_delays(&mut self, delays_ms: [u32; 3]) -> Result<(), DialError> {
+        self.jitter
+            .set_delays(delays_ms)
+            .map_err(|_| DialError::InvalidOptions)
+    }
+
     pub(crate) fn observe(&self) -> Result<Observation, DialError> {
         let mut current = self.jitter.observe().map_err(|_| DialError::Jitter)?;
         let completed = &self.completed;

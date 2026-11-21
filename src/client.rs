@@ -491,6 +491,9 @@ impl IaxPeer {
         &mut self,
         descriptor: *const std::ffi::c_void,
     ) -> Result<(), DialError> {
+        if self.provider_ownership.is_some() {
+            return unsafe { self.configure_private_jitter(descriptor, [20, 40, 100]) };
+        }
         if self.async_attached || self.playout.is_some() {
             return Err(DialError::InvalidOptions);
         }
@@ -499,18 +502,49 @@ impl IaxPeer {
             .codecs
             .as_ref()
             .map_or(rate / 100, |codecs| codecs.loss_unit);
-        let jitter = if self.provider_ownership.is_some() {
-            // Both provider constructors use FormatCatalog::phone before NEW/
-            // AUTHREQ. Its verified 8 kHz G.711 coding unit divides160, so the
-            // retained Stream's20 ms packet is exactly160 frames. Identity and
-            // codec fields are private and immutable through this lifecycle.
-            unsafe { crate::jitter::Jitter::phone(descriptor) }
-        } else {
-            unsafe { crate::jitter::Jitter::new_at_rate(descriptor, rate, loss_unit) }
-        }
-        .map_err(|_| DialError::InvalidOptions)?;
+        let jitter = unsafe { crate::jitter::Jitter::new_at_rate(descriptor, rate, loss_unit) }
+            .map_err(|_| DialError::InvalidOptions)?;
         self.playout = Some(Playout::new_at_rate(jitter, self.connected_at, rate));
         Ok(())
+    }
+
+    /// Configure the actual packet jitter owner for a private G.711 call only.
+    /// Both native provider constructors bind the 8 kHz, 160-frame coding unit.
+    ///
+    /// # Safety
+    /// The caller owns this unattached peer. The descriptor must be a valid
+    /// ABI 1 jitter provider with independently owned, serially movable
+    /// contexts. Callbacks neither retain borrowed arguments nor unwind.
+    /// Keep the descriptor and its DSO valid through peer destruction.
+    pub unsafe fn configure_private_jitter(
+        &mut self,
+        descriptor: *const std::ffi::c_void,
+        delays_ms: [u32; 3],
+    ) -> Result<(), DialError> {
+        self.ensure_provider_live()?;
+        if self.provider_ownership.is_none()
+            || self.async_attached
+            || self.playout.is_some()
+            || self.sample_rate_hz() != 8000
+        {
+            return Err(DialError::InvalidOptions);
+        }
+        let jitter = unsafe { crate::jitter::Jitter::phone_with_delays(descriptor, delays_ms) }
+            .map_err(|_| DialError::InvalidOptions)?;
+        self.playout = Some(Playout::new_at_rate(jitter, self.connected_at, 8000));
+        Ok(())
+    }
+
+    /// Edit jitter bounds on the existing private call's exclusive media owner.
+    pub(crate) fn set_private_jitter(&mut self, delays_ms: [u32; 3]) -> Result<(), DialError> {
+        self.ensure_provider_live()?;
+        if self.provider_ownership.is_none() {
+            return Err(DialError::InvalidOptions);
+        }
+        self.playout
+            .as_mut()
+            .ok_or(DialError::InvalidOptions)?
+            .set_delays(delays_ms)
     }
 
     /// Prepare one queue-backed receive owner before its retained callback starts.

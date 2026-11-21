@@ -289,7 +289,7 @@ dependencies = [
 [[package]]
 name = "rptadv-jitter-client"
 version = "0.1.0-alpha24"
-source = "git+https://github.com/cpeter1207/rpt_advanced?rev=b244eb17cf96ca839c92125f9062f34f03f644bd#b244eb17cf96ca839c92125f9062f34f03f644bd"
+source = "git+https://github.com/cpeter1207/rpt_advanced?rev=24a050878a4794138e0ecad346a63e7eca3d4292#24a050878a4794138e0ecad346a63e7eca3d4292"
 
 [[package]]
 name = "rptadviax2"
