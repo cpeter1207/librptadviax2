@@ -23,11 +23,17 @@ impl Jitter {
         unsafe { Self::new_at_rate(descriptor, CLOCK_RATE_HZ, CONCEALMENT_SPAN) }
     }
 
-    /// Use the shared 20/40/100 ms, 160-byte profile only for phone G.711/20 ms.
+    /// Use the shared checked millisecond conversion for a native private G.711 call.
     /// # Safety
-    /// The descriptor and implementing DSO must remain valid through this context's drop.
-    pub(crate) unsafe fn phone(descriptor: *const c_void) -> Result<Self, Error> {
-        unsafe { rptadv_jitter_client::Jitter::phone(descriptor) }.map(Self)
+    /// The caller supplies a valid ABI 1 jitter provider whose callbacks create
+    /// independent, serially movable contexts, never retain borrowed inputs
+    /// and never unwind. Keep the descriptor and DSO valid through drop.
+    pub(crate) unsafe fn phone_with_delays(
+        descriptor: *const c_void,
+        delays_ms: [u32; 3],
+    ) -> Result<Self, Error> {
+        unsafe { rptadv_jitter_client::Jitter::with_delays(descriptor, 8000, 160, 160, delays_ms) }
+            .map(Self)
     }
 
     /// Apply the unchanged 160/180/500 ms policy and IAX-specific payload budget.

@@ -20,6 +20,10 @@ _Static_assert(offsetof(struct rptadv_iax2_async_descriptor_v1, peer_wake) ==
     24 + 8 * sizeof(void (*)(void)), "wake tail must preserve the prefix");
 _Static_assert(offsetof(struct rptadv_iax2_async_descriptor_v1, peer_set_deadline) ==
     24 + 9 * sizeof(void (*)(void)), "deadline tail order changed");
+_Static_assert(offsetof(struct rptadv_iax2_async_descriptor_v1, peer_configure_private_jitter) ==
+    24 + 10 * sizeof(void (*)(void)), "private jitter must preserve the released async prefix");
+_Static_assert(offsetof(struct rptadv_iax2_async_descriptor_v1, peer_set_private_jitter) ==
+    24 + 11 * sizeof(void (*)(void)), "live policy must preserve the initial policy prefix");
 _Static_assert(offsetof(struct rptadv_iax2_client_descriptor_v2, prepare_audio) ==
     24 + 9 * sizeof(void (*)(void)), "prepared codec layout differs");
 _Static_assert(offsetof(struct rptadv_iax2_client_descriptor_v2, elapsed_ms) ==
@@ -200,6 +204,7 @@ int main(int argc, char **argv)
 		!async->peer_wake || !async->peer_set_deadline ||
 		async->runtime_create(&runtime) != 0 || !runtime ||
 		async->peer_configure_jitter(NULL, NULL) != -1 ||
+		!async->peer_set_private_jitter || async->peer_set_private_jitter(NULL, 20, 40, 100) != -1 ||
 		async->server_enable(runtime, NULL) != -1 ||
 		async->peer_attach(runtime, NULL, NULL, NULL, &registration) != -1 || registration)
 		return 1;

@@ -45,6 +45,11 @@ pub struct AsyncDescriptor {
     pub peer_wake: unsafe extern "C" fn(*mut c_void),
     /// Owner-only relative deadline; u64::MAX clears, zero makes the next turn due.
     pub peer_set_deadline: unsafe extern "C" fn(*mut c_void, u64) -> i32,
+    /// Optional per-call private G.711 jitter configuration before attachment.
+    pub peer_configure_private_jitter:
+        unsafe extern "C" fn(*mut c_void, *const c_void, u32, u32, u32) -> i32,
+    /// Optional existing-context update on the private peer's serial owner.
+    pub peer_set_private_jitter: unsafe extern "C" fn(*mut c_void, u32, u32, u32) -> i32,
 }
 
 static API: AsyncDescriptor = AsyncDescriptor {
@@ -61,6 +66,8 @@ static API: AsyncDescriptor = AsyncDescriptor {
     peer_observe,
     peer_wake,
     peer_set_deadline,
+    peer_configure_private_jitter,
+    peer_set_private_jitter,
 };
 
 /// Return the immutable optional table. Retain this DSO through every detach.
@@ -211,6 +218,36 @@ unsafe extern "C" fn peer_configure_jitter(peer: *mut c_void, descriptor: *const
         Ok(()) => 0,
         Err(_) => -1,
     }
+}
+
+unsafe extern "C" fn peer_configure_private_jitter(
+    peer: *mut c_void,
+    descriptor: *const c_void,
+    minimum_ms: u32,
+    initial_ms: u32,
+    maximum_ms: u32,
+) -> i32 {
+    let Some(peer) = (unsafe { peer.cast::<IaxPeer>().as_mut() }) else {
+        return -1;
+    };
+    match unsafe { peer.configure_private_jitter(descriptor, [minimum_ms, initial_ms, maximum_ms]) }
+    {
+        Ok(()) => 0,
+        Err(_) => -1,
+    }
+}
+
+unsafe extern "C" fn peer_set_private_jitter(
+    peer: *mut c_void,
+    minimum_ms: u32,
+    initial_ms: u32,
+    maximum_ms: u32,
+) -> i32 {
+    let Some(peer) = (unsafe { peer.cast::<IaxPeer>().as_mut() }) else {
+        return -1;
+    };
+    peer.set_private_jitter([minimum_ms, initial_ms, maximum_ms])
+        .map_or(-1, |()| 0)
 }
 
 unsafe extern "C" fn server_enable(runtime: *mut c_void, server: *mut c_void) -> i32 {
